@@ -11,11 +11,12 @@ import (
 
 // SlashCommandResult is a message returned after executing a slash command.
 type SlashCommandResult struct {
-	Output      string
-	SwitchFocus *Focus
-	SwitchMode  *MiddleMode
-	Quit        bool // true means exit TUI
-	Clear       bool // true means clear current view
+	Output          string
+	SwitchFocus     *Focus
+	SwitchMode      *MiddleMode
+	SwitchAgentMode *AgentMode
+	Quit            bool // true means exit TUI
+	Clear           bool // true means clear current view
 }
 
 // executeSlashCommand processes a slash command and returns a tea.Cmd.
@@ -48,6 +49,24 @@ func executeSlashCommand(cmd *SlashCommand, database *db.DB, cfg *config.LLMConf
 				Output:      renderModelsText(cfg),
 				SwitchFocus: &focus,
 				SwitchMode:  &mode,
+			}
+		}
+
+	case "team":
+		return func() tea.Msg {
+			mode := AgentModeTeam
+			return SlashCommandResult{
+				Output:          "Agent mode set to team.",
+				SwitchAgentMode: &mode,
+			}
+		}
+
+	case "copilt":
+		return func() tea.Msg {
+			mode := AgentModeCopilot
+			return SlashCommandResult{
+				Output:          "Agent mode set to copilt.",
+				SwitchAgentMode: &mode,
 			}
 		}
 
@@ -90,6 +109,8 @@ func renderHelpText() string {
 	b.WriteString("  /help, /h          Show this help\n")
 	b.WriteString("  /search <q>, /s    Search command history\n")
 	b.WriteString("  /models, /m        Show LLM model config\n")
+	b.WriteString("  /team              Switch agent mode to team\n")
+	b.WriteString("  /copilt            Switch agent mode to copilt\n")
 	b.WriteString("  /clear, /c         Clear current view\n")
 	b.WriteString("  /exit              Exit TUI\n")
 	b.WriteString("\n")

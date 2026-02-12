@@ -65,6 +65,43 @@ CREATE TABLE IF NOT EXISTS agent_executions (
     completed_at    INTEGER
 );
 
+-- Agent event log (team execution tracing)
+CREATE TABLE IF NOT EXISTS agent_events (
+    id                TEXT PRIMARY KEY,
+    execution_id      TEXT NOT NULL,
+    agent_name        TEXT NOT NULL,
+    event_type        TEXT NOT NULL,
+    payload_json      TEXT,
+    model             TEXT,
+    tool_name         TEXT,
+    tokens_total      INTEGER,
+    tokens_prompt     INTEGER,
+    tokens_completion INTEGER,
+    latency_ms        INTEGER,
+    ts                INTEGER NOT NULL,
+    trace_id          TEXT,
+    parent_trace_id   TEXT
+);
+
+-- Agent sessions (TUI conversations)
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+-- Agent messages (TUI conversation messages)
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+
+    FOREIGN KEY (session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE
+);
+
 -- ============================================================
 -- P0 Indexes — Performance critical for TUI and tai queries
 -- ============================================================

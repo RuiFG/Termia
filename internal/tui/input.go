@@ -17,13 +17,19 @@ type SlashCommand struct {
 	Args string
 }
 
+// SlashSuggestion represents a slash command suggestion with description.
+type SlashSuggestion struct {
+	Name string
+	Desc string
+}
+
 // InputModel is the bottom input bar component.
 type InputModel struct {
 	textInput        textinput.Model
 	textarea         textarea.Model
 	width            int
 	focused          bool
-	slashSuggestions []string
+	slashSuggestions []SlashSuggestion
 	slashIndex       int
 	useTextarea      bool
 }
@@ -63,7 +69,15 @@ func NewInputModel() InputModel {
 	ta.BlurredStyle = blurredStyle
 	ta.Focus()
 
-	suggestions := []string{"help", "search", "models", "clear", "exit"}
+	suggestions := []SlashSuggestion{
+		{Name: "help", Desc: "show help"},
+		{Name: "search", Desc: "search history"},
+		{Name: "models", Desc: "show model config"},
+		{Name: "team", Desc: "switch to team mode"},
+		{Name: "copilt", Desc: "switch to copilt mode"},
+		{Name: "clear", Desc: "clear view"},
+		{Name: "exit", Desc: "exit TUI"},
+	}
 	return InputModel{
 		textInput:        ti,
 		textarea:         ta,
@@ -237,7 +251,7 @@ func (m InputModel) Update(msg tea.Msg) (InputModel, tea.Cmd) {
 }
 
 // SlashSuggestions returns available slash command suggestions.
-func (m InputModel) SlashSuggestions() []string {
+func (m InputModel) SlashSuggestions() []SlashSuggestion {
 	val := strings.TrimSpace(m.Value())
 	if !strings.HasPrefix(val, "/") {
 		return nil
@@ -258,9 +272,9 @@ func (m InputModel) SlashSuggestions() []string {
 		return nil
 	}
 
-	var matches []string
+	var matches []SlashSuggestion
 	for _, cmd := range m.slashSuggestions {
-		if strings.HasPrefix(cmd, partial) {
+		if strings.HasPrefix(cmd.Name, partial) {
 			matches = append(matches, cmd)
 		}
 	}
@@ -271,7 +285,7 @@ func (m InputModel) SlashSuggestions() []string {
 	}
 
 	// If exactly one match and it's the same as partial, command is fully typed — hide menu
-	if len(matches) == 1 && matches[0] == partial {
+	if len(matches) == 1 && matches[0].Name == partial {
 		return nil
 	}
 
@@ -285,9 +299,9 @@ func (m InputModel) SelectedSlashSuggestion() string {
 		return ""
 	}
 	if m.slashIndex < 0 || m.slashIndex >= len(suggestions) {
-		return suggestions[0]
+		return suggestions[0].Name
 	}
-	return suggestions[m.slashIndex]
+	return suggestions[m.slashIndex].Name
 }
 
 func (m *InputModel) moveSlashSelection(delta int) {
@@ -315,6 +329,17 @@ func (m *InputModel) SelectSlashSuggestion() bool {
 	}
 	m.SetValue("/" + selected + " ")
 	m.slashIndex = 0
+	if m.useTextarea {
+		m.textarea.CursorEnd()
+		if m.focused {
+			_ = m.textarea.Focus()
+		}
+	} else {
+		m.textInput.CursorEnd()
+		if m.focused {
+			_ = m.textInput.Focus()
+		}
+	}
 	return true
 }
 
@@ -462,13 +487,46 @@ func RenderSlashMenu(m InputModel, width int) string {
 
 	var lines []string
 	for i, cmd := range suggestions {
-		line := "/" + cmd
+		left := "/" + cmd.Name
+		desc := cmd.Desc
+		line := left
+		if strings.TrimSpace(desc) != "" {
+			leftWidth := lipgloss.Width(left)
+			maxDesc := width - leftWidth - 1
+			if maxDesc < 0 {
+				maxDesc = 0
+			}
+			if lipgloss.Width(desc) > maxDesc {
+				desc = truncateToWidth(desc, maxDesc)
+			}
+			descWidth := lipgloss.Width(desc)
+			spaces := width - leftWidth - descWidth
+			if spaces < 1 {
+				spaces = 1
+			}
+			line = left + strings.Repeat(" ", spaces) + metaStyle.Render(desc)
+		}
 		style := normalRowStyle
 		if i == m.slashIndex {
-			style = selectedRowStyle
+			style = selectedSlashRowStyle
 		}
 		lines = append(lines, style.Width(width).Inline(true).Render(line))
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func truncateToWidth(input string, maxWidth int) string {
+	if maxWidth <= 0 || input == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range input {
+		candidate := b.String() + string(r)
+		if lipgloss.Width(candidate) > maxWidth {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

@@ -63,7 +63,7 @@ func (d *DB) Conn() *sql.DB {
 
 // schemaVersion is bumped whenever schema.sql changes.
 // Migrate() skips execution if PRAGMA user_version already matches.
-const schemaVersion = 2
+const schemaVersion = 4
 
 // Migrate executes the embedded schema SQL to create or update database tables.
 // Uses PRAGMA user_version to skip re-execution on subsequent opens, which

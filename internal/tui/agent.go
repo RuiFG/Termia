@@ -70,6 +70,31 @@ func (m *AgentModel) AddMessage(msg string) {
 	}
 }
 
+func (m *AgentModel) SetMessages(messages []string) {
+	m.messages = nil
+	if len(messages) > 0 {
+		m.messages = append(m.messages, messages...)
+	}
+	m.refreshContent()
+	if m.ready {
+		m.viewport.GotoBottom()
+	}
+}
+
+// AppendToLast appends content to the most recent message.
+func (m *AgentModel) AppendToLast(chunk string) {
+	if len(m.messages) == 0 {
+		m.AddMessage(chunk)
+		return
+	}
+	last := len(m.messages) - 1
+	m.messages[last] += chunk
+	m.refreshContent()
+	if m.ready {
+		m.viewport.GotoBottom()
+	}
+}
+
 // Update handles events for the agent panel.
 func (m AgentModel) Update(msg tea.Msg) (AgentModel, tea.Cmd) {
 	if !m.ready {

@@ -34,6 +34,11 @@ func ShellDir() string {
 	return filepath.Join(TermiaDir(), "shell")
 }
 
+// AgentsDir returns the directory for agent role definitions.
+func AgentsDir() string {
+	return filepath.Join(TermiaDir(), "agents")
+}
+
 // CacheDir returns the directory for cached data.
 func CacheDir() string {
 	return filepath.Join(TermiaDir(), "cache")
@@ -47,6 +52,7 @@ func EnsureDirs() error {
 		filepath.Dir(DBPath()), // db directory
 		TranscriptsDir(),
 		ShellDir(),
+		AgentsDir(),
 		CacheDir(),
 	}
 

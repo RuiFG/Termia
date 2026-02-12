@@ -41,13 +41,41 @@ func overlayContent(base, over string, width, height int) string {
 		startY = 0
 	}
 
-	// Replace lines in the overlay zone
+	return overlayContentAt(baseLines, overLines, width, height, startY)
+}
+
+func overlayContentCentered(base, over string, width, height int) string {
+	baseLines := strings.Split(base, "\n")
+	overLines := strings.Split(over, "\n")
+	overH := len(overLines)
+	startY := (height - overH) / 2
+	if startY < 0 {
+		startY = 0
+	}
+	return overlayContentAt(baseLines, overLines, width, height, startY)
+}
+
+func overlayContentAt(baseLines, overLines []string, width, height, startY int) string {
+	// Normalize base to exactly `height` lines, each exactly `width` visible cells wide.
+	for len(baseLines) < height {
+		baseLines = append(baseLines, "")
+	}
+	if len(baseLines) > height {
+		baseLines = baseLines[:height]
+	}
+	for i := range baseLines {
+		baseLines[i] = padToWidth(baseLines[i], width)
+	}
+
+	if startY < 0 {
+		startY = 0
+	}
+
 	for oy := 0; oy < len(overLines); oy++ {
 		by := startY + oy
 		if by >= len(baseLines) {
 			break
 		}
-		// Pad/truncate overlay line to exactly `width`
 		baseLines[by] = padToWidth(overLines[oy], width)
 	}
 

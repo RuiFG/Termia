@@ -5,11 +5,11 @@ package config
 func DefaultConfig() *Config {
 	return &Config{
 		General: GeneralConfig{
-			StoragePath:           "~/.termia",
-			MaxTranscriptAgeDays:  90,
-			MaxDBSizeMB:           1000,
-			RecordOutputs:         true,
-			RecordEnvVars:         false,
+			StoragePath:          "~/.termia",
+			MaxTranscriptAgeDays: 90,
+			MaxDBSizeMB:          1000,
+			RecordOutputs:        true,
+			RecordEnvVars:        false,
 			IgnorePatterns: []string{
 				"^pass ",
 				"^export .*SECRET",
@@ -18,10 +18,10 @@ func DefaultConfig() *Config {
 		LLM: LLMConfig{
 			DefaultProvider: "openai",
 			OpenAI: LLMProviderConfig{
-				APIKeyEnv:  "OPENAI_API_KEY",
-				Model:      "gpt-4o",
-				MaxTokens:  2000,
-				BaseURL:    "",
+				APIKeyEnv: "OPENAI_API_KEY",
+				Model:     "gpt-4o",
+				MaxTokens: 2000,
+				BaseURL:   "",
 			},
 			Anthropic: LLMProviderConfig{
 				APIKeyEnv: "ANTHROPIC_API_KEY",
@@ -49,10 +49,16 @@ func DefaultConfig() *Config {
 			Navigation:      "vim",
 		},
 		Sync: SyncConfig{
-			Enabled:              false,
-			Endpoint:             "https://api.termia.io",
-			AutoSyncIntervalMin:  15,
-			EncryptLocal:         true,
+			Enabled:             false,
+			Endpoint:            "https://api.termia.io",
+			AutoSyncIntervalMin: 15,
+			EncryptLocal:        true,
+		},
+		Agent: AgentTeamConfig{
+			Roles:           []string{"coordinator", "researcher"},
+			RequireApproval: true,
+			MCPServers:      nil,
+			Teams:           nil,
 		},
 	}
 }

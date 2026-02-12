@@ -9,10 +9,11 @@ import (
 
 // Config represents the complete Termia configuration structure.
 type Config struct {
-	General GeneralConfig `toml:"general"`
-	LLM     LLMConfig     `toml:"llm"`
-	TUI     TUIConfig     `toml:"tui"`
-	Sync    SyncConfig    `toml:"sync"`
+	General GeneralConfig   `toml:"general"`
+	LLM     LLMConfig       `toml:"llm"`
+	TUI     TUIConfig       `toml:"tui"`
+	Sync    SyncConfig      `toml:"sync"`
+	Agent   AgentTeamConfig `toml:"agent_team"`
 }
 
 // GeneralConfig contains general application settings.
@@ -56,6 +57,27 @@ type SyncConfig struct {
 	Endpoint            string `toml:"endpoint"`
 	AutoSyncIntervalMin int    `toml:"auto_sync_interval_min"`
 	EncryptLocal        bool   `toml:"encrypt_local"`
+}
+
+// AgentTeamConfig contains agent team settings.
+type AgentTeamConfig struct {
+	Roles           []string           `toml:"roles"`
+	RequireApproval bool               `toml:"require_approval"`
+	MCPServers      []MCPServerConfig  `toml:"mcp_servers"`
+	Teams           []AgentTeamProfile `toml:"teams"`
+}
+
+// AgentTeamProfile defines a named team configuration.
+type AgentTeamProfile struct {
+	Name  string   `toml:"name"`
+	Roles []string `toml:"roles"`
+}
+
+// MCPServerConfig describes an MCP server placeholder configuration.
+type MCPServerConfig struct {
+	Name     string   `toml:"name"`
+	Endpoint string   `toml:"endpoint"`
+	Tools    []string `toml:"tools"`
 }
 
 // Load reads and parses a TOML configuration file from the given path.

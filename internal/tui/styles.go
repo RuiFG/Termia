@@ -90,7 +90,6 @@ var (
 	// Status bar at very bottom (inside container or outside?).
 	// If we use 3 blocks, status might be part of bottom or separate.
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(colorMuted).
 			Padding(0, 1)
 )
 
@@ -100,6 +99,10 @@ var (
 	selectedRowStyle = lipgloss.NewStyle().
 				Background(colorHighlight).
 				Foreground(colorOnSurface).
+				Bold(true)
+
+	selectedSlashRowStyle = lipgloss.NewStyle().
+				Background(colorHighlight).
 				Bold(true)
 
 	normalRowStyle = lipgloss.NewStyle().
@@ -151,6 +154,11 @@ var (
 			BorderBottom(false).
 			Padding(0, 1)
 
+	commandPaletteStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorSubtle).
+				Padding(0, 1)
+
 	// Loading indicator.
 	loadingStyle = lipgloss.NewStyle().
 			Foreground(colorMuted).
@@ -160,6 +168,15 @@ var (
 	citedBadgeStyle = lipgloss.NewStyle().
 			Foreground(colorSecondary).
 			Bold(true)
+
+	// Agent mode badges in input bar.
+	teamModeStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Bold(true)
+
+	copilotModeStyle = lipgloss.NewStyle().
+				Foreground(colorWarning).
+				Bold(true)
 
 	// Cited command marker in history rows.
 	citedMarkerStyle = lipgloss.NewStyle().

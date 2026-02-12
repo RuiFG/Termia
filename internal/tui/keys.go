@@ -20,8 +20,10 @@ type KeyMap struct {
 	Cite     key.Binding // Space to cite/reference a command in history
 
 	// Modes
-	Search key.Binding
-	Slash  key.Binding
+	Search   key.Binding
+	Slash    key.Binding
+	Palette  key.Binding
+	Variants key.Binding
 
 	// Quit
 	Quit      key.Binding
@@ -83,6 +85,14 @@ func DefaultKeyMap() KeyMap {
 		Slash: key.NewBinding(
 			key.WithKeys("/"),
 			key.WithHelp("/", "command"),
+		),
+		Palette: key.NewBinding(
+			key.WithKeys("ctrl+p"),
+			key.WithHelp("ctrl+p", "commands"),
+		),
+		Variants: key.NewBinding(
+			key.WithKeys("ctrl+t"),
+			key.WithHelp("ctrl+t", "variants"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("q"),

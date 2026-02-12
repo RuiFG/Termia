@@ -32,6 +32,26 @@ func NewAgentConfigFromConfig(llmCfg *config.LLMConfig) (*AgentConfig, error) {
 		return nil, fmt.Errorf("resolve provider: %w", err)
 	}
 
+	return newAgentConfigFromProvider(llmCfg, providerName, providerCfg)
+}
+
+// NewAgentConfigFromProvider builds an AgentConfig from a specific provider name.
+func NewAgentConfigFromProvider(llmCfg *config.LLMConfig, providerName string) (*AgentConfig, error) {
+	if llmCfg == nil {
+		return nil, fmt.Errorf("llm config is nil")
+	}
+	providerCfg, resolvedName, err := resolveProviderConfigByName(llmCfg, providerName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve provider: %w", err)
+	}
+	return newAgentConfigFromProvider(llmCfg, resolvedName, providerCfg)
+}
+
+func newAgentConfigFromProvider(_ *config.LLMConfig, providerName string, providerCfg *config.LLMProviderConfig) (*AgentConfig, error) {
+	if providerCfg == nil {
+		return nil, fmt.Errorf("provider config is nil")
+	}
+
 	apiKey := ""
 	if providerName != "ollama" || providerCfg.APIKeyEnv != "" {
 		resolved, err := resolveAPIKey(providerCfg.APIKeyEnv)
@@ -63,6 +83,10 @@ func resolveProviderConfig(llmCfg *config.LLMConfig) (*config.LLMProviderConfig,
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(llmCfg.DefaultProvider))
+	return resolveProviderConfigByName(llmCfg, provider)
+}
+
+func resolveProviderConfigByName(llmCfg *config.LLMConfig, provider string) (*config.LLMProviderConfig, string, error) {
 	switch provider {
 	case "openai":
 		return &llmCfg.OpenAI, provider, nil
@@ -73,7 +97,7 @@ func resolveProviderConfig(llmCfg *config.LLMConfig) (*config.LLMProviderConfig,
 	case "deepseek":
 		return &llmCfg.DeepSeek, provider, nil
 	default:
-		return nil, "", fmt.Errorf("unsupported provider: %s", llmCfg.DefaultProvider)
+		return nil, "", fmt.Errorf("unsupported provider: %s", provider)
 	}
 }
 

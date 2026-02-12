@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -67,8 +68,52 @@ type RunCommandRsp struct {
 	ExitCode int    `json:"exit_code"`
 }
 
+// ReadFileReq is the input for the read_file tool.
+type ReadFileReq struct {
+	Path string `json:"path" jsonschema:"description=File path to read,required"`
+}
+
+// ReadFileRsp is the output for the read_file tool.
+type ReadFileRsp struct {
+	Content string `json:"content"`
+}
+
+// GrepReq is the input for the grep tool.
+type GrepReq struct {
+	Pattern string `json:"pattern" jsonschema:"description=Regex pattern,required"`
+	Path    string `json:"path" jsonschema:"description=Path to file or directory,required"`
+}
+
+// GrepRsp is the output for the grep tool.
+type GrepRsp struct {
+	Matches string `json:"matches"`
+}
+
+// EditFileReq is the input for the edit_file tool.
+type EditFileReq struct {
+	Path    string `json:"path" jsonschema:"description=File path to edit,required"`
+	OldText string `json:"old_text" jsonschema:"description=Exact text to replace,required"`
+	NewText string `json:"new_text" jsonschema:"description=Replacement text,required"`
+}
+
+// EditFileRsp is the output for the edit_file tool.
+type EditFileRsp struct {
+	Result string `json:"result"`
+}
+
+// WriteFileReq is the input for the write_file tool.
+type WriteFileReq struct {
+	Path    string `json:"path" jsonschema:"description=File path to write,required"`
+	Content string `json:"content" jsonschema:"description=File content,required"`
+}
+
+// WriteFileRsp is the output for the write_file tool.
+type WriteFileRsp struct {
+	Result string `json:"result"`
+}
+
 // CreateTools returns the toolset available to the agent as Eino tools.
-func CreateTools(database *db.DB) []tool.BaseTool {
+func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 	queryCommandsTool := utils.NewTool(&schema.ToolInfo{
 		Name: "query_commands",
 		Desc: "Query recent command history. Filter by search text or get recent commands.",
@@ -161,6 +206,149 @@ func CreateTools(database *db.DB) []tool.BaseTool {
 		return &SearchHistoryRsp{Result: formatCommandsForLLM(commands)}, nil
 	})
 
+	readFileTool := utils.NewTool(&schema.ToolInfo{
+		Name: "read_file",
+		Desc: "Read a text file from disk.",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"path": {Type: schema.String, Required: true, Desc: "File path to read"},
+		}),
+	}, func(ctx context.Context, req *ReadFileReq) (*ReadFileRsp, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		path, err := safePath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		if requireApproval {
+			approved, err := promptCommandApproval(fmt.Sprintf("read file: %s", path))
+			if err != nil {
+				return nil, err
+			}
+			if !approved {
+				return &ReadFileRsp{Content: ""}, nil
+			}
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read file: %w", err)
+		}
+		return &ReadFileRsp{Content: string(data)}, nil
+	})
+
+	grepTool := utils.NewTool(&schema.ToolInfo{
+		Name: "grep",
+		Desc: "Search for a regex pattern in a file or directory.",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"pattern": {Type: schema.String, Required: true, Desc: "Regex pattern"},
+			"path":    {Type: schema.String, Required: true, Desc: "File or directory path"},
+		}),
+	}, func(ctx context.Context, req *GrepReq) (*GrepRsp, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		pattern := strings.TrimSpace(req.Pattern)
+		if pattern == "" {
+			return nil, fmt.Errorf("pattern is required")
+		}
+		path, err := safePath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		if requireApproval {
+			approved, err := promptCommandApproval(fmt.Sprintf("grep path: %s", path))
+			if err != nil {
+				return nil, err
+			}
+			if !approved {
+				return &GrepRsp{Matches: ""}, nil
+			}
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex: %w", err)
+		}
+		matches, err := grepPath(re, path)
+		if err != nil {
+			return nil, err
+		}
+		return &GrepRsp{Matches: matches}, nil
+	})
+
+	editFileTool := utils.NewTool(&schema.ToolInfo{
+		Name: "edit_file",
+		Desc: "Replace exact text in a file.",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"path":     {Type: schema.String, Required: true, Desc: "File path"},
+			"old_text": {Type: schema.String, Required: true, Desc: "Exact text to replace"},
+			"new_text": {Type: schema.String, Required: true, Desc: "Replacement text"},
+		}),
+	}, func(ctx context.Context, req *EditFileReq) (*EditFileRsp, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		path, err := safePath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		if requireApproval {
+			approved, err := promptCommandApproval(fmt.Sprintf("edit file: %s", path))
+			if err != nil {
+				return nil, err
+			}
+			if !approved {
+				return &EditFileRsp{Result: "user rejected edit"}, nil
+			}
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read file: %w", err)
+		}
+		oldText := req.OldText
+		if oldText == "" {
+			return nil, fmt.Errorf("old_text is required")
+		}
+		content := string(data)
+		if !strings.Contains(content, oldText) {
+			return nil, fmt.Errorf("old_text not found in file")
+		}
+		updated := strings.Replace(content, oldText, req.NewText, 1)
+		if err := os.WriteFile(path, []byte(updated), 0644); err != nil {
+			return nil, fmt.Errorf("write file: %w", err)
+		}
+		return &EditFileRsp{Result: "updated"}, nil
+	})
+
+	writeFileTool := utils.NewTool(&schema.ToolInfo{
+		Name: "write_file",
+		Desc: "Write content to a file (overwrite).",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"path":    {Type: schema.String, Required: true, Desc: "File path"},
+			"content": {Type: schema.String, Required: true, Desc: "File content"},
+		}),
+	}, func(ctx context.Context, req *WriteFileReq) (*WriteFileRsp, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		path, err := safePath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		if requireApproval {
+			approved, err := promptCommandApproval(fmt.Sprintf("write file: %s", path))
+			if err != nil {
+				return nil, err
+			}
+			if !approved {
+				return &WriteFileRsp{Result: "user rejected write"}, nil
+			}
+		}
+		if err := os.WriteFile(path, []byte(req.Content), 0644); err != nil {
+			return nil, fmt.Errorf("write file: %w", err)
+		}
+		return &WriteFileRsp{Result: "written"}, nil
+	})
+
 	runCommandTool := utils.NewTool(&schema.ToolInfo{
 		Name: "command",
 		Desc: "Propose and execute a shell command after user approval.",
@@ -176,12 +364,14 @@ func CreateTools(database *db.DB) []tool.BaseTool {
 		if cmdLine == "" {
 			return nil, fmt.Errorf("command is required")
 		}
-		approved, err := promptCommandApproval(cmdLine)
-		if err != nil {
-			return nil, err
-		}
-		if !approved {
-			return &RunCommandRsp{Stdout: "", Stderr: "user rejected command", ExitCode: 130}, nil
+		if requireApproval {
+			approved, err := promptCommandApproval(cmdLine)
+			if err != nil {
+				return nil, err
+			}
+			if !approved {
+				return &RunCommandRsp{Stdout: "", Stderr: "user rejected command", ExitCode: 130}, nil
+			}
 		}
 		stdout, stderr, exitCode, err := runShellCommand(ctx, cmdLine, strings.TrimSpace(req.Cwd))
 		if err != nil {
@@ -190,7 +380,79 @@ func CreateTools(database *db.DB) []tool.BaseTool {
 		return &RunCommandRsp{Stdout: stdout, Stderr: stderr, ExitCode: exitCode}, nil
 	})
 
-	return []tool.BaseTool{queryCommandsTool, getCommandOutputTool, searchHistoryTool, runCommandTool}
+	return []tool.BaseTool{
+		queryCommandsTool,
+		getCommandOutputTool,
+		searchHistoryTool,
+		runCommandTool,
+		readFileTool,
+		grepTool,
+		editFileTool,
+		writeFileTool,
+	}
+}
+
+func safePath(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("resolve path: %w", err)
+	}
+	return abs, nil
+}
+
+func grepPath(re *regexp.Regexp, path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat path: %w", err)
+	}
+	if !info.IsDir() {
+		return grepFile(re, path)
+	}
+
+	var builder strings.Builder
+	walkErr := filepath.WalkDir(path, func(entryPath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		matches, err := grepFile(re, entryPath)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(matches) != "" {
+			builder.WriteString(matches)
+			if !strings.HasSuffix(matches, "\n") {
+				builder.WriteString("\n")
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return "", fmt.Errorf("grep path: %w", walkErr)
+	}
+
+	return builder.String(), nil
+}
+
+func grepFile(re *regexp.Regexp, path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+	lines := strings.Split(string(data), "\n")
+	var builder strings.Builder
+	for i, line := range lines {
+		if re.MatchString(line) {
+			builder.WriteString(fmt.Sprintf("%s:%d:%s\n", path, i+1, line))
+		}
+	}
+	return builder.String(), nil
 }
 
 // parseToolArgs is a legacy helper kept for BuildContext usage.

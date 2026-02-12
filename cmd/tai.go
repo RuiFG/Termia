@@ -88,29 +88,22 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Create agent config
+	// Create agent config (for metadata storage)
 	agentCfg, err := agent.NewAgentConfigFromConfig(&cfg.LLM)
 	if err != nil {
 		fmt.Printf("⚠️  LLM not configured: %v. Set up with `termia config edit`\n", err)
 		return nil
 	}
 
-	// Create model
 	model, err := agent.NewModel(agentCfg)
 	if err != nil {
 		return fmt.Errorf("failed to create model: %w", err)
 	}
-
-	// Create tools
-	tools := agent.CreateTools(database)
-	boundModel, err := agent.BindTools(model, tools)
+	tools := agent.CreateTools(database, cfg.Agent.RequireApproval)
+	reactRunner, err := agent.NewReactRunner(context.Background(), model, tools, database, logger)
 	if err != nil {
-		return fmt.Errorf("failed to bind tools: %w", err)
+		return fmt.Errorf("failed to create react runner: %w", err)
 	}
-
-	// Create runner
-	runner := agent.NewRunner(boundModel, database, logger, agentCfg)
-	defer runner.Close()
 
 	// Create context with signal cancellation
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -124,7 +117,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 	}
 
 	// Run analysis
-	stream, err := runner.RunAgent(ctx, tools, userQuery, selectedCommands)
+	stream, err := reactRunner.Run(ctx, userQuery, selectedCommands)
 	if err != nil {
 		return fmt.Errorf("failed to run analysis: %w", err)
 	}

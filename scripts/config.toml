@@ -1,0 +1,61 @@
+# Termia Configuration
+# Location: ~/.termia/config.toml
+
+[general]
+# Storage
+storage_path = "~/.termia"
+max_transcript_age_days = 90    # Auto-delete old transcripts
+max_db_size_mb = 1000           # Rotate DB when exceeds
+
+# Recording
+record_outputs = true           # Capture stdout/stderr
+record_env_vars = false         # Store environment (privacy risk)
+ignore_patterns = [
+    "^pass ",                   # Password manager
+    "^export .*SECRET",         # Secrets
+]
+
+[llm]
+# Default provider
+default_provider = "openai"     # "openai" | "anthropic" | "ollama" | "deepseek"
+
+# OpenAI
+[llm.openai]
+api_key_env = "OPENAI_API_KEY"  # Read from env var
+model = "gpt-4o"
+max_tokens = 2000
+base_url = ""                   # Optional: override default endpoint
+
+# Anthropic (native support via trpc-agent-go)
+[llm.anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-3-7-sonnet-20250219"
+max_tokens = 2000
+
+# Ollama (local)
+[llm.ollama]
+api_key_env = ""                # Ollama doesn't require API key
+model = "llama3.2:latest"
+base_url = "http://localhost:11434/v1"
+
+# DeepSeek
+[llm.deepseek]
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com"
+
+[tui]
+# Theme
+theme = "default"               # "default" | "nord" | "dracula"
+show_exit_codes = true
+highlight_errors = true         # Red background for exit != 0
+
+# Keybindings (vim-style by default)
+navigation = "vim"              # "vim" | "emacs" | "arrows"
+
+[sync]
+# Cloud sync (P1)
+enabled = false
+endpoint = "https://api.termia.io"
+auto_sync_interval_min = 15
+encrypt_local = true            # E2E encryption

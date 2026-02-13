@@ -135,7 +135,7 @@ func DefaultKeyMap() KeyMap {
 
 // HistoryHelp returns short help text for history mode.
 func HistoryHelp() string {
-	return "↑↓: navigate | enter: preview | space: cite | d: delete | f: fav | tab: switch"
+	return "↑↓: navigate | enter: detail | space: cite | d: delete | f: fav | tab: switch"
 }
 
 // PreviewHelp returns short help text for preview mode.

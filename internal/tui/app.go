@@ -95,9 +95,27 @@ type App struct {
 	menuHeight    int
 	inputHeight   int
 	statusHeight  int
+	leftWidth     int
+	rightWidth    int
+	leftContentW  int
+	rightContentW int
+	twoColumn     bool
+	modalWidth    int
+	modalHeight   int
+	modalXStart   int
+	modalXEnd     int
+	modalYStart   int
+	modalYEnd     int
+	modalContentX int
+	modalContentY int
+	modalContentW int
+	modalContentH int
 	ready         bool
 
-	// Panel Y positions (rendered, relative to container content area)
+	leftXStart    int
+	leftXEnd      int
+	rightXStart   int
+	rightXEnd     int
 	historyYStart int
 	historyYEnd   int
 	contentYStart int
@@ -106,11 +124,14 @@ type App struct {
 	inputYEnd     int
 
 	// State
-	focus      Focus
-	middleMode MiddleMode
-	agentMode  AgentMode
-	thinkLevel ThinkLevel
-	statusMsg  string
+	focus            Focus
+	middleMode       MiddleMode
+	detailOpen       bool
+	agentMode        AgentMode
+	thinkLevel       ThinkLevel
+	statusMsg        string
+	contentSelection textSelection
+	inputSelection   textSelection
 
 	// Team selection
 	teams           []config.AgentTeamProfile
@@ -120,17 +141,20 @@ type App struct {
 	// Sessions
 	sessions        []db.AgentSession
 	activeSessionID string
-	responseBuffer  strings.Builder
+	responseBuffer  []string
 
 	// Command palette
 	paletteOpen  bool
 	paletteStage paletteStage
 	paletteIndex int
+	paletteQuery string
 
 	// Sub-models
 	history HistoryModel
 	preview PreviewModel
+	detail  HistoryDetailModel
 	agent   AgentModel
+	modal   ModalModel
 	input   InputModel
 	keys    KeyMap
 }
@@ -203,7 +227,9 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		thinkLevel:      ThinkMedium,
 		history:         NewHistoryModel(keys),
 		preview:         NewPreviewModel(keys),
+		detail:          NewHistoryDetailModel(keys),
 		agent:           NewAgentModel(keys),
+		modal:           NewModalModel(),
 		input:           NewInputModel(),
 		keys:            keys,
 		teams:           teams,
@@ -288,7 +314,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case outputLoadedMsg:
-		// Only apply output if it's for the currently previewed command (prevents stale data)
+		if a.modal.IsOpen() && a.modal.CommandID() == msg.commandID {
+			a.modal.SetContent(msg.content)
+			return a, nil
+		}
+		if a.detailOpen && a.detail.CommandID() == msg.commandID {
+			a.detail.SetContent(msg.content)
+			return a, nil
+		}
 		if a.preview.CommandID() == msg.commandID {
 			a.preview.SetContent(msg.content)
 		}
@@ -304,7 +337,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentChunkMsg:
 		if msg.chunk != "" {
 			a.agent.AppendToLast(msg.chunk)
-			a.responseBuffer.WriteString(msg.chunk)
+			a.responseBuffer = append(a.responseBuffer, msg.chunk)
 		}
 		return a, readAgentChunkCmd(msg.stream)
 
@@ -312,8 +345,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.activeSessionID == "" {
 			return a, nil
 		}
-		response := strings.TrimSpace(a.responseBuffer.String())
-		a.responseBuffer.Reset()
+		response := strings.TrimSpace(strings.Join(a.responseBuffer, ""))
+		a.responseBuffer = nil
 		if response == "" {
 			return a, nil
 		}
@@ -324,6 +357,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
+		if a.modal.IsOpen() {
+			return a.handleModalKey(msg)
+		}
 		if a.paletteOpen {
 			switch {
 			case msg.Type == tea.KeyEsc:
@@ -340,8 +376,57 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return a, nil
 			case msg.Type == tea.KeyEnter:
 				return a.handlePaletteSelect()
+			case msg.Type == tea.KeyBackspace:
+				if a.paletteQuery != "" {
+					runes := []rune(a.paletteQuery)
+					if len(runes) > 0 {
+						a.paletteQuery = string(runes[:len(runes)-1])
+					}
+					a.paletteIndex = 0
+				}
+				return a, nil
+			case msg.Type == tea.KeySpace:
+				a.paletteQuery += " "
+				a.paletteIndex = 0
+				return a, nil
+			case msg.Type == tea.KeyRunes:
+				if len(msg.Runes) > 0 {
+					a.paletteQuery += string(msg.Runes)
+					a.paletteIndex = 0
+				}
+				return a, nil
 			}
 			return a, nil
+		}
+
+		if a.detailOpen && msg.Type == tea.KeyEsc {
+			return a.closeDetail()
+		}
+		if a.detailOpen && msg.Type == tea.KeyCtrlC {
+			text := a.detail.SelectedText()
+			a.detail.ClearSelection()
+			if text == "" {
+				return a, nil
+			}
+			return a, copyToClipboardCmd(text)
+		}
+		if msg.Type == tea.KeyCtrlC {
+			if a.contentSelection.HasSelection() {
+				text := a.contentSelection.SelectedText()
+				a.contentSelection.Clear()
+				if text == "" {
+					return a, nil
+				}
+				return a, copyToClipboardCmd(text)
+			}
+			if a.inputSelection.HasSelection() {
+				text := a.inputSelection.SelectedText()
+				a.inputSelection.Clear()
+				if text == "" {
+					return a, nil
+				}
+				return a, copyToClipboardCmd(text)
+			}
 		}
 
 		// Global Keybindings
@@ -382,7 +467,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		return a, nil
+		return a.handleMouse(msg)
 	}
 
 	// Forward non-key, non-mouse messages (e.g. blink, tick) to sub-models
@@ -396,7 +481,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	a.history, cmd = a.history.Update(msg)
 	cmds = append(cmds, cmd)
 
-	if a.middleMode == ModePreview {
+	if a.detailOpen {
+		a.detail, cmd = a.detail.Update(msg)
+		cmds = append(cmds, cmd)
+	} else if a.middleMode == ModePreview {
 		a.preview, cmd = a.preview.Update(msg)
 		cmds = append(cmds, cmd)
 	} else {
@@ -462,8 +550,7 @@ func (a App) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case key.Matches(msg, a.keys.Enter):
-		// Enter on history -> Load output into Middle Panel and Switch to Preview Mode
-		return a.previewSelected()
+		return a.openDetailSelected()
 
 	case key.Matches(msg, a.keys.Delete):
 		return a.deleteSelected()
@@ -489,18 +576,135 @@ func (a App) handleContentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	case key.Matches(msg, a.keys.Back):
 		// Back -> Focus History
+		if a.detailOpen {
+			return a.closeDetail()
+		}
 		a.focus = FocusHistory
 		a.updateFocusState()
 		return a, nil
 	}
 
 	var cmd tea.Cmd
-	if a.middleMode == ModePreview {
+	if a.detailOpen {
+		a.detail, cmd = a.detail.Update(msg)
+	} else if a.middleMode == ModePreview {
 		a.preview, cmd = a.preview.Update(msg)
 	} else {
 		a.agent, cmd = a.agent.Update(msg)
 	}
 	return a, cmd
+}
+
+func (a App) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, a.keys.PageUp) {
+		a.modal.PageScroll(-1)
+		return a, nil
+	}
+	if key.Matches(msg, a.keys.PageDown) {
+		a.modal.PageScroll(1)
+		return a, nil
+	}
+	switch msg.Type {
+	case tea.KeyEsc:
+		a.modal.Close()
+		return a, nil
+	case tea.KeyCtrlC:
+		text := a.modal.SelectedText()
+		a.modal.ClearSelection()
+		if text == "" {
+			return a, nil
+		}
+		return a, copyToClipboardCmd(text)
+	}
+
+	a.modal.HandleKey(msg.Type)
+	return a, nil
+}
+
+func (a App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	contentX := msg.X
+	contentY := msg.Y
+	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+		if focus, ok := a.focusFromMouse(contentX, contentY); ok {
+			a.focus = focus
+			a.updateFocusState()
+		}
+	}
+	if a.modal.IsOpen() {
+		if msg.Button == tea.MouseButtonWheelUp {
+			a.modal.Scroll(-3)
+			return a, nil
+		}
+		if msg.Button == tea.MouseButtonWheelDown {
+			a.modal.Scroll(3)
+			return a, nil
+		}
+
+		if msg.Button != tea.MouseButtonLeft {
+			return a, nil
+		}
+
+		if contentX < a.modalContentX || contentX >= a.modalContentX+a.modalContentW {
+			if msg.Action == tea.MouseActionRelease {
+				a.modal.EndSelection()
+			}
+			return a, nil
+		}
+		if contentY < a.modalContentY || contentY >= a.modalContentY+a.modalContentH {
+			if msg.Action == tea.MouseActionRelease {
+				a.modal.EndSelection()
+			}
+			return a, nil
+		}
+
+		line := a.modal.ScrollOffset() + (contentY - a.modalContentY)
+		col := contentX - a.modalContentX
+
+		switch msg.Action {
+		case tea.MouseActionPress:
+			a.modal.BeginSelection(line, col)
+		case tea.MouseActionMotion:
+			a.modal.UpdateSelection(line, col)
+		case tea.MouseActionRelease:
+			a.modal.UpdateSelection(line, col)
+			a.modal.EndSelection()
+		}
+
+		return a, nil
+	}
+
+	if handled, cmd := a.handleInputSelection(msg, contentX, contentY); handled {
+		return a, cmd
+	}
+
+	if a.detailOpen {
+		return a.handleDetailSelection(msg, contentX, contentY)
+	}
+
+	return a.handleContentSelection(msg, contentX, contentY)
+}
+
+func (a App) focusFromMouse(x, y int) (Focus, bool) {
+	if a.rightWidth > 0 {
+		if x >= a.rightXStart && x <= a.rightXEnd && y >= a.historyYStart && y <= a.historyYEnd {
+			return FocusHistory, true
+		}
+	} else {
+		if x >= a.leftXStart && x <= a.leftXEnd && y >= a.historyYStart && y <= a.historyYEnd {
+			return FocusHistory, true
+		}
+	}
+
+	if x >= a.leftXStart && x <= a.leftXEnd {
+		if y >= a.contentYStart && y <= a.contentYEnd {
+			return FocusContent, true
+		}
+		if y >= a.inputYStart && y <= a.inputYEnd {
+			return FocusInput, true
+		}
+	}
+
+	return FocusHistory, false
 }
 
 // submitInput handles Enter press on the input bar.
@@ -525,7 +729,7 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 	a.middleMode = ModeAgent
 	a.agent.AddMessage(fmt.Sprintf("> %s", val))
 	a.agent.AddMessage("")
-	a.responseBuffer.Reset()
+	a.responseBuffer = nil
 
 	if a.activeSessionID == "" {
 		newSession, err := createSession(a.db)
@@ -567,6 +771,97 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 
 	a.input.Reset()
 	return a, readAgentChunkCmd(stream)
+}
+
+func (a App) openModalSelected() (tea.Model, tea.Cmd) {
+	cmd := a.history.SelectedCommand()
+	if cmd == nil {
+		return a, nil
+	}
+	header := formatCommandDetails(cmd)
+	if isInteractiveCommand(cmd.Command) {
+		a.modal.Open(cmd.ID)
+		a.modal.SetHeader(header)
+		a.modal.SetContent("(Interactive command — preview not available)")
+		return a, nil
+	}
+	return a.openModalCommand(cmd, header)
+}
+
+func (a App) openModalCommand(cmd *db.Command, header string) (tea.Model, tea.Cmd) {
+	a.modal.Open(cmd.ID)
+	a.modal.SetHeader(header)
+	a.modal.SetContent("")
+	return a, loadOutputCmd(a.db, cmd.ID)
+}
+
+func (a App) openDetailSelected() (tea.Model, tea.Cmd) {
+	cmd := a.history.SelectedCommand()
+	if cmd == nil {
+		return a, nil
+	}
+	if isInteractiveCommand(cmd.Command) {
+		a.detailOpen = true
+		a.detail.SetCommand(cmd)
+		a.detail.SetContent("(Interactive command — preview not available)")
+		return a, nil
+	}
+	return a.openDetailCommand(cmd)
+}
+
+func (a App) openDetailCommand(cmd *db.Command) (tea.Model, tea.Cmd) {
+	a.detailOpen = true
+	a.detail.SetCommand(cmd)
+	a.detail.SetContent("")
+	return a, loadOutputCmd(a.db, cmd.ID)
+}
+
+func (a App) closeDetail() (tea.Model, tea.Cmd) {
+	a.detailOpen = false
+	a.detail.ClearContent()
+	a.focus = FocusHistory
+	a.updateFocusState()
+	return a, nil
+}
+
+func formatCommandDetails(cmd *db.Command) string {
+	if cmd == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Command: ")
+	b.WriteString(cmd.Command)
+	b.WriteString("\nCwd: ")
+	if strings.TrimSpace(cmd.Cwd) == "" {
+		b.WriteString("-")
+	} else {
+		b.WriteString(cmd.Cwd)
+	}
+	b.WriteString("\nExit: ")
+	if cmd.ExitCode == nil {
+		b.WriteString("unknown")
+	} else if *cmd.ExitCode == 0 {
+		b.WriteString("success (0)")
+	} else {
+		b.WriteString(fmt.Sprintf("failed (%d)", *cmd.ExitCode))
+	}
+	b.WriteString("\nTime: ")
+	if cmd.TsStart == 0 {
+		b.WriteString("-")
+	} else {
+		b.WriteString(time.Unix(0, cmd.TsStart).Format("2006-01-02 15:04:05"))
+	}
+	return b.String()
+}
+
+func copyToClipboardCmd(text string) tea.Cmd {
+	if text == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		_ = copyToClipboard(text)
+		return nil
+	}
 }
 
 func (a *App) runTeamQuery(query string) (<-chan string, error) {
@@ -775,21 +1070,38 @@ func (a App) View() string {
 		innerH = 6
 	}
 
-	// Panel frame dimensions (border + padding)
-	panelFW, _ := historyPaneStyle.GetFrameSize()
-	panelContentWidth := innerW - panelFW
-	if panelContentWidth < 10 {
-		panelContentWidth = 10
+	if a.modal.IsOpen() {
+		return a.modal.View()
 	}
 
-	// Render components
-	history := a.renderHistory(panelContentWidth)
-	content := a.renderContent(panelContentWidth)
-	inputSection := a.renderInput(panelContentWidth)
-	status := a.renderStatusBar(panelContentWidth)
+	statusFW, _ := statusBarStyle.GetFrameSize()
+	statusContentW := innerW - statusFW
+	if statusContentW < 1 {
+		statusContentW = 1
+	}
+	status := a.renderStatusBar(statusContentW)
 
-	// Compose layout: history + content + input
-	body := lipgloss.JoinVertical(lipgloss.Left, history, content, inputSection, status)
+	var body string
+	if a.twoColumn {
+		left := lipgloss.JoinVertical(
+			lipgloss.Left,
+			a.renderContent(a.leftContentW),
+			a.renderInput(a.leftContentW),
+		)
+		right := a.renderHistory(a.rightContentW)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+		body = lipgloss.JoinVertical(lipgloss.Left, body, status)
+	} else {
+		history := a.renderHistory(a.leftContentW)
+		content := a.renderContent(a.leftContentW)
+		inputSection := a.renderInput(a.leftContentW)
+		body = lipgloss.JoinVertical(lipgloss.Left, history, content, inputSection, status)
+	}
+
+	if a.paletteOpen {
+		palette := a.renderCommandPalette(innerW)
+		body = overlayContentCentered(body, palette, innerW, innerH)
+	}
 
 	// Container uses Height/Width to ensure minimum size (pads if body is shorter).
 	// Do NOT use MaxHeight/MaxWidth — they truncate AFTER borders, clipping the bottom border.
@@ -822,10 +1134,15 @@ func (a App) renderHistory(contentWidth int) string {
 // BEFORE the panel border is applied, avoiding ANSI complexity.
 func (a App) renderContent(contentWidth int) string {
 	var content string
-	if a.middleMode == ModePreview {
+	if a.detailOpen {
+		content = a.detail.View()
+	} else if a.middleMode == ModePreview {
 		content = a.preview.View()
 	} else {
 		content = a.agent.View()
+	}
+	if !a.detailOpen && a.contentSelection.HasSelection() {
+		content = strings.Join(a.contentSelection.HighlightLines(contentWidth), "\n")
 	}
 
 	// Clamp inner content to exact height BEFORE border is applied.
@@ -866,14 +1183,29 @@ func (a App) renderContent(contentWidth int) string {
 		}
 	}
 
-	if a.paletteOpen {
-		totalWidth := lipgloss.Width(panel)
-		totalHeight := lipgloss.Height(panel)
-		palette := a.renderCommandPalette(totalWidth)
-		panel = overlayContentCentered(panel, palette, totalWidth, totalHeight)
-	}
-
 	return panel
+}
+
+func contentSelectionLines(content string, width, height int) []string {
+	clampStyle := lipgloss.NewStyle().Width(width).Height(height).MaxHeight(height)
+	inner := clampStyle.Render(content)
+	plain := stripANSICodes(inner)
+	lines := strings.Split(plain, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	return lines
+}
+
+func panelInnerOrigin(style lipgloss.Style, xStart, yStart int) (int, int) {
+	return xStart + style.GetBorderLeftSize() + style.GetPaddingLeft(),
+		yStart + style.GetBorderTopSize() + style.GetPaddingTop()
 }
 
 // renderInput renders the input panel with border based on focus.
@@ -885,8 +1217,27 @@ func (a App) renderInput(contentWidth int) string {
 	// Status line: agent label + model + thinking level + citations
 	citedCount := a.history.CitedCount()
 	status := a.renderAgentStatusLine()
-	badge := citedBadgeStyle.Render(fmt.Sprintf("📎 %d commands referenced", citedCount))
-	inner := inputView + "\n" + strings.TrimSpace(status+" "+badge)
+	label := "commands"
+	if citedCount <= 1 {
+		label = "command"
+	}
+	badge := citedBadgeStyle.Render(fmt.Sprintf("📎 %d %s referenced", citedCount, label))
+	statusLine := buildStatusLine(status, badge, contentWidth)
+
+	inputLines := strings.Split(inputView, "\n")
+	if a.inputSelection.HasSelection() {
+		inputLines = a.inputSelection.HighlightLines(contentWidth)
+	}
+	inputAreaLines := a.inputHeight - 1
+	blankLines := inputAreaLines - len(inputLines)
+	if blankLines < 1 {
+		blankLines = 1
+	}
+	for i := 0; i < blankLines; i++ {
+		inputLines = append(inputLines, "")
+	}
+	inputLines = append(inputLines, statusLine)
+	inner := strings.Join(inputLines, "\n")
 
 	// Clamp inner content to exact height BEFORE border is applied.
 	clamp := lipgloss.NewStyle().Width(contentWidth).Height(a.inputHeight).MaxHeight(a.inputHeight)
@@ -921,7 +1272,7 @@ func (a App) renderAgentStatusLine() string {
 		parts = append(parts, metaStyle.Render("Model: "+modelLabel))
 	}
 	if thinkLabel != "" {
-		parts = append(parts, metaStyle.Render("Think: "+thinkLabel))
+		parts = append(parts, a.thinkLevelStyle().Render(thinkLabel))
 	}
 	return strings.Join(parts, "  ")
 }
@@ -961,6 +1312,17 @@ func (a App) thinkLevelLabel() string {
 		return "High"
 	default:
 		return "Medium"
+	}
+}
+
+func (a App) thinkLevelStyle() lipgloss.Style {
+	switch a.thinkLevel {
+	case ThinkLow:
+		return thinkLowStyle
+	case ThinkHigh:
+		return thinkHighStyle
+	default:
+		return thinkMediumStyle
 	}
 }
 
@@ -1059,16 +1421,18 @@ func (a *App) openPalette() {
 	a.paletteOpen = true
 	a.paletteStage = paletteStageSuggested
 	a.paletteIndex = 0
+	a.paletteQuery = ""
 }
 
 func (a *App) closePalette() {
 	a.paletteOpen = false
 	a.paletteStage = paletteStageSuggested
 	a.paletteIndex = 0
+	a.paletteQuery = ""
 }
 
 func (a *App) movePaletteSelection(delta int) {
-	items := a.paletteItems()
+	items := a.paletteVisibleItems()
 	if len(items) == 0 {
 		a.paletteIndex = 0
 		return
@@ -1082,7 +1446,7 @@ func (a *App) movePaletteSelection(delta int) {
 }
 
 func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
-	items := a.paletteItems()
+	items := a.paletteVisibleItems()
 	if len(items) == 0 {
 		return a, nil
 	}
@@ -1136,6 +1500,221 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 	}
 }
 
+func (a App) handleDetailSelection(msg tea.MouseMsg, contentX, contentY int) (tea.Model, tea.Cmd) {
+	if contentX < a.leftXStart || contentX > a.leftXEnd {
+		if msg.Action == tea.MouseActionRelease {
+			a.detail.EndSelection()
+		}
+		return a, nil
+	}
+	if contentY < a.contentYStart || contentY > a.contentYEnd {
+		if msg.Action == tea.MouseActionRelease {
+			a.detail.EndSelection()
+		}
+		return a, nil
+	}
+
+	innerX, innerY := panelInnerOrigin(contentPaneStyle, a.leftXStart, a.contentYStart)
+	innerW := a.leftContentW
+	innerH := a.middleHeight
+
+	if contentX < innerX || contentX >= innerX+innerW {
+		if msg.Action == tea.MouseActionRelease {
+			a.detail.EndSelection()
+		}
+		return a, nil
+	}
+	if contentY < innerY || contentY >= innerY+innerH {
+		if msg.Action == tea.MouseActionRelease {
+			a.detail.EndSelection()
+		}
+		return a, nil
+	}
+
+	if msg.Button == tea.MouseButtonWheelUp {
+		a.detail.Scroll(-3)
+		return a, nil
+	}
+	if msg.Button == tea.MouseButtonWheelDown {
+		a.detail.Scroll(3)
+		return a, nil
+	}
+
+	if msg.Button != tea.MouseButtonLeft {
+		return a, nil
+	}
+
+	headerHeight := a.detail.HeaderHeight()
+	contentStartY := innerY + headerHeight
+	contentEndY := contentStartY + a.detail.ContentHeight() - 1
+	if contentY < contentStartY || contentY > contentEndY {
+		if msg.Action == tea.MouseActionRelease {
+			a.detail.EndSelection()
+		}
+		return a, nil
+	}
+
+	line := a.detail.ScrollOffset() + (contentY - contentStartY)
+	col := contentX - innerX
+
+	switch msg.Action {
+	case tea.MouseActionPress:
+		a.detail.BeginSelection(line, col)
+	case tea.MouseActionMotion:
+		a.detail.UpdateSelection(line, col)
+	case tea.MouseActionRelease:
+		a.detail.UpdateSelection(line, col)
+		a.detail.EndSelection()
+	}
+
+	return a, nil
+}
+
+func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (tea.Model, tea.Cmd) {
+	if contentX < a.leftXStart || contentX > a.leftXEnd {
+		if msg.Action == tea.MouseActionRelease {
+			a.contentSelection.EndSelection()
+		}
+		return a, nil
+	}
+	if contentY < a.contentYStart || contentY > a.contentYEnd {
+		if msg.Action == tea.MouseActionRelease {
+			a.contentSelection.EndSelection()
+		}
+		return a, nil
+	}
+
+	innerX, innerY := panelInnerOrigin(contentPaneStyle, a.leftXStart, a.contentYStart)
+	innerW := a.leftContentW
+	innerH := a.middleHeight
+
+	if contentX < innerX || contentX >= innerX+innerW {
+		if msg.Action == tea.MouseActionRelease {
+			a.contentSelection.EndSelection()
+		}
+		return a, nil
+	}
+	if contentY < innerY || contentY >= innerY+innerH {
+		if msg.Action == tea.MouseActionRelease {
+			a.contentSelection.EndSelection()
+		}
+		return a, nil
+	}
+
+	if msg.Button != tea.MouseButtonLeft {
+		return a, nil
+	}
+
+	if len(a.contentSelection.lines) == 0 {
+		var content string
+		if a.middleMode == ModePreview {
+			content = a.preview.View()
+		} else {
+			content = a.agent.View()
+		}
+		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
+	}
+
+	line := contentY - innerY
+	col := contentX - innerX
+	var cmd tea.Cmd
+	if msg.Action == tea.MouseActionPress {
+		a.inputSelection.Clear()
+		var content string
+		if a.middleMode == ModePreview {
+			content = a.preview.View()
+		} else {
+			content = a.agent.View()
+		}
+		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
+		a.contentSelection.BeginSelection(line, col)
+		return a, nil
+	}
+	if msg.Action == tea.MouseActionMotion {
+		a.contentSelection.UpdateSelection(line, col)
+		return a, nil
+	}
+	if msg.Action == tea.MouseActionRelease {
+		a.contentSelection.UpdateSelection(line, col)
+		a.contentSelection.EndSelection()
+		text := a.contentSelection.SelectedText()
+		if text != "" {
+			cmd = copyToClipboardCmd(text)
+		}
+		return a, cmd
+	}
+
+	return a, nil
+}
+
+func (a App) handleInputSelection(msg tea.MouseMsg, contentX, contentY int) (bool, tea.Cmd) {
+	if contentX < a.leftXStart || contentX > a.leftXEnd {
+		if msg.Action == tea.MouseActionRelease {
+			a.inputSelection.EndSelection()
+		}
+		return false, nil
+	}
+	if contentY < a.inputYStart || contentY > a.inputYEnd {
+		if msg.Action == tea.MouseActionRelease {
+			a.inputSelection.EndSelection()
+		}
+		return false, nil
+	}
+
+	innerX, innerY := panelInnerOrigin(inputBarStyle, a.leftXStart, a.inputYStart)
+	innerW := a.leftContentW
+	innerH := a.inputHeight
+
+	if contentX < innerX || contentX >= innerX+innerW {
+		if msg.Action == tea.MouseActionRelease {
+			a.inputSelection.EndSelection()
+		}
+		return false, nil
+	}
+	if contentY < innerY || contentY >= innerY+innerH {
+		if msg.Action == tea.MouseActionRelease {
+			a.inputSelection.EndSelection()
+		}
+		return false, nil
+	}
+
+	if msg.Button != tea.MouseButtonLeft {
+		return true, nil
+	}
+
+	inputAreaLines := a.inputHeight - 1
+	line := contentY - innerY
+	if line >= inputAreaLines {
+		if msg.Action == tea.MouseActionRelease {
+			a.inputSelection.EndSelection()
+		}
+		return true, nil
+	}
+
+	col := contentX - innerX
+	if msg.Action == tea.MouseActionPress {
+		a.contentSelection.Clear()
+		a.inputSelection.SetLines(InputSelectionLines(a.input, inputAreaLines))
+		a.inputSelection.BeginSelection(line, col)
+		return true, nil
+	}
+	if msg.Action == tea.MouseActionMotion {
+		a.inputSelection.UpdateSelection(line, col)
+		return true, nil
+	}
+	if msg.Action == tea.MouseActionRelease {
+		a.inputSelection.UpdateSelection(line, col)
+		a.inputSelection.EndSelection()
+		text := a.inputSelection.SelectedText()
+		if text == "" {
+			return true, nil
+		}
+		return true, copyToClipboardCmd(text)
+	}
+
+	return true, nil
+}
+
 func (a *App) cycleThinkLevel() {
 	switch a.thinkLevel {
 	case ThinkLow:
@@ -1148,7 +1727,7 @@ func (a *App) cycleThinkLevel() {
 }
 
 func (a App) renderCommandPalette(totalWidth int) string {
-	items := a.paletteItems()
+	items := a.paletteVisibleItems()
 	if totalWidth <= 0 {
 		return ""
 	}
@@ -1171,10 +1750,17 @@ func (a App) renderCommandPalette(totalWidth int) string {
 	lines = append(lines, a.renderPaletteHeader(contentWidth))
 	lines = append(lines, "")
 	lines = append(lines, panelTitleStyle.Render(a.paletteTitle()))
+	if a.paletteQuery != "" {
+		lines = append(lines, metaStyle.Render("Search: "+a.paletteQuery))
+	}
+	selectedIndex := a.paletteIndex
+	if selectedIndex < 0 || selectedIndex >= len(items) {
+		selectedIndex = 0
+	}
 	for i, item := range items {
 		line := a.formatPaletteLine(item.Label, item.Desc, contentWidth)
 		style := normalRowStyle
-		if i == a.paletteIndex {
+		if i == selectedIndex {
 			style = selectedSlashRowStyle
 		}
 		lines = append(lines, style.Width(contentWidth).Inline(true).Render(line))
@@ -1225,6 +1811,24 @@ func (a App) paletteItems() []paletteItem {
 			{Label: "New Session", Action: paletteActionNewSession},
 		}
 	}
+}
+
+func (a App) paletteVisibleItems() []paletteItem {
+	items := a.paletteItems()
+	query := strings.TrimSpace(a.paletteQuery)
+	if query == "" {
+		return items
+	}
+	query = strings.ToLower(query)
+	filtered := make([]paletteItem, 0, len(items))
+	for _, item := range items {
+		label := strings.ToLower(item.Label)
+		desc := strings.ToLower(item.Desc)
+		if strings.Contains(label, query) || strings.Contains(desc, query) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 func (a App) modelPaletteItems() []paletteItem {
@@ -1335,10 +1939,38 @@ func (a *App) layoutPanels() {
 
 	// Panel frame: border + padding
 	panelFW, panelFH := historyPaneStyle.GetFrameSize()
-	panelContentWidth := innerW - panelFW
-	if panelContentWidth < 10 {
-		panelContentWidth = 10
+	minContentW := 10
+	minPanelW := panelFW + minContentW
+	a.twoColumn = innerW >= minPanelW*2
+
+	modalW := a.width
+	if modalW < 1 {
+		modalW = 1
 	}
+	modalH := a.height
+	if modalH < 1 {
+		modalH = 1
+	}
+	a.modalWidth = modalW
+	a.modalHeight = modalH
+	modalFW, modalFH := modalStyle.GetFrameSize()
+	leftFrame := modalFW / 2
+	topFrame := modalFH / 2
+	a.modalContentW = modalW - modalFW
+	a.modalContentH = modalH - modalFH
+	if a.modalContentW < 1 {
+		a.modalContentW = 1
+	}
+	if a.modalContentH < 1 {
+		a.modalContentH = 1
+	}
+	a.modalXStart = 0
+	a.modalYStart = 0
+	a.modalXEnd = a.modalXStart + modalW - 1
+	a.modalYEnd = a.modalYStart + modalH - 1
+	a.modalContentX = a.modalXStart + leftFrame
+	a.modalContentY = a.modalYStart + topFrame
+	a.modal.SetSize(modalW, modalH)
 
 	// Track menu height for overlay rendering (does NOT affect layout budget)
 	suggestions := a.input.SlashSuggestions()
@@ -1352,60 +1984,148 @@ func (a *App) layoutPanels() {
 	a.statusHeight = 1
 
 	// Fixed input rendered height: content + frame
-	// inputHeight is dynamic based on wrapped input lines (plus a reserved status line)
-	a.inputHeight = InputLineCount(a.input)
-	if a.inputHeight < 1 {
-		a.inputHeight = 1
+	inputLines := InputLineCount(a.input)
+	inputAreaLines := inputLines + 1
+	if inputAreaLines < 2 {
+		inputAreaLines = 2
 	}
-	// Reserve an extra status line (used for cited count + future hints)
-	a.inputHeight += 1
-	if a.inputHeight > maxInputLines+1 {
-		a.inputHeight = maxInputLines + 1
+	if inputAreaLines > maxInputLines+1 {
+		inputAreaLines = maxInputLines + 1
 	}
+	a.inputHeight = inputAreaLines + 1
 	inputRendered := a.inputHeight + panelFH
 
-	// Available height for history + content
-	available := totalInner - inputRendered - a.statusHeight
-	if available < panelFH*2+2 { // minimum for 2 panels with 1 line each
-		available = panelFH*2 + 2
+	available := totalInner - a.statusHeight
+	minPanelRendered := panelFH + 1
+	if available < minPanelRendered {
+		available = minPanelRendered
+	}
+	if inputRendered+minPanelRendered > available {
+		inputRendered = available - minPanelRendered
+		if inputRendered < minPanelRendered {
+			inputRendered = minPanelRendered
+		}
+		a.inputHeight = inputRendered - panelFH
+		if a.inputHeight < 2 {
+			a.inputHeight = 2
+		}
+	}
+	outputRendered := available - inputRendered
+	if outputRendered < minPanelRendered {
+		outputRendered = minPanelRendered
 	}
 
-	// Split: history ~25%, content gets the rest
-	historyRendered := available / 4
-	if historyRendered < panelFH+1 { // minimum: 1 content line + frame
-		historyRendered = panelFH + 1
-	}
-	contentRendered := available - historyRendered
-	if contentRendered < panelFH+1 {
-		contentRendered = panelFH + 1
+	if a.twoColumn {
+		leftW := innerW * 5 / 8
+		rightW := innerW - leftW
+		if leftW < minPanelW {
+			leftW = minPanelW
+			rightW = innerW - leftW
+		}
+		if rightW < minPanelW {
+			rightW = minPanelW
+			leftW = innerW - rightW
+		}
+		if leftW < minPanelW || rightW < minPanelW {
+			a.twoColumn = false
+		}
+		a.leftWidth = leftW
+		a.rightWidth = rightW
+		a.leftContentW = leftW - panelFW
+		a.rightContentW = rightW - panelFW
+		if a.leftContentW < minContentW {
+			a.leftContentW = minContentW
+		}
+		if a.rightContentW < minContentW {
+			a.rightContentW = minContentW
+		}
+
+		a.historyHeight = available - panelFH
+		a.middleHeight = outputRendered - panelFH
+		if a.historyHeight < 1 {
+			a.historyHeight = 1
+		}
+		if a.middleHeight < 1 {
+			a.middleHeight = 1
+		}
+
+		a.history.SetSize(a.rightContentW, a.historyHeight)
+		a.preview.SetSize(a.leftContentW, a.middleHeight)
+		a.detail.SetSize(a.leftContentW, a.middleHeight)
+		a.agent.SetSize(a.leftContentW, a.middleHeight)
+		a.input.SetWidth(a.leftContentW)
+		inputWidgetHeight := InputLineCount(a.input)
+		maxWidgetHeight := a.inputHeight - 1
+		if inputWidgetHeight > maxWidgetHeight {
+			inputWidgetHeight = maxWidgetHeight
+		}
+		if inputWidgetHeight < 1 {
+			inputWidgetHeight = 1
+		}
+		a.input.SetHeight(inputWidgetHeight)
+
+		a.leftXStart = 1
+		a.leftXEnd = a.leftXStart + a.leftWidth - 1
+		a.rightXStart = a.leftXEnd + 1
+		a.rightXEnd = a.rightXStart + a.rightWidth - 1
+		a.contentYStart = 1
+		a.contentYEnd = a.contentYStart + outputRendered - 1
+		a.inputYStart = a.contentYEnd + 1
+		a.inputYEnd = a.inputYStart + inputRendered - 1
+		a.historyYStart = 1
+		a.historyYEnd = a.historyYStart + available - 1
+		return
 	}
 
-	// Content heights for .Height() calls (subtract frame)
+	a.leftWidth = innerW
+	a.rightWidth = 0
+	a.leftContentW = innerW - panelFW
+	if a.leftContentW < minContentW {
+		a.leftContentW = minContentW
+	}
+	a.rightContentW = 0
+
+	availableVert := totalInner - inputRendered - a.statusHeight
+	if availableVert < panelFH*2+2 {
+		availableVert = panelFH*2 + 2
+	}
+	historyRendered := availableVert / 4
+	if historyRendered < minPanelRendered {
+		historyRendered = minPanelRendered
+	}
+	contentRendered := availableVert - historyRendered
+	if contentRendered < minPanelRendered {
+		contentRendered = minPanelRendered
+	}
 	a.historyHeight = historyRendered - panelFH
 	a.middleHeight = contentRendered - panelFH
-	// a.inputHeight is already set above (1 or 2 depending on citations)
-
-	// Clamp minimums
 	if a.historyHeight < 1 {
 		a.historyHeight = 1
 	}
 	if a.middleHeight < 1 {
 		a.middleHeight = 1
 	}
-	if a.inputHeight < 1 {
-		a.inputHeight = 1
+
+	a.history.SetSize(a.leftContentW, a.historyHeight)
+	a.preview.SetSize(a.leftContentW, a.middleHeight)
+	a.detail.SetSize(a.leftContentW, a.middleHeight)
+	a.agent.SetSize(a.leftContentW, a.middleHeight)
+	a.input.SetWidth(a.leftContentW)
+	inputWidgetHeight := InputLineCount(a.input)
+	maxWidgetHeight := a.inputHeight - 1
+	if inputWidgetHeight > maxWidgetHeight {
+		inputWidgetHeight = maxWidgetHeight
 	}
+	if inputWidgetHeight < 1 {
+		inputWidgetHeight = 1
+	}
+	a.input.SetHeight(inputWidgetHeight)
 
-	// Update sub-model sizes (viewport content dimensions)
-	a.history.SetSize(panelContentWidth, a.historyHeight)
-	a.preview.SetSize(panelContentWidth, a.middleHeight)
-	a.agent.SetSize(panelContentWidth, a.middleHeight)
-	a.input.SetWidth(panelContentWidth)
-	a.input.SetHeight(InputLineCount(a.input))
-
-	// Compute panel Y boundaries (relative to terminal, including container border)
-	// Container border top = containerFH/2 (split evenly top/bottom for rounded border = 1)
-	y := 1 // start after container top border
+	a.leftXStart = 1
+	a.leftXEnd = innerW
+	a.rightXStart = 0
+	a.rightXEnd = 0
+	y := 1
 	a.historyYStart = y
 	a.historyYEnd = y + historyRendered - 1
 	y += historyRendered

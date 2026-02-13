@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/truncate"
 	"github.com/termia/termia/internal/db"
 )
 
@@ -295,27 +296,24 @@ func (m HistoryModel) renderRow(cmd db.Command, selected bool) string {
 	rightSide := strings.Join(rightParts, " ")
 	rightWidth := lipgloss.Width(rightSide)
 
-	// Truncate command if needed — use ellipsis instead of tilde
-	maxCmdWidth := w - rightWidth - citeWidth - 3 // spacing
-	if maxCmdWidth < 10 {
-		maxCmdWidth = 10
+	available := w - rightWidth - citeWidth - 3
+	if available < 10 {
+		available = 10
 	}
-	if lipgloss.Width(cmdText) > maxCmdWidth {
-		runes := []rune(cmdText)
-		if len(runes) > maxCmdWidth-1 {
-			cmdText = string(runes[:maxCmdWidth-1]) + "…"
-		}
+	if lipgloss.Width(cmdText) > available {
+		cmdText = truncate.StringWithTail(cmdText, uint(available), "…")
 	}
+	left := cmdText
 
 	// Pad command to fill space
-	cmdWidth := lipgloss.Width(cmdText)
-	padding := w - citeWidth - cmdWidth - rightWidth
+	leftWidth := lipgloss.Width(left)
+	padding := w - citeWidth - leftWidth - rightWidth
 	if padding < 1 {
 		padding = 1
 	}
 	padStr := strings.Repeat(" ", padding)
 
-	line := citeMarker + cmdText + padStr + rightSide
+	line := citeMarker + left + padStr + rightSide
 
 	if selected {
 		return selectedRowStyle.Width(w).Render(line)

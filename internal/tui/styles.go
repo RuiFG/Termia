@@ -123,6 +123,15 @@ var (
 	metaStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
 
+	thinkLowStyle = lipgloss.NewStyle().
+			Foreground(colorMuted)
+
+	thinkMediumStyle = lipgloss.NewStyle().
+				Foreground(colorWarning)
+
+	thinkHighStyle = lipgloss.NewStyle().
+			Foreground(colorError)
+
 	// CWD path.
 	cwdStyle = lipgloss.NewStyle().
 			Foreground(colorSecondary)
@@ -181,4 +190,10 @@ var (
 	// Cited command marker in history rows.
 	citedMarkerStyle = lipgloss.NewStyle().
 				Foreground(colorSecondary)
+
+	pastePlaceholderStyle = lipgloss.NewStyle().
+				Foreground(colorWarning)
+
+	inputCursorStyle = lipgloss.NewStyle().
+				Reverse(true)
 )

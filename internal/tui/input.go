@@ -1,8 +1,11 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -32,6 +35,13 @@ type InputModel struct {
 	slashSuggestions []SlashSuggestion
 	slashIndex       int
 	useTextarea      bool
+	pasteBlocks      map[rune]pasteBlock
+	pasteSeq         int
+}
+
+type pasteBlock struct {
+	content string
+	lines   int
 }
 
 const (
@@ -39,6 +49,7 @@ const (
 	inputPlaceholder  = "Type / for commands..."
 	suggestedMinWidth = 10
 	maxInputLines     = 6
+	pasteTokenBase    = 0xE000
 )
 
 // NewInputModel creates a new input bar.
@@ -48,6 +59,9 @@ func NewInputModel() InputModel {
 	ti.Prompt = inputPrompt
 	ti.PromptStyle = inputPromptStyle
 	ti.CharLimit = 500
+	ti.Cursor.Style = inputCursorStyle
+	ti.Cursor.SetMode(cursor.CursorStatic)
+	ti.Cursor.Blink = false
 	ti.Focus()
 
 	ta := textarea.New()
@@ -67,6 +81,16 @@ func NewInputModel() InputModel {
 	blurredStyle = focusedStyle
 	ta.FocusedStyle = focusedStyle
 	ta.BlurredStyle = blurredStyle
+	ta.Cursor.Style = inputCursorStyle
+	ta.Cursor.SetMode(cursor.CursorStatic)
+	ta.Cursor.Blink = false
+	promptWidth := lipgloss.Width(inputPrompt)
+	ta.SetPromptFunc(promptWidth, func(lineIdx int) string {
+		if lineIdx == 0 {
+			return inputPrompt
+		}
+		return ""
+	})
 	ta.Focus()
 
 	suggestions := []SlashSuggestion{
@@ -83,6 +107,7 @@ func NewInputModel() InputModel {
 		textarea:         ta,
 		focused:          true,
 		slashSuggestions: suggestions,
+		pasteBlocks:      make(map[rune]pasteBlock),
 	}
 }
 
@@ -113,14 +138,26 @@ func (m InputModel) Focused() bool {
 
 // Value returns the current input text.
 func (m InputModel) Value() string {
+	return m.ExpandedValue()
+}
+
+func (m InputModel) RawValue() string {
 	if m.useTextarea {
 		return m.textarea.Value()
 	}
 	return m.textInput.Value()
 }
 
+func (m InputModel) ExpandedValue() string {
+	if len(m.pasteBlocks) == 0 {
+		return m.RawValue()
+	}
+	return expandPasteBlocks(m.RawValue(), m.pasteBlocks)
+}
+
 // SetValue sets the input text.
 func (m *InputModel) SetValue(s string) {
+	m.resetPasteBlocks()
 	m.textInput.SetValue(s)
 	m.textarea.SetValue(s)
 	m.slashIndex = 0
@@ -138,6 +175,7 @@ func (m *InputModel) Reset() {
 	m.textInput.Reset()
 	m.useTextarea = false
 	m.slashIndex = 0
+	m.resetPasteBlocks()
 }
 
 // SetWidth updates the input width (content width).
@@ -199,6 +237,11 @@ func (m InputModel) ParseSlashCommand() *SlashCommand {
 func (m InputModel) Update(msg tea.Msg) (InputModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.handlePasteKey(msg) {
+			m.cleanupPasteBlocks()
+			m.syncTextareaMode()
+			return m, nil
+		}
 		switch msg.Type {
 		case tea.KeyUp:
 			m.moveSlashSelection(-1)
@@ -215,37 +258,18 @@ func (m InputModel) Update(msg tea.Msg) (InputModel, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	before := m.Value()
+	before := m.RawValue()
 	if m.useTextarea {
 		m.textarea, cmd = m.textarea.Update(msg)
 	} else {
 		m.textInput, cmd = m.textInput.Update(msg)
 	}
-	if before != m.Value() {
+	if before != m.RawValue() {
 		m.slashIndex = 0
 	}
 
-	// Switch to textarea when content spans multiple lines.
-	if !m.useTextarea {
-		lineCount := InputLineCount(m)
-		if lineCount > 1 {
-			m.useTextarea = true
-			m.textarea.SetValue(m.textInput.Value())
-			m.textarea.CursorEnd()
-			m.textInput.Blur()
-			if m.focused {
-				_ = m.textarea.Focus()
-			}
-		}
-	} else if InputLineCount(m) <= 1 {
-		m.useTextarea = false
-		m.textInput.SetValue(m.textarea.Value())
-		m.textInput.CursorEnd()
-		m.textarea.Blur()
-		if m.focused {
-			_ = m.textInput.Focus()
-		}
-	}
+	m.cleanupPasteBlocks()
+	m.syncTextareaMode()
 
 	return m, cmd
 }
@@ -354,27 +378,16 @@ func (m InputModel) View() string {
 // RenderInputSection renders the input bar content (no suggestions).
 func RenderInputSection(m InputModel) string {
 	// Manually render placeholder when empty — avoids textinput dual-line issues
-	if m.Value() == "" && !m.IsSlashCommand() {
-		prompt := inputPromptStyle.Render(inputPrompt)
-		placeholder := lipgloss.NewStyle().Foreground(colorMuted).Render(inputPlaceholder)
-		return prompt + placeholder
+	if m.DisplayValue() == "" && !m.IsSlashCommand() {
+		return renderEmptyInputWithCursor(m)
+	}
+
+	if len(m.pasteBlocks) > 0 && !m.useTextarea {
+		return renderTextInputWithPaste(m)
 	}
 
 	if m.useTextarea {
-		lines := renderTextareaLines(m)
-		if len(lines) == 0 {
-			return ""
-		}
-		inputPromptW := InputPromptWidth(m)
-		rows := make([]string, 0, len(lines))
-		for i, line := range lines {
-			if i == 0 {
-				rows = append(rows, inputPromptStyle.Render(inputPrompt)+line)
-				continue
-			}
-			rows = append(rows, strings.Repeat(" ", inputPromptW)+line)
-		}
-		return strings.Join(rows, "\n")
+		return m.textarea.View()
 	}
 
 	return m.textInput.View()
@@ -391,7 +404,7 @@ func InputLineCount(m InputModel) int {
 		width = suggestedMinWidth
 	}
 
-	val := m.Value()
+	val := m.DisplayValue()
 	if val == "" {
 		return 1
 	}
@@ -419,7 +432,7 @@ func InputLineCount(m InputModel) int {
 }
 
 func InputVisibleLines(m InputModel) []string {
-	if m.Value() == "" && !m.IsSlashCommand() {
+	if m.DisplayValue() == "" && !m.IsSlashCommand() {
 		return []string{RenderInputSection(m)}
 	}
 
@@ -432,7 +445,7 @@ func InputVisibleLines(m InputModel) []string {
 		width = suggestedMinWidth
 	}
 
-	wrapped := wordwrap.String(m.Value(), width)
+	wrapped := wordwrap.String(m.DisplayValue(), width)
 	wrapped = wrap.String(wrapped, width)
 	lines := strings.Split(wrapped, "\n")
 	if len(lines) == 0 {
@@ -441,8 +454,23 @@ func InputVisibleLines(m InputModel) []string {
 	return lines
 }
 
+func InputSelectionLines(m InputModel, maxLines int) []string {
+	plain := stripANSICodes(RenderInputSection(m))
+	lines := strings.Split(plain, "\n")
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	for len(lines) < maxLines {
+		lines = append(lines, "")
+	}
+	return lines
+}
+
 func renderTextareaLines(m InputModel) []string {
-	lines := strings.Split(m.textarea.Value(), "\n")
+	lines := strings.Split(m.DisplayValue(), "\n")
 	if len(lines) == 0 {
 		return []string{""}
 	}
@@ -468,6 +496,338 @@ func renderTextareaLines(m InputModel) []string {
 	}
 
 	return wrappedLines
+}
+
+func (m InputModel) DisplayValue() string {
+	if len(m.pasteBlocks) == 0 {
+		return m.RawValue()
+	}
+	return renderPasteBlocks(m.RawValue(), m.pasteBlocks)
+}
+
+func (m *InputModel) handlePasteKey(msg tea.KeyMsg) bool {
+	if msg.Type == tea.KeyCtrlV {
+		pasted, err := clipboard.ReadAll()
+		if err == nil && pasted != "" {
+			return m.insertPasteBlock(pasted)
+		}
+		return false
+	}
+	if msg.Type == tea.KeyRunes {
+		pasted := string(msg.Runes)
+		if msg.Paste || strings.Contains(pasted, "\n") || strings.Contains(pasted, "\r") {
+			return m.insertPasteBlock(pasted)
+		}
+	}
+	return false
+}
+
+func (m *InputModel) insertPasteBlock(pasted string) bool {
+	content := normalizePasteContent(pasted)
+	lineCount := countLines(content)
+	if lineCount <= 2 {
+		return false
+	}
+	m.ensurePasteBlocks()
+	token := rune(pasteTokenBase + m.pasteSeq)
+	m.pasteSeq++
+	m.pasteBlocks[token] = pasteBlock{content: content, lines: lineCount}
+	m.insertToken(token)
+	m.slashIndex = 0
+	return true
+}
+
+func (m *InputModel) insertToken(token rune) {
+	if m.useTextarea {
+		m.textarea.InsertRune(token)
+		return
+	}
+	pos := m.textInput.Position()
+	value := []rune(m.textInput.Value())
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(value) {
+		pos = len(value)
+	}
+	value = append(value[:pos], append([]rune{token}, value[pos:]...)...)
+	m.textInput.SetValue(string(value))
+	m.textInput.SetCursor(pos + 1)
+}
+
+func (m *InputModel) syncTextareaMode() {
+	if len(m.pasteBlocks) > 0 {
+		if m.useTextarea {
+			m.useTextarea = false
+			m.textInput.SetValue(m.textarea.Value())
+			m.textInput.CursorEnd()
+			m.textarea.Blur()
+			if m.focused {
+				_ = m.textInput.Focus()
+			}
+		}
+		return
+	}
+	if !m.useTextarea {
+		lineCount := InputLineCount(*m)
+		if lineCount > 1 {
+			m.useTextarea = true
+			m.textarea.SetValue(m.textInput.Value())
+			m.textarea.CursorEnd()
+			m.textInput.Blur()
+			if m.focused {
+				_ = m.textarea.Focus()
+			}
+		}
+		return
+	}
+	if InputLineCount(*m) <= 1 {
+		m.useTextarea = false
+		m.textInput.SetValue(m.textarea.Value())
+		m.textInput.CursorEnd()
+		m.textarea.Blur()
+		if m.focused {
+			_ = m.textInput.Focus()
+		}
+	}
+}
+
+func (m *InputModel) cleanupPasteBlocks() {
+	if len(m.pasteBlocks) == 0 {
+		return
+	}
+	active := make(map[rune]struct{})
+	for _, r := range m.RawValue() {
+		if _, ok := m.pasteBlocks[r]; ok {
+			active[r] = struct{}{}
+		}
+	}
+	for token := range m.pasteBlocks {
+		if _, ok := active[token]; !ok {
+			delete(m.pasteBlocks, token)
+		}
+	}
+}
+
+func (m *InputModel) ensurePasteBlocks() {
+	if m.pasteBlocks == nil {
+		m.pasteBlocks = make(map[rune]pasteBlock)
+	}
+}
+
+func (m *InputModel) resetPasteBlocks() {
+	if m.pasteBlocks == nil {
+		return
+	}
+	for k := range m.pasteBlocks {
+		delete(m.pasteBlocks, k)
+	}
+	m.pasteSeq = 0
+}
+
+func normalizePasteContent(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	return content
+}
+
+func countLines(content string) int {
+	if content == "" {
+		return 0
+	}
+	return strings.Count(content, "\n") + 1
+}
+
+func renderPasteBlocks(value string, blocks map[rune]pasteBlock) string {
+	var b strings.Builder
+	for _, r := range value {
+		if block, ok := blocks[r]; ok {
+			b.WriteString(renderPastePlaceholder(block))
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func expandPasteBlocks(value string, blocks map[rune]pasteBlock) string {
+	var b strings.Builder
+	for _, r := range value {
+		if block, ok := blocks[r]; ok {
+			b.WriteString(block.content)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func renderPastePlaceholder(block pasteBlock) string {
+	label := fmt.Sprintf("[Pause %d lines]", block.lines)
+	return pastePlaceholderStyle.Render(label)
+}
+
+func renderTextInputWithPaste(m InputModel) string {
+	raw := []rune(m.RawValue())
+	pos := m.textInput.Position()
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(raw) {
+		pos = len(raw)
+	}
+	width := m.textInput.Width
+	if width < 1 {
+		width = suggestedMinWidth
+	}
+
+	segments := make([]pasteSegment, 0, len(raw))
+	for _, r := range raw {
+		if block, ok := m.pasteBlocks[r]; ok {
+			label := fmt.Sprintf("[Pause %d lines]", block.lines)
+			segments = append(segments, pasteSegment{text: label, placeholder: true})
+			continue
+		}
+		segments = append(segments, pasteSegment{text: string(r)})
+	}
+
+	segWidths := make([]int, len(segments))
+	totalWidth := 0
+	for i, seg := range segments {
+		segWidths[i] = lipgloss.Width(seg.text)
+		totalWidth += segWidths[i]
+	}
+
+	cursorCell := 0
+	for i := 0; i < pos && i < len(segWidths); i++ {
+		cursorCell += segWidths[i]
+	}
+
+	offset := 0
+	if width > 0 {
+		if cursorCell < offset {
+			offset = cursorCell
+		}
+		if cursorCell >= offset+width {
+			offset = cursorCell - width + 1
+		}
+		if offset < 0 {
+			offset = 0
+		}
+	}
+	end := offset + width
+	if width <= 0 {
+		end = totalWidth
+	}
+
+	var b strings.Builder
+	cursorModel := m.textInput.Cursor
+	cur := 0
+	for i, seg := range segments {
+		segStart := cur
+		segEnd := cur + segWidths[i]
+		if segEnd <= offset {
+			cur = segEnd
+			continue
+		}
+		if segStart >= end {
+			break
+		}
+		visibleStart := maxInt(offset, segStart) - segStart
+		visibleEnd := minInt(end, segEnd) - segStart
+		if visibleEnd > visibleStart {
+			cursorRel := -1
+			if i == pos {
+				cursorRel = cursorCell - segStart
+			}
+			b.WriteString(renderPasteSegment(seg, visibleStart, visibleEnd, cursorRel, &cursorModel))
+		}
+		cur = segEnd
+	}
+
+	if pos == len(raw) && cursorCell >= offset && cursorCell < end {
+		cursorModel.SetChar(" ")
+		b.WriteString(cursorModel.View())
+	}
+
+	content := b.String()
+	contentWidth := lipgloss.Width(content)
+	if width > 0 && contentWidth < width {
+		content += strings.Repeat(" ", width-contentWidth)
+	}
+
+	return m.textInput.PromptStyle.Render(m.textInput.Prompt) + content
+}
+
+type pasteSegment struct {
+	text        string
+	placeholder bool
+}
+
+func renderPasteSegment(seg pasteSegment, startCell, endCell int, cursorRel int, cursorModel *cursor.Model) string {
+	if startCell >= endCell || seg.text == "" {
+		return ""
+	}
+	startCell = maxInt(0, startCell)
+	endCell = maxInt(startCell, endCell)
+	var b strings.Builder
+	cur := 0
+	for _, r := range seg.text {
+		rw := lipgloss.Width(string(r))
+		next := cur + rw
+		if next <= startCell {
+			cur = next
+			continue
+		}
+		if cur >= endCell {
+			break
+		}
+		cell := string(r)
+		if cursorRel >= 0 && cursorRel >= cur && cursorRel < next {
+			cursorModel.SetChar(cell)
+			b.WriteString(cursorModel.View())
+		} else if seg.placeholder {
+			b.WriteString(pastePlaceholderStyle.Render(cell))
+		} else {
+			b.WriteString(cell)
+		}
+		cur = next
+	}
+	return b.String()
+}
+
+func renderEmptyInputWithCursor(m InputModel) string {
+	prompt := inputPromptStyle.Render(inputPrompt)
+	placeholder := inputPlaceholder
+	if placeholder == "" {
+		cursorModel := m.textInput.Cursor
+		cursorModel.SetChar(" ")
+		return prompt + cursorModel.View()
+	}
+	placeholderStyle := lipgloss.NewStyle().Foreground(colorMuted)
+	first := string([]rune(placeholder)[0])
+	rest := ""
+	if len([]rune(placeholder)) > 1 {
+		rest = string([]rune(placeholder)[1:])
+	}
+	cursorModel := m.textInput.Cursor
+	cursorModel.TextStyle = placeholderStyle
+	cursorModel.SetChar(first)
+	return prompt + cursorModel.View() + placeholderStyle.Render(rest)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // InputPromptWidth returns the visible width of the input prompt.

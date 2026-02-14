@@ -27,6 +27,8 @@ const (
 	FocusInput
 )
 
+const mouseMotionThrottle = 20 * time.Millisecond
+
 // MiddleMode determines what the middle panel displays.
 type MiddleMode int
 
@@ -132,6 +134,7 @@ type App struct {
 	statusMsg        string
 	contentSelection textSelection
 	inputSelection   textSelection
+	lastMouseMotion  time.Time
 
 	// Team selection
 	teams           []config.AgentTeamProfile
@@ -171,6 +174,8 @@ type commandsErrorMsg struct {
 type commandDeletedMsg struct {
 	id string
 }
+
+type commandExecutedMsg struct{}
 
 type outputLoadedMsg struct {
 	commandID string
@@ -243,6 +248,7 @@ func (a App) Init() tea.Cmd {
 	return tea.Batch(
 		loadCommandsCmd(a.db),
 		loadSessionsCmd(a.db),
+		waitForCommandExecutedCmd(),
 		a.input.Focus(),
 	)
 }
@@ -307,6 +313,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.statusMsg = fmt.Sprintf("Error: %v", msg.err)
 		return a, nil
+
+	case commandExecutedMsg:
+		return a, tea.Batch(loadCommandsCmd(a.db), waitForCommandExecutedCmd())
 
 	case commandDeletedMsg:
 		a.history.RemoveCommand(msg.id)
@@ -624,6 +633,12 @@ func (a App) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (a App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	contentX := msg.X
 	contentY := msg.Y
+	if msg.Action == tea.MouseActionPress {
+		a.lastMouseMotion = time.Time{}
+	}
+	if msg.Action == tea.MouseActionMotion && msg.Button == tea.MouseButtonLeft {
+		a.lastMouseMotion = time.Now()
+	}
 	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
 		if focus, ok := a.focusFromMouse(contentX, contentY); ok {
 			a.focus = focus
@@ -682,6 +697,10 @@ func (a App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return a.handleContentSelection(msg, contentX, contentY)
+}
+
+func (a App) hasActiveDragSelection() bool {
+	return a.contentSelection.dragging || a.inputSelection.dragging || a.modal.dragging || a.detail.dragging
 }
 
 func (a App) focusFromMouse(x, y int) (Focus, bool) {
@@ -1605,16 +1624,6 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 		return a, nil
 	}
 
-	if len(a.contentSelection.lines) == 0 {
-		var content string
-		if a.middleMode == ModePreview {
-			content = a.preview.View()
-		} else {
-			content = a.agent.View()
-		}
-		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
-	}
-
 	line := contentY - innerY
 	col := contentX - innerX
 	var cmd tea.Cmd
@@ -1629,6 +1638,15 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
 		a.contentSelection.BeginSelection(line, col)
 		return a, nil
+	}
+	if len(a.contentSelection.lines) == 0 {
+		var content string
+		if a.middleMode == ModePreview {
+			content = a.preview.View()
+		} else {
+			content = a.agent.View()
+		}
+		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
 	}
 	if msg.Action == tea.MouseActionMotion {
 		a.contentSelection.UpdateSelection(line, col)
@@ -2148,6 +2166,13 @@ func loadCommandsCmd(database *db.DB) tea.Cmd {
 	}
 }
 
+func waitForCommandExecutedCmd() tea.Cmd {
+	return func() tea.Msg {
+		<-agent.CommandExecutedEvents()
+		return commandExecutedMsg{}
+	}
+}
+
 func loadSessionsCmd(database *db.DB) tea.Cmd {
 	return func() tea.Msg {
 		sessions, err := database.ListAgentSessions(200)
@@ -2234,12 +2259,46 @@ func generateID() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
+func mouseMotionFilter(model tea.Model, msg tea.Msg) tea.Msg {
+	mouse, ok := msg.(tea.MouseMsg)
+	if !ok {
+		return msg
+	}
+	if mouse.Action != tea.MouseActionMotion {
+		return msg
+	}
+	if mouse.Button != tea.MouseButtonLeft {
+		return nil
+	}
+	var app App
+	switch m := model.(type) {
+	case App:
+		app = m
+	case *App:
+		if m == nil {
+			return msg
+		}
+		app = *m
+	default:
+		return msg
+	}
+	if !app.hasActiveDragSelection() {
+		return nil
+	}
+	if !app.lastMouseMotion.IsZero() && time.Since(app.lastMouseMotion) < mouseMotionThrottle {
+		return nil
+	}
+	return msg
+}
+
 // Run starts the TUI.
 func Run(database *db.DB, cfg *config.Config, logger *zap.Logger) error {
 	app := New(database, cfg, logger)
 	program := tea.NewProgram(app,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
+		tea.WithFPS(30),
+		tea.WithFilter(mouseMotionFilter),
 	)
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("failed to run TUI: %w", err)

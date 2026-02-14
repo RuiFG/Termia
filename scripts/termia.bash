@@ -55,6 +55,31 @@ _termia_dealias() {
     printf "%s" "$cmdline"
 }
 
+_termia_import_history_queue() {
+    [[ -n "$TERMIA_NO_RECORD" ]] && return
+    local queue="${TERMIA_HISTORY_QUEUE:-}"
+    [[ -z "$queue" ]] && return
+    [[ ! -s "$queue" ]] && return
+
+    local tmp="${queue}.$$"
+    if mv "$queue" "$tmp" 2>/dev/null; then
+        : > "$queue" 2>/dev/null
+    else
+        tmp="$queue"
+    fi
+
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        history -s -- "$line"
+    done < "$tmp"
+
+    if [[ "$tmp" != "$queue" ]]; then
+        rm -f "$tmp"
+    else
+        : > "$queue" 2>/dev/null
+    fi
+}
+
 # Capture command start (via DEBUG trap)
 _termia_debug_trap() {
     [[ -n "$TERMIA_NO_RECORD" ]] && return
@@ -102,6 +127,11 @@ _termia_prompt_command() {
     if [[ -n "$TERMIA_INTERNAL" ]] && [[ -n "$TERMIA_INTEGRATION_LOADED" ]]; then
         _termia_cmd_id=""; _termia_last_cmd=""; return
     fi
+
+    _termia_import_history_queue
+    history -a
+    history -n
+
     [[ -z "$_termia_cmd_id" ]] && return
 
     if [[ -n "$TERMIA_MARKER_FD" ]]; then

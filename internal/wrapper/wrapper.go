@@ -122,6 +122,8 @@ func (w *Wrapper) Start() error {
 	cmd.Env = append(baseEnv, extraEnv...)
 	cmd.Env = append(cmd.Env,
 		fmt.Sprintf("TERMIA_SHELL_DIR=%s", config.ShellDir()),
+		fmt.Sprintf("TERMIA_HISTORY_QUEUE=%s", config.HistoryQueuePath()),
+		fmt.Sprintf("TERMIA_SHELL=%s", w.shell),
 		fmt.Sprintf("TERMIA_BIN=%s", binPath),
 		"TERMIA_INTERNAL=1",
 		"TERMIA_INTERNAL_PATTERN=^(echo \"🚀 Termia active! Type 'tui' for history, 'tai' for AI help.\")$",

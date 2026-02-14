@@ -4,6 +4,7 @@ import "strings"
 
 type textSelection struct {
 	lines       []string
+	lineWidths  []int
 	selection   modalSelection
 	dragging    bool
 	lastDragPos modalPos
@@ -19,6 +20,10 @@ func (s *textSelection) SetLines(lines []string) {
 		return
 	}
 	s.lines = lines
+	s.lineWidths = make([]int, len(lines))
+	for i := range lines {
+		s.lineWidths[i] = lineCellWidth(lines[i])
+	}
 	s.clampSelection()
 	s.cached = nil
 	s.cachedWidth = 0
@@ -32,6 +37,7 @@ func (s *textSelection) Clear() {
 	s.cached = nil
 	s.cachedWidth = 0
 	s.cachedOk = false
+	s.lineWidths = nil
 }
 
 func (s *textSelection) BeginSelection(line, col int) {
@@ -118,6 +124,9 @@ func (s textSelection) HighlightLines(width int) []string {
 	if !ok {
 		return s.cached
 	}
+	if s.cachedOk && comparePos(start, s.cachedStart) == 0 && comparePos(end, s.cachedEnd) == 0 {
+		return s.cached
+	}
 	fromLine := start.line
 	toLine := end.line
 	if s.cachedOk {
@@ -128,7 +137,7 @@ func (s textSelection) HighlightLines(width int) []string {
 	toLine = clamp(toLine, 0, len(s.lines)-1)
 	for i := fromLine; i <= toLine; i++ {
 		startCol, endCol, has := s.selectionForLine(i)
-		s.cached[i] = highlightLineWithCursor(s.lines[i], startCol, endCol, -1, has)
+		s.cached[i] = highlightLineRangeWithWidth(s.lines[i], s.lineWidths[i], startCol, endCol, has)
 		s.cached[i] = padToWidth(s.cached[i], width)
 	}
 	s.cachedStart = start
@@ -158,7 +167,7 @@ func (s textSelection) selectionForLine(line int) (int, int, bool) {
 	if line < start.line || line > end.line {
 		return 0, 0, false
 	}
-	lineWidth := lineCellWidth(s.lines[line])
+	lineWidth := s.lineWidths[line]
 	if start.line == end.line {
 		return clamp(start.col, 0, lineWidth), clamp(end.col, 0, lineWidth), true
 	}

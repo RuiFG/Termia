@@ -50,6 +50,31 @@ _termia_dealias() {
     printf "%s" "$cmdline"
 }
 
+_termia_import_history_queue() {
+    [[ -n "$TERMIA_NO_RECORD" ]] && return
+    local queue="${TERMIA_HISTORY_QUEUE:-}"
+    [[ -z "$queue" ]] && return
+    [[ ! -s "$queue" ]] && return
+
+    local tmp="${queue}.$$"
+    if mv "$queue" "$tmp" 2>/dev/null; then
+        : > "$queue" 2>/dev/null
+    else
+        tmp="$queue"
+    fi
+
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        print -s -- "$line"
+    done < "$tmp"
+
+    if [[ "$tmp" != "$queue" ]]; then
+        rm -f "$tmp"
+    else
+        : > "$queue" 2>/dev/null
+    fi
+}
+
 _termia_preexec() {
     # Skip if in privacy mode
     [[ -n "$TERMIA_NO_RECORD" ]] && return
@@ -85,6 +110,10 @@ _termia_precmd() {
     if [[ -n "$TERMIA_INTERNAL" ]] && [[ -n "$TERMIA_INTEGRATION_LOADED" ]]; then
         _termia_cmd_id=""; return
     fi
+
+    _termia_import_history_queue
+    fc -W
+
     [[ -z "$_termia_cmd_id" ]] && return
 
     if [[ -n "$TERMIA_MARKER_FD" ]]; then

@@ -468,6 +468,9 @@ func highlightCursorLine(line string, col int) string {
 }
 
 func highlightLineWithCursor(line string, startCol, endCol, cursorCol int, hasSelection bool) string {
+	if !hasSelection && cursorCol < 0 {
+		return line
+	}
 	width := lineCellWidth(line)
 	if width == 0 {
 		return line
@@ -477,6 +480,9 @@ func highlightLineWithCursor(line string, startCol, endCol, cursorCol int, hasSe
 	}
 	if cursorCol < 0 {
 		cursorCol = -1
+	}
+	if hasSelection && cursorCol < 0 && startCol <= 0 && endCol >= width {
+		return modalSelectionStyle.Render(line)
 	}
 	var b strings.Builder
 	cur := 0
@@ -498,6 +504,48 @@ func highlightLineWithCursor(line string, startCol, endCol, cursorCol int, hasSe
 		cur = next
 	}
 	return b.String()
+}
+
+func highlightLineRangeWithWidth(line string, lineWidth, startCol, endCol int, hasSelection bool) string {
+	if !hasSelection {
+		return line
+	}
+	if lineWidth <= 0 {
+		lineWidth = lineCellWidth(line)
+	}
+	startCol = clamp(startCol, 0, lineWidth)
+	endCol = clamp(endCol, 0, lineWidth)
+	if startCol >= endCol {
+		return line
+	}
+	if startCol == 0 && endCol >= lineWidth {
+		return modalSelectionStyle.Render(line)
+	}
+	prefix, selected, suffix := splitByCellRange(line, startCol, endCol)
+	if selected == "" {
+		return line
+	}
+	return prefix + modalSelectionStyle.Render(selected) + suffix
+}
+
+func splitByCellRange(line string, startCol, endCol int) (string, string, string) {
+	var prefix strings.Builder
+	var selected strings.Builder
+	var suffix strings.Builder
+	cur := 0
+	for _, r := range line {
+		rw := lipgloss.Width(string(r))
+		next := cur + rw
+		if next <= startCol {
+			prefix.WriteRune(r)
+		} else if cur >= endCol {
+			suffix.WriteRune(r)
+		} else {
+			selected.WriteRune(r)
+		}
+		cur = next
+	}
+	return prefix.String(), selected.String(), suffix.String()
 }
 
 func sliceByCell(line string, startCol, endCol int) string {

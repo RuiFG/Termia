@@ -18,7 +18,10 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
+	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/recorder"
 )
 
 // --- Request/Response types for function tools ---
@@ -373,7 +376,60 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 				return &RunCommandRsp{Stdout: "", Stderr: "user rejected command", ExitCode: 130}, nil
 			}
 		}
-		stdout, stderr, exitCode, err := runShellCommand(ctx, cmdLine, strings.TrimSpace(req.Cwd))
+
+		cwd := strings.TrimSpace(req.Cwd)
+		var (
+			cmdID            string
+			startOffset      int64
+			transcriptWriter *recorder.TranscriptWriter
+		)
+		if database != nil {
+			writer, err := recorder.NewTranscriptWriter(config.TranscriptsDir())
+			if err != nil {
+				return nil, fmt.Errorf("create transcript: %w", err)
+			}
+			transcriptWriter = writer
+			startOffset = writer.Offset()
+			cmdID = uuid.New().String()
+			resolvedCwd := cwd
+			if resolvedCwd == "" {
+				if wd, err := os.Getwd(); err == nil {
+					resolvedCwd = wd
+				}
+			}
+			cmd := &db.Command{
+				ID:          cmdID,
+				TsStart:     time.Now().UnixNano(),
+				Command:     cmdLine,
+				Cwd:         resolvedCwd,
+				StartOffset: &startOffset,
+			}
+			if err := database.CreateCommand(cmd); err != nil {
+				_ = transcriptWriter.Close()
+				return nil, fmt.Errorf("create command: %w", err)
+			}
+		}
+
+		stdout, stderr, exitCode, err := runShellCommand(ctx, cmdLine, cwd, transcriptWriter)
+		sessionEnd := time.Now().UnixNano()
+
+		if transcriptWriter != nil && database != nil {
+			endOffset := transcriptWriter.Offset()
+			outputSize := endOffset - startOffset
+			transcriptPath := transcriptWriter.Path()
+			if updateErr := database.UpdateCommandEnd(cmdID, sessionEnd, exitCode, endOffset, outputSize, &transcriptPath); updateErr != nil {
+				_ = transcriptWriter.Close()
+				return nil, fmt.Errorf("update command: %w", updateErr)
+			}
+			if closeErr := transcriptWriter.Close(); closeErr != nil {
+				return nil, fmt.Errorf("close transcript: %w", closeErr)
+			}
+			notifyCommandExecuted()
+		}
+
+		if queueErr := enqueueHistoryCommand(cmdLine); queueErr != nil {
+			return nil, queueErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -671,20 +727,28 @@ func promptCommandApproval(command string) (bool, error) {
 	return choice == "y" || choice == "yes", nil
 }
 
-func runShellCommand(ctx context.Context, command string, cwd string) (string, string, int, error) {
-	shell := "sh"
+func runShellCommand(ctx context.Context, command string, cwd string, outputWriter io.Writer) (string, string, int, error) {
 	shellFlag := "-lc"
-	if strings.Contains(strings.ToLower(os.Getenv("SHELL")), "bash") {
-		shell = "bash"
+	shellPath := strings.TrimSpace(os.Getenv("TERMIA_SHELL"))
+	if shellPath == "" {
+		shellPath = strings.TrimSpace(os.Getenv("SHELL"))
 	}
-	cmd := exec.CommandContext(ctx, shell, shellFlag, command)
+	if shellPath == "" {
+		shellPath = "sh"
+	}
+	cmd := exec.CommandContext(ctx, shellPath, shellFlag, command)
 	if strings.TrimSpace(cwd) != "" {
 		cmd.Dir = cwd
 	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	if outputWriter != nil {
+		cmd.Stdout = io.MultiWriter(&stdout, outputWriter)
+		cmd.Stderr = io.MultiWriter(&stderr, outputWriter)
+	} else {
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+	}
 	err := cmd.Run()
 	if err == nil {
 		return stdout.String(), stderr.String(), 0, nil
@@ -695,4 +759,26 @@ func runShellCommand(ctx context.Context, command string, cwd string) (string, s
 		return stdout.String(), stderr.String(), exitCode, nil
 	}
 	return stdout.String(), stderr.String(), exitCode, fmt.Errorf("run command: %w", err)
+}
+
+func enqueueHistoryCommand(command string) error {
+	queue := strings.TrimSpace(os.Getenv("TERMIA_HISTORY_QUEUE"))
+	if queue == "" {
+		queue = config.HistoryQueuePath()
+	}
+	if queue == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(queue), 0755); err != nil {
+		return fmt.Errorf("create history queue dir: %w", err)
+	}
+	file, err := os.OpenFile(queue, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open history queue: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(command + "\n"); err != nil {
+		return fmt.Errorf("write history queue: %w", err)
+	}
+	return nil
 }

@@ -29,6 +29,10 @@ func TranscriptsDir() string {
 	return filepath.Join(TermiaDir(), "transcripts")
 }
 
+func HistoryQueuePath() string {
+	return filepath.Join(TermiaDir(), "history.queue")
+}
+
 // ShellDir returns the directory for shell integration files.
 func ShellDir() string {
 	return filepath.Join(TermiaDir(), "shell")

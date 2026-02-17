@@ -37,6 +37,7 @@ type InputModel struct {
 	useTextarea      bool
 	pasteBlocks      map[rune]pasteBlock
 	pasteSeq         int
+	prompt           string
 }
 
 type pasteBlock struct {
@@ -46,7 +47,7 @@ type pasteBlock struct {
 
 const (
 	inputPrompt       = "> "
-	inputPlaceholder  = "Type / for commands..."
+	inputPlaceholder  = "Type / for chat commands..."
 	suggestedMinWidth = 10
 	maxInputLines     = 6
 	pasteTokenBase    = 0xE000
@@ -94,13 +95,7 @@ func NewInputModel() InputModel {
 	ta.Focus()
 
 	suggestions := []SlashSuggestion{
-		{Name: "help", Desc: "show help"},
-		{Name: "search", Desc: "search history"},
-		{Name: "models", Desc: "show model config"},
-		{Name: "team", Desc: "switch to team mode"},
-		{Name: "copilt", Desc: "switch to copilt mode"},
-		{Name: "clear", Desc: "clear view"},
-		{Name: "exit", Desc: "exit TUI"},
+		{Name: "ralph-loop", Desc: "start ralph loop"},
 	}
 	return InputModel{
 		textInput:        ti,
@@ -108,6 +103,26 @@ func NewInputModel() InputModel {
 		focused:          true,
 		slashSuggestions: suggestions,
 		pasteBlocks:      make(map[rune]pasteBlock),
+		prompt:           inputPrompt,
+	}
+}
+
+func (m *InputModel) SetPrompt(prompt string) {
+	if strings.TrimSpace(prompt) == "" {
+		prompt = inputPrompt
+	}
+	m.prompt = prompt
+	m.textInput.Prompt = prompt
+	m.textarea.Prompt = prompt
+	promptWidth := lipgloss.Width(prompt)
+	m.textarea.SetPromptFunc(promptWidth, func(lineIdx int) string {
+		if lineIdx == 0 {
+			return prompt
+		}
+		return ""
+	})
+	if m.width > 0 {
+		m.SetWidth(m.width)
 	}
 }
 
@@ -797,7 +812,11 @@ func renderPasteSegment(seg pasteSegment, startCell, endCell int, cursorRel int,
 }
 
 func renderEmptyInputWithCursor(m InputModel) string {
-	prompt := inputPromptStyle.Render(inputPrompt)
+	promptValue := m.prompt
+	if strings.TrimSpace(promptValue) == "" {
+		promptValue = inputPrompt
+	}
+	prompt := inputPromptStyle.Render(promptValue)
 	placeholder := inputPlaceholder
 	if placeholder == "" {
 		cursorModel := m.textInput.Cursor

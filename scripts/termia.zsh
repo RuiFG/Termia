@@ -10,7 +10,24 @@ export TERMIA_INTEGRATION_LOADED=1
 # ─── Injected shell functions ───────────────────────────────
 
 tui() {
-    "${TERMIA_BIN:-termia}" tui "$@"
+    local cd_file=""
+    if command -v mktemp >/dev/null 2>&1; then
+        cd_file="$(mktemp "${TERMIA_SHELL_DIR:-/tmp}/termia-cd.XXXXXX")"
+    else
+        cd_file="${TERMIA_SHELL_DIR:-/tmp}/termia-cd.$$"
+        : >"$cd_file"
+    fi
+    TERMIA_CD_FILE="$cd_file" "${TERMIA_BIN:-termia}" tui "$@"
+    local exit_code=$?
+    if [[ -n "$cd_file" && -s "$cd_file" ]]; then
+        local new_dir
+        new_dir="$(cat "$cd_file")"
+        if [[ -n "$new_dir" ]]; then
+            builtin cd -- "$new_dir" 2>/dev/null || true
+        fi
+    fi
+    [[ -n "$cd_file" ]] && rm -f "$cd_file"
+    return $exit_code
 }
 
 tai() {
@@ -23,6 +40,8 @@ tai() {
 # shell built-in $RANDOM + timestamp for lightweight ID.
 
 _termia_cmd_id=""
+_termia_prompt_hint=""
+_termia_prompt_base=""
 
 _termia_osc133() {
     local seq="$1"
@@ -48,6 +67,23 @@ _termia_dealias() {
     fi
 
     printf "%s" "$cmdline"
+}
+
+_termia_update_prompt_hint() {
+    local count_file="${TERMIA_PENDING_PROMPTS_COUNT:-}"
+    local count=""
+    if [[ -n "$count_file" && -f "$count_file" ]]; then
+        count=$(< "$count_file")
+    fi
+    if [[ "$count" == <-> ]] && (( count > 0 )); then
+        _termia_prompt_hint="🔔${count} "
+    else
+        _termia_prompt_hint=""
+    fi
+    if [[ -z "$_termia_prompt_base" ]]; then
+        _termia_prompt_base="$PROMPT"
+    fi
+    PROMPT="${_termia_prompt_hint}${_termia_prompt_base}"
 }
 
 _termia_import_history_queue() {
@@ -105,6 +141,8 @@ _termia_preexec() {
 
 _termia_precmd() {
     local exit_code=$?
+
+    _termia_update_prompt_hint
 
     [[ -n "$TERMIA_NO_RECORD" ]] && { _termia_cmd_id=""; return; }
     if [[ -n "$TERMIA_INTERNAL" ]] && [[ -n "$TERMIA_INTEGRATION_LOADED" ]]; then

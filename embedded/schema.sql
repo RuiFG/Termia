@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS agent_events (
 CREATE TABLE IF NOT EXISTS agent_sessions (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
+    cwd             TEXT NOT NULL DEFAULT '',
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -114,6 +115,21 @@ CREATE INDEX IF NOT EXISTS idx_analyses_created   ON analyses(created_at DESC);
 -- ============================================================
 -- P1 Tables — Added post-MVP
 -- ============================================================
+
+CREATE TABLE IF NOT EXISTS pending_prompts (
+    prompt_id       TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+
+    FOREIGN KEY (session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_prompts_status_created
+    ON pending_prompts(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pending_prompts_session_status
+    ON pending_prompts(session_id, status, created_at DESC);
 
 -- Command outputs (for non-PTY commands, e.g., from agent)
 CREATE TABLE IF NOT EXISTS command_outputs (

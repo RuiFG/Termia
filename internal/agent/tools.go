@@ -224,7 +224,7 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := promptCommandApproval(fmt.Sprintf("read file: %s", path))
+			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("read file: %s", path))
 			if err != nil {
 				return nil, err
 			}
@@ -259,7 +259,7 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := promptCommandApproval(fmt.Sprintf("grep path: %s", path))
+			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("grep path: %s", path))
 			if err != nil {
 				return nil, err
 			}
@@ -295,7 +295,7 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := promptCommandApproval(fmt.Sprintf("edit file: %s", path))
+			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("edit file: %s", path))
 			if err != nil {
 				return nil, err
 			}
@@ -338,7 +338,7 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := promptCommandApproval(fmt.Sprintf("write file: %s", path))
+			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("write file: %s", path))
 			if err != nil {
 				return nil, err
 			}
@@ -368,7 +368,7 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, fmt.Errorf("command is required")
 		}
 		if requireApproval {
-			approved, err := promptCommandApproval(cmdLine)
+			approved, err := requestApprovalOrEnqueue(database, cmdLine)
 			if err != nil {
 				return nil, err
 			}
@@ -725,6 +725,60 @@ func promptCommandApproval(command string) (bool, error) {
 	}
 	choice := strings.TrimSpace(strings.ToLower(input))
 	return choice == "y" || choice == "yes", nil
+}
+
+func requestApprovalOrEnqueue(database *db.DB, message string) (bool, error) {
+	approvalMode := strings.ToLower(strings.TrimSpace(os.Getenv("TERMIA_APPROVAL_MODE")))
+	if approvalMode == "prompt" {
+		return promptCommandApproval(message)
+	}
+	if os.Getenv("TERMIA_WRAPPED") == "1" && os.Getenv("TERMIA_TUI_ACTIVE") != "1" {
+		if _, err := enqueuePendingPrompt(database, message); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return promptCommandApproval(message)
+}
+
+func enqueuePendingPrompt(database *db.DB, content string) (bool, error) {
+	if database == nil {
+		return false, nil
+	}
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false, nil
+	}
+
+	sessionID := strings.TrimSpace(os.Getenv("TERMIA_SESSION_ID"))
+	if sessionID == "" {
+		sessions, err := database.ListAgentSessions(1)
+		if err != nil {
+			return false, err
+		}
+		if len(sessions) == 0 {
+			return false, nil
+		}
+		sessionID = sessions[0].ID
+	}
+	if sessionID == "" {
+		return false, nil
+	}
+
+	prompt := &db.PendingPrompt{
+		PromptID:  uuid.New().String(),
+		SessionID: sessionID,
+		Content:   trimmed,
+		CreatedAt: time.Now().UnixNano(),
+		Status:    db.PendingPromptStatusPending,
+	}
+	if err := database.CreatePendingPrompt(prompt); err != nil {
+		return false, err
+	}
+	if err := database.WritePendingPromptsCount(config.PendingPromptsCountPath()); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func runShellCommand(ctx context.Context, command string, cwd string, outputWriter io.Writer) (string, string, int, error) {

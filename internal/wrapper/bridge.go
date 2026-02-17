@@ -3,10 +3,12 @@
 package wrapper
 
 import (
+	"errors"
 	"io"
 	"os"
 	"sync"
 
+	"github.com/muesli/cancelreader"
 	"go.uber.org/zap"
 )
 
@@ -17,10 +19,43 @@ type bridgeState struct {
 	cond   *sync.Cond
 }
 
-// startBridge starts bidirectional I/O bridging between terminal and PTY.
-func (w *Wrapper) startBridge() {
+func newBridgeState() *bridgeState {
 	state := &bridgeState{}
 	state.cond = sync.NewCond(&state.mu)
+	return state
+}
+
+func (s *bridgeState) waitIfPaused() {
+	s.mu.Lock()
+	for s.paused {
+		s.cond.Wait()
+	}
+	s.mu.Unlock()
+}
+
+func (s *bridgeState) pause() {
+	s.mu.Lock()
+	s.paused = true
+	s.mu.Unlock()
+}
+
+func (s *bridgeState) resume() {
+	s.mu.Lock()
+	s.paused = false
+	s.cond.Broadcast()
+	s.mu.Unlock()
+}
+
+func (s *bridgeState) isPaused() bool {
+	s.mu.Lock()
+	paused := s.paused
+	s.mu.Unlock()
+	return paused
+}
+
+// startBridge starts bidirectional I/O bridging between terminal and PTY.
+func (w *Wrapper) startBridge() {
+	w.bridgeState = newBridgeState()
 
 	// Goroutine 1: stdin → PTY (with pause/resume support)
 	go func() {
@@ -32,16 +67,21 @@ func (w *Wrapper) startBridge() {
 
 		buf := make([]byte, 4096)
 		for {
-			// Check if paused
-			state.mu.Lock()
-			for state.paused {
-				state.cond.Wait()
+			w.bridgeState.waitIfPaused()
+
+			reader, err := w.getInputReader()
+			if err != nil {
+				w.logger.Error("failed to init stdin reader", zap.Error(err))
+				return
 			}
-			state.mu.Unlock()
 
 			// Read from stdin
-			n, err := os.Stdin.Read(buf)
+			n, err := reader.Read(buf)
 			if err != nil {
+				if errors.Is(err, cancelreader.ErrCanceled) {
+					w.resetInputReader()
+					continue
+				}
 				if err != io.EOF {
 					w.logger.Debug("stdin read error", zap.Error(err))
 				}
@@ -77,6 +117,8 @@ func (w *Wrapper) startBridge() {
 				return
 			}
 
+			w.bridgeState.waitIfPaused()
+
 			// Write to stdout
 			if _, err := os.Stdout.Write(buf[:n]); err != nil {
 				w.logger.Debug("stdout write error", zap.Error(err))
@@ -95,14 +137,61 @@ func (w *Wrapper) startBridge() {
 	}()
 }
 
+func (w *Wrapper) getInputReader() (cancelreader.CancelReader, error) {
+	w.bridgeInputMu.Lock()
+	defer w.bridgeInputMu.Unlock()
+
+	if w.bridgeInput != nil {
+		return w.bridgeInput, nil
+	}
+
+	reader, err := cancelreader.NewReader(os.Stdin)
+	if err != nil {
+		return nil, err
+	}
+
+	w.bridgeInput = reader
+	return reader, nil
+}
+
+func (w *Wrapper) resetInputReader() {
+	w.bridgeInputMu.Lock()
+	if w.bridgeInput != nil {
+		_ = w.bridgeInput.Close()
+		w.bridgeInput = nil
+	}
+	w.bridgeInputMu.Unlock()
+}
+
+func (w *Wrapper) cancelInputReader() {
+	w.bridgeInputMu.Lock()
+	reader := w.bridgeInput
+	w.bridgeInputMu.Unlock()
+
+	if reader != nil {
+		reader.Cancel()
+	}
+}
+
 // Pause stops stdin→PTY bridging (for TUI takeover).
 func (w *Wrapper) Pause() {
-	// Note: This would need access to the bridge state.
-	// For now, we'll add a field to Wrapper to hold the state.
-	w.logger.Info("pause requested (not fully implemented)")
+	if w.bridgeState == nil {
+		w.logger.Info("pause requested before bridge ready")
+		return
+	}
+
+	w.bridgeState.pause()
+	w.cancelInputReader()
+	w.logger.Info("bridge paused")
 }
 
 // Resume resumes stdin→PTY bridging.
 func (w *Wrapper) Resume() {
-	w.logger.Info("resume requested (not fully implemented)")
+	if w.bridgeState == nil {
+		w.logger.Info("resume requested before bridge ready")
+		return
+	}
+
+	w.bridgeState.resume()
+	w.logger.Info("bridge resumed")
 }

@@ -32,8 +32,7 @@ func NewPreviewModel(keys KeyMap) PreviewModel {
 // SetSize updates the preview panel dimensions.
 func (m *PreviewModel) SetSize(w, h int) {
 	m.width = w
-	// Reserve 2 lines for header
-	contentHeight := h - 2
+	contentHeight := h - 4
 	if contentHeight < 1 {
 		contentHeight = 1
 	}
@@ -124,10 +123,10 @@ func (m PreviewModel) renderHeader() string {
 	}
 
 	cmd := m.command
-	parts := []string{cmd.Command}
+	parts := []string{lipgloss.NewStyle().Bold(true).Foreground(colorOnSurface).Render(cmd.Command)}
 
 	if cmd.Cwd != "" {
-		parts = append(parts, cwdStyle.Render(cmd.Cwd))
+		parts = append(parts, metadataLabelStyle.Render("CWD:")+" "+cwdStyle.Render(cmd.Cwd))
 	}
 
 	exitStr := "?"
@@ -138,21 +137,21 @@ func (m PreviewModel) renderHeader() string {
 			exitStr = exitErrStyle.Render(fmt.Sprintf("%d", *cmd.ExitCode))
 		}
 	}
-	parts = append(parts, fmt.Sprintf("exit %s", exitStr))
+	parts = append(parts, metadataLabelStyle.Render("EXIT:")+" "+exitStr)
 
 	dur := formatDuration(cmd.DurationMs)
 	if dur != "" {
-		parts = append(parts, metaStyle.Render(dur))
+		parts = append(parts, metadataLabelStyle.Render("DUR:")+" "+metaStyle.Render(dur))
 	}
 
 	if m.loading {
 		parts = append(parts, loadingStyle.Render("loading..."))
 	} else {
 		scrollPct := fmt.Sprintf("%.0f%%", m.viewport.ScrollPercent()*100)
-		parts = append(parts, metaStyle.Render(scrollPct))
+		parts = append(parts, metadataLabelStyle.Render("POS:")+" "+metaStyle.Render(scrollPct))
 	}
 
-	header := strings.Join(parts, " | ")
+	header := strings.Join(parts, "   ")
 	// Truncate to fit width — prevent line wrapping that breaks layout
 	if lipgloss.Width(header) > m.width-2 { // -2 for padding
 		runes := []rune(header)

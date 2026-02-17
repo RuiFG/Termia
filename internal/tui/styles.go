@@ -60,7 +60,7 @@ var (
 	historyPaneStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorSubtle).
-				Padding(0, 1)
+				Padding(0, 2)
 
 	focusedHistoryPaneStyle = historyPaneStyle.Copy().
 				BorderForeground(colorPrimary)
@@ -69,7 +69,7 @@ var (
 	contentPaneStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorSubtle).
-				Padding(0, 1)
+				Padding(0, 2)
 
 	focusedContentPaneStyle = contentPaneStyle.Copy().
 				BorderForeground(colorPrimary)
@@ -78,7 +78,7 @@ var (
 	inputBarStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorSubtle).
-			Padding(0, 1)
+			Padding(0, 2)
 
 	focusedInputBarStyle = inputBarStyle.Copy().
 				BorderForeground(colorPrimary)
@@ -123,6 +123,10 @@ var (
 	metaStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
 
+	metadataLabelStyle = lipgloss.NewStyle().
+				Foreground(colorMuted).
+				Bold(true)
+
 	thinkLowStyle = lipgloss.NewStyle().
 			Foreground(colorMuted)
 
@@ -140,13 +144,21 @@ var (
 	panelTitleStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(colorOnSurface).
-			Padding(0, 1)
+			Padding(1, 2)
+
+	paletteHeaderTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(colorOnSurface)
+
+	paletteSectionStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(colorMuted)
 
 	// Preview header with command info.
 	previewHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(colorPrimary).
-				Padding(0, 1).
+				Padding(1, 2).
 				Border(lipgloss.Border{Bottom: "─"}, false, false, true, false).
 				BorderForeground(colorSubtle)
 
@@ -183,13 +195,22 @@ var (
 			Foreground(colorPrimary).
 			Bold(true)
 
-	copilotModeStyle = lipgloss.NewStyle().
-				Foreground(colorWarning).
-				Bold(true)
+	agentModeStyle = lipgloss.NewStyle().
+			Foreground(colorWarning).
+			Bold(true)
 
 	// Cited command marker in history rows.
 	citedMarkerStyle = lipgloss.NewStyle().
 				Foreground(colorSecondary)
+
+	roleHeaderStyle = lipgloss.NewStyle().
+			Foreground(colorOnSurface).
+			Bold(true)
+	roleSeparatorStyle = lipgloss.NewStyle().
+				Foreground(colorSubtle)
+
+	dirPromptErrorStyle = lipgloss.NewStyle().
+				Foreground(colorError)
 
 	pastePlaceholderStyle = lipgloss.NewStyle().
 				Foreground(colorWarning)

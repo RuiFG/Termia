@@ -3,11 +3,16 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/truncate"
@@ -42,7 +47,7 @@ type AgentMode int
 
 const (
 	AgentModeTeam AgentMode = iota
-	AgentModeCopilot
+	AgentModeAgent
 )
 
 // ThinkLevel controls the UI thinking level indicator.
@@ -59,15 +64,14 @@ type paletteStage int
 const (
 	paletteStageSuggested paletteStage = iota
 	paletteStageModels
-	paletteStageAgents
 	paletteStageSessions
+	paletteStageTeams
 )
 
 type paletteAction int
 
 const (
 	paletteActionOpenModels paletteAction = iota
-	paletteActionOpenAgents
 	paletteActionOpenSessions
 	paletteActionNewSession
 	paletteActionSelectModel
@@ -80,6 +84,12 @@ type paletteItem struct {
 	Desc   string
 	Action paletteAction
 	Value  string
+	Header bool
+}
+
+type paletteSection struct {
+	Label string
+	Items []paletteItem
 }
 
 // App is the main TUI model that orchestrates the 3-panel layout.
@@ -130,11 +140,16 @@ type App struct {
 	middleMode       MiddleMode
 	detailOpen       bool
 	agentMode        AgentMode
+	chordPending     bool
 	thinkLevel       ThinkLevel
 	statusMsg        string
 	contentSelection textSelection
 	inputSelection   textSelection
 	lastMouseMotion  time.Time
+	launchCwd        string
+	cwd              string
+	cwdSyncWarned    bool
+	sessionCwds      map[string]string
 
 	// Team selection
 	teams           []config.AgentTeamProfile
@@ -145,12 +160,20 @@ type App struct {
 	sessions        []db.AgentSession
 	activeSessionID string
 	responseBuffer  []string
+	pendingPromptID string
 
 	// Command palette
 	paletteOpen  bool
 	paletteStage paletteStage
 	paletteIndex int
 	paletteQuery string
+
+	dirPromptOpen    bool
+	dirPromptInput   textinput.Model
+	dirPromptMatches []string
+	dirPromptError   string
+	dirPromptIndex   int
+	dirPromptScroll  int
 
 	// Sub-models
 	history HistoryModel
@@ -218,33 +241,62 @@ type favoriteToggledMsg struct {
 	id string
 }
 
+func newDirPromptInput() textinput.Model {
+	input := textinput.New()
+	input.Placeholder = ""
+	input.Prompt = "> "
+	input.PromptStyle = inputPromptStyle
+	input.CharLimit = 500
+	input.Cursor.Style = inputCursorStyle
+	input.Cursor.Blink = false
+	return input
+}
+
 // New creates a new App model.
 func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 	keys := DefaultKeyMap()
 	teams, activeName, activeRoles := resolveTeams(cfg.Agent)
-	return App{
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	}
+	input := NewInputModel()
+	app := App{
 		db:              database,
 		cfg:             cfg,
 		logger:          logger,
 		focus:           FocusInput, // Start with input focused (standard TUI pattern)
 		middleMode:      ModeAgent,  // Default to Agent view
-		agentMode:       AgentModeTeam,
+		agentMode:       AgentModeAgent,
 		thinkLevel:      ThinkMedium,
 		history:         NewHistoryModel(keys),
 		preview:         NewPreviewModel(keys),
 		detail:          NewHistoryDetailModel(keys),
 		agent:           NewAgentModel(keys),
 		modal:           NewModalModel(),
-		input:           NewInputModel(),
+		input:           input,
 		keys:            keys,
 		teams:           teams,
 		activeTeamName:  activeName,
 		activeTeamRoles: activeRoles,
+		launchCwd:       cwd,
+		cwd:             cwd,
+		sessionCwds:     make(map[string]string),
+		dirPromptInput:  newDirPromptInput(),
 	}
+	app.updateInputPrompt()
+	return app
 }
 
 // Init loads the initial data asynchronously.
 func (a App) Init() tea.Cmd {
+	if a.db != nil {
+		if err := a.updatePendingPromptCount(); err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to sync pending prompt count", zap.Error(err))
+			}
+		}
+	}
 	return tea.Batch(
 		loadCommandsCmd(a.db),
 		loadSessionsCmd(a.db),
@@ -271,11 +323,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionsLoadedMsg:
 		a.sessions = msg.sessions
+		a.cacheSessionCwds(a.sessions)
 		if a.activeSessionID == "" {
 			if len(a.sessions) == 0 {
-				return a, createSessionCmd(a.db)
+				return a, createSessionCmd(a.db, a.launchCwd)
 			}
-			a.activeSessionID = a.sessions[0].ID
+			a.setActiveSessionID(a.sessions[0].ID)
+			a.ensureSessionCwd(a.activeSessionID)
+			a.applySessionCwd(a.activeSessionID)
 			return a, loadSessionMessagesCmd(a.db, a.activeSessionID)
 		}
 		return a, nil
@@ -289,7 +344,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionCreatedMsg:
 		a.sessions = append([]db.AgentSession{msg.session}, a.sessions...)
-		a.activeSessionID = msg.session.ID
+		a.setActiveSessionID(msg.session.ID)
+		a.cacheSessionCwd(msg.session)
+		a.ensureSessionCwd(msg.session.ID)
+		a.applySessionCwd(msg.session.ID)
 		a.agent.SetMessages(nil)
 		return a, nil
 
@@ -351,6 +409,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, readAgentChunkCmd(msg.stream)
 
 	case agentDoneMsg:
+		_ = os.Unsetenv("TERMIA_SESSION_ID")
+		a.resolvePendingPrompt()
 		if a.activeSessionID == "" {
 			return a, nil
 		}
@@ -362,12 +422,17 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, createMessageCmd(a.db, a.activeSessionID, "assistant", response)
 
 	case agentErrorMsg:
-		a.agent.AddMessage(fmt.Sprintf("Error: %v", msg.err))
+		_ = os.Unsetenv("TERMIA_SESSION_ID")
+		a.resolvePendingPrompt()
+		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", msg.err))
 		return a, nil
 
 	case tea.KeyMsg:
 		if a.modal.IsOpen() {
 			return a.handleModalKey(msg)
+		}
+		if a.dirPromptOpen {
+			return a.handleDirPromptKey(msg)
 		}
 		if a.paletteOpen {
 			switch {
@@ -391,20 +456,28 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if len(runes) > 0 {
 						a.paletteQuery = string(runes[:len(runes)-1])
 					}
-					a.paletteIndex = 0
+					a.resetPaletteIndex()
 				}
 				return a, nil
 			case msg.Type == tea.KeySpace:
 				a.paletteQuery += " "
-				a.paletteIndex = 0
+				a.resetPaletteIndex()
 				return a, nil
 			case msg.Type == tea.KeyRunes:
 				if len(msg.Runes) > 0 {
 					a.paletteQuery += string(msg.Runes)
-					a.paletteIndex = 0
+					a.resetPaletteIndex()
 				}
 				return a, nil
 			}
+			return a, nil
+		}
+
+		if a.chordPending {
+			return a.handleChordKey(msg)
+		}
+		if msg.Type == tea.KeyCtrlX {
+			a.chordPending = true
 			return a, nil
 		}
 
@@ -525,6 +598,242 @@ func (a *App) updateFocusState() {
 	} else {
 		a.input.Blur()
 	}
+}
+
+func (a App) handleChordKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyEsc {
+		a.chordPending = false
+		return a, nil
+	}
+	if msg.Type != tea.KeyRunes || len(msg.Runes) == 0 {
+		a.chordPending = false
+		return a, nil
+	}
+
+	key := unicode.ToLower(msg.Runes[0])
+	switch key {
+	case 'a':
+		a.agentMode = AgentModeAgent
+		a.middleMode = ModeAgent
+		a.statusMsg = "Mode set to Agent."
+	case 't':
+		a.openPaletteStage(paletteStageTeams)
+	case 'c':
+		a.openDirPrompt()
+	}
+	a.chordPending = false
+	return a, nil
+}
+
+func (a *App) openDirPrompt() {
+	a.dirPromptOpen = true
+	a.dirPromptError = ""
+	a.dirPromptMatches = nil
+	a.dirPromptIndex = -1
+	a.dirPromptScroll = 0
+	a.dirPromptInput.SetValue("")
+	a.dirPromptInput.Placeholder = tildePath(a.cwd)
+	a.dirPromptInput.Focus()
+	a.paletteOpen = false
+	a.updateDirPromptMatches()
+}
+
+func (a *App) closeDirPrompt() {
+	a.dirPromptOpen = false
+	a.dirPromptError = ""
+	a.dirPromptMatches = nil
+	a.dirPromptIndex = -1
+	a.dirPromptScroll = 0
+	a.dirPromptInput.Blur()
+}
+
+func (a App) handleDirPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		a.closeDirPrompt()
+		return a, nil
+	case tea.KeyEnter:
+		return a.submitDirPrompt()
+	case tea.KeyUp:
+		a.moveDirPromptSelection(-1)
+		return a, nil
+	case tea.KeyDown:
+		a.moveDirPromptSelection(1)
+		return a, nil
+	case tea.KeyTab:
+		if !a.applyDirPromptSelection() {
+			a.completeDirPrompt()
+		}
+		return a, nil
+	}
+
+	var cmd tea.Cmd
+	a.dirPromptInput, cmd = a.dirPromptInput.Update(msg)
+	a.updateDirPromptMatches()
+	return a, cmd
+}
+
+func (a *App) updateDirPromptMatches() {
+	_, matches := completeDirPrompt(a.dirPromptInput.Value(), a.cwd)
+	a.setDirPromptMatches(matches)
+}
+
+func (a *App) completeDirPrompt() {
+	value := a.dirPromptInput.Value()
+	completed, matches := completeDirPrompt(value, a.cwd)
+	a.setDirPromptMatches(matches)
+	if completed != value {
+		a.dirPromptInput.SetValue(completed)
+		a.dirPromptInput.CursorEnd()
+	}
+}
+
+func (a *App) setDirPromptMatches(matches []string) {
+	a.dirPromptMatches = matches
+	if len(matches) == 0 {
+		a.dirPromptIndex = -1
+		a.dirPromptScroll = 0
+		return
+	}
+	if a.dirPromptIndex >= len(matches) {
+		a.dirPromptIndex = len(matches) - 1
+	}
+	if a.dirPromptIndex < -1 {
+		a.dirPromptIndex = -1
+	}
+	a.ensureDirPromptVisible()
+}
+
+func (a *App) dirPromptVisibleMatches() []string {
+	start, end := a.dirPromptWindow()
+	if start >= end {
+		return nil
+	}
+	return a.dirPromptMatches[start:end]
+}
+
+func (a *App) dirPromptMaxVisible() int {
+	if len(a.dirPromptMatches) == 0 {
+		return 0
+	}
+	return minInt(6, len(a.dirPromptMatches))
+}
+
+func (a *App) dirPromptWindow() (int, int) {
+	maxItems := a.dirPromptMaxVisible()
+	if maxItems == 0 {
+		return 0, 0
+	}
+	start := a.dirPromptScroll
+	if start < 0 {
+		start = 0
+	}
+	maxStart := len(a.dirPromptMatches) - maxItems
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	if start > maxStart {
+		start = maxStart
+	}
+	end := start + maxItems
+	if end > len(a.dirPromptMatches) {
+		end = len(a.dirPromptMatches)
+	}
+	return start, end
+}
+
+func (a *App) ensureDirPromptVisible() {
+	maxItems := a.dirPromptMaxVisible()
+	if maxItems == 0 {
+		a.dirPromptScroll = 0
+		return
+	}
+	if a.dirPromptIndex < 0 {
+		a.dirPromptScroll = 0
+		return
+	}
+	if a.dirPromptIndex < a.dirPromptScroll {
+		a.dirPromptScroll = a.dirPromptIndex
+	}
+	if a.dirPromptIndex >= a.dirPromptScroll+maxItems {
+		a.dirPromptScroll = a.dirPromptIndex - maxItems + 1
+	}
+	maxScroll := len(a.dirPromptMatches) - maxItems
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if a.dirPromptScroll > maxScroll {
+		a.dirPromptScroll = maxScroll
+	}
+	if a.dirPromptScroll < 0 {
+		a.dirPromptScroll = 0
+	}
+}
+
+func (a *App) moveDirPromptSelection(delta int) {
+	if len(a.dirPromptMatches) == 0 {
+		a.dirPromptIndex = -1
+		a.dirPromptScroll = 0
+		return
+	}
+	if a.dirPromptIndex < 0 {
+		if delta < 0 {
+			a.dirPromptIndex = len(a.dirPromptMatches) - 1
+		} else {
+			a.dirPromptIndex = 0
+		}
+		a.ensureDirPromptVisible()
+		return
+	}
+	a.dirPromptIndex += delta
+	if a.dirPromptIndex < 0 {
+		a.dirPromptIndex = len(a.dirPromptMatches) - 1
+		a.ensureDirPromptVisible()
+		return
+	}
+	if a.dirPromptIndex >= len(a.dirPromptMatches) {
+		a.dirPromptIndex = 0
+	}
+	a.ensureDirPromptVisible()
+}
+
+func (a *App) applyDirPromptSelection() bool {
+	if len(a.dirPromptMatches) == 0 {
+		return false
+	}
+	if a.dirPromptIndex < 0 || a.dirPromptIndex >= len(a.dirPromptMatches) {
+		return false
+	}
+	value := a.dirPromptInput.Value()
+	dirPart, _ := splitDirInput(value)
+	selection := dirPart + a.dirPromptMatches[a.dirPromptIndex]
+	if selection == value {
+		return false
+	}
+	a.dirPromptInput.SetValue(selection)
+	a.dirPromptInput.CursorEnd()
+	a.updateDirPromptMatches()
+	return true
+}
+
+func (a App) submitDirPrompt() (tea.Model, tea.Cmd) {
+	value := strings.TrimSpace(a.dirPromptInput.Value())
+	if value == "" {
+		a.closeDirPrompt()
+		return a, nil
+	}
+	resolved, err := resolveDirPath(value, a.cwd)
+	if err != nil {
+		a.dirPromptError = err.Error()
+		return a, nil
+	}
+	if err := os.Chdir(resolved); err != nil {
+		a.dirPromptError = fmt.Sprintf("%s: %v", resolved, err)
+		return a, nil
+	}
+	a.setCwd(resolved)
+	a.closeDirPrompt()
+	return a, nil
 }
 
 // handleInputKey processes key events when input is focused.
@@ -746,20 +1055,21 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 
 	// Regular text input -> Send to Agent
 	a.middleMode = ModeAgent
-	a.agent.AddMessage(fmt.Sprintf("> %s", val))
-	a.agent.AddMessage("")
+	a.agent.AddMessage("user", val)
+	a.agent.AddMessage("agent", "")
 	a.responseBuffer = nil
 
 	if a.activeSessionID == "" {
-		newSession, err := createSession(a.db)
+		newSession, err := createSession(a.db, a.cwd)
 		if err != nil {
 			a.agent.AppendToLast(fmt.Sprintf("Error: %v", err))
 			a.input.Reset()
 			return a, nil
 		}
-		a.activeSessionID = newSession.ID
+		a.setActiveSessionID(newSession.ID)
 		a.sessions = append([]db.AgentSession{newSession}, a.sessions...)
 	}
+	a.setActiveSessionID(a.activeSessionID)
 
 	if err := a.db.CreateAgentMessage(&db.AgentMessage{
 		ID:        generateID(),
@@ -777,12 +1087,14 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		stream <-chan string
 		err    error
 	)
-	if a.agentMode == AgentModeCopilot {
-		stream, err = a.runCopilotQuery(val)
+	if a.agentMode == AgentModeAgent {
+		stream, err = a.runAgentQuery(val)
 	} else {
 		stream, err = a.runTeamQuery(val)
 	}
 	if err != nil {
+		_ = os.Unsetenv("TERMIA_SESSION_ID")
+		a.resolvePendingPrompt()
 		a.agent.AppendToLast(fmt.Sprintf("Error: %v", err))
 		a.input.Reset()
 		return a, nil
@@ -905,7 +1217,7 @@ func (a *App) runTeamQuery(query string) (<-chan string, error) {
 	return teamRunner.Run(context.Background(), query, nil)
 }
 
-func (a *App) runCopilotQuery(query string) (<-chan string, error) {
+func (a *App) runAgentQuery(query string) (<-chan string, error) {
 	if a.db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
@@ -955,13 +1267,6 @@ func (a App) handleSlashResult(result SlashCommandResult) (tea.Model, tea.Cmd) {
 		return a, tea.Quit
 	}
 
-	if result.Clear {
-		a.statusMsg = ""
-		a.agent.messages = nil
-		a.agent.refreshContent()
-		return a, nil
-	}
-
 	if result.SwitchFocus != nil {
 		a.focus = *result.SwitchFocus
 	}
@@ -971,13 +1276,19 @@ func (a App) handleSlashResult(result SlashCommandResult) (tea.Model, tea.Cmd) {
 	if result.SwitchAgentMode != nil {
 		a.agentMode = *result.SwitchAgentMode
 	}
+	if result.OpenPalette != nil {
+		a.openPaletteStage(*result.OpenPalette)
+	}
 
 	if result.Output != "" {
 		a.middleMode = ModeAgent
-		a.agent.AddMessage(result.Output)
+		a.agent.AddMessage("agent", result.Output)
 	}
 
 	a.updateFocusState()
+	if result.CreateSession {
+		return a, createSessionCmd(a.db, a.launchCwd)
+	}
 	return a, nil
 }
 
@@ -1121,6 +1432,10 @@ func (a App) View() string {
 		palette := a.renderCommandPalette(innerW)
 		body = overlayContentCentered(body, palette, innerW, innerH)
 	}
+	if a.dirPromptOpen {
+		prompt := a.renderDirPrompt(innerW)
+		body = overlayContentCentered(body, prompt, innerW, innerH)
+	}
 
 	// Container uses Height/Width to ensure minimum size (pads if body is shorter).
 	// Do NOT use MaxHeight/MaxWidth — they truncate AFTER borders, clipping the bottom border.
@@ -1247,6 +1562,10 @@ func (a App) renderInput(contentWidth int) string {
 	if a.inputSelection.HasSelection() {
 		inputLines = a.inputSelection.HighlightLines(contentWidth)
 	}
+	cwdLine := a.renderInputCwdLine(contentWidth)
+	if cwdLine != "" {
+		inputLines = append([]string{cwdLine}, inputLines...)
+	}
 	inputAreaLines := a.inputHeight - 1
 	blankLines := inputAreaLines - len(inputLines)
 	if blankLines < 1 {
@@ -1275,8 +1594,8 @@ func (a App) renderInput(contentWidth int) string {
 
 func (a App) renderAgentModeBadge() string {
 	switch a.agentMode {
-	case AgentModeCopilot:
-		return copilotModeStyle.Render("Copilt")
+	case AgentModeAgent:
+		return agentModeStyle.Render("Agent")
 	default:
 		return teamModeStyle.Render("Team")
 	}
@@ -1297,8 +1616,8 @@ func (a App) renderAgentStatusLine() string {
 }
 
 func (a App) renderAgentLabel() string {
-	if a.agentMode == AgentModeCopilot {
-		return copilotModeStyle.Render("Copilt")
+	if a.agentMode == AgentModeAgent {
+		return agentModeStyle.Render("Agent")
 	}
 	name := strings.TrimSpace(a.activeTeamName)
 	if name == "" {
@@ -1373,11 +1692,37 @@ func (a App) renderStatusBar(contentWidth int) string {
 }
 
 func (a App) renderStatusHints() string {
-	return fmt.Sprintf("Ctrl+P %s | Ctrl+T %s | Tab %s",
+	hints := fmt.Sprintf("Ctrl+P %s | Ctrl+T %s | Tab %s",
 		metaStyle.Render("command"),
 		metaStyle.Render("variants"),
 		metaStyle.Render("windows"),
 	)
+	badge := a.pendingPromptBadge()
+	if badge == "" {
+		return hints
+	}
+	return fmt.Sprintf("%s  %s", badge, hints)
+}
+
+func (a App) pendingPromptBadge() string {
+	count := a.pendingPromptCount()
+	if count <= 0 {
+		return ""
+	}
+	return metadataLabelStyle.Render(fmt.Sprintf("🔔%d", count))
+}
+
+func (a App) pendingPromptCount() int {
+	path := config.PendingPromptsCountPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return count
 }
 
 func buildStatusLine(left, right string, width int) string {
@@ -1439,8 +1784,15 @@ func overlayStatusLine(left, right string, width int) string {
 func (a *App) openPalette() {
 	a.paletteOpen = true
 	a.paletteStage = paletteStageSuggested
-	a.paletteIndex = 0
 	a.paletteQuery = ""
+	a.resetPaletteIndex()
+}
+
+func (a *App) openPaletteStage(stage paletteStage) {
+	a.paletteOpen = true
+	a.paletteStage = stage
+	a.paletteQuery = ""
+	a.resetPaletteIndex()
 }
 
 func (a *App) closePalette() {
@@ -1456,12 +1808,7 @@ func (a *App) movePaletteSelection(delta int) {
 		a.paletteIndex = 0
 		return
 	}
-	a.paletteIndex += delta
-	if a.paletteIndex < 0 {
-		a.paletteIndex = len(items) - 1
-	} else if a.paletteIndex >= len(items) {
-		a.paletteIndex = 0
-	}
+	a.paletteIndex = nextSelectableIndex(items, a.paletteIndex, delta)
 }
 
 func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
@@ -1470,16 +1817,16 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	if a.paletteIndex < 0 || a.paletteIndex >= len(items) {
-		a.paletteIndex = 0
+		a.paletteIndex = firstSelectableIndex(items)
 	}
 	item := items[a.paletteIndex]
+	if item.Header {
+		a.paletteIndex = nextSelectableIndex(items, a.paletteIndex, 1)
+		return a, nil
+	}
 	switch item.Action {
 	case paletteActionOpenModels:
 		a.paletteStage = paletteStageModels
-		a.paletteIndex = 0
-		return a, nil
-	case paletteActionOpenAgents:
-		a.paletteStage = paletteStageAgents
 		a.paletteIndex = 0
 		return a, nil
 	case paletteActionOpenSessions:
@@ -1488,16 +1835,20 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		return a, nil
 	case paletteActionNewSession:
 		a.closePalette()
-		return a, createSessionCmd(a.db)
+		return a, createSessionCmd(a.db, a.launchCwd)
 	case paletteActionSelectModel:
 		a.cfg.LLM.DefaultProvider = item.Value
 		a.statusMsg = fmt.Sprintf("Model switched to %s.", item.Label)
 		a.closePalette()
 		return a, nil
 	case paletteActionSelectAgent:
-		if item.Value == "copilt" {
-			a.agentMode = AgentModeCopilot
-			a.statusMsg = "Agent mode set to copilt."
+		if item.Value == "agent" {
+			a.agentMode = AgentModeAgent
+			a.statusMsg = "Agent mode set to Agent."
+			a.closePalette()
+			return a, nil
+		}
+		if strings.TrimSpace(item.Value) == "" {
 			a.closePalette()
 			return a, nil
 		}
@@ -1511,8 +1862,9 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		a.closePalette()
 		return a, nil
 	case paletteActionSelectSession:
-		a.activeSessionID = item.Value
+		a.setActiveSessionID(item.Value)
 		a.closePalette()
+		a.applySessionCwd(item.Value)
 		return a, loadSessionMessagesCmd(a.db, item.Value)
 	default:
 		return a, nil
@@ -1700,9 +2052,10 @@ func (a App) handleInputSelection(msg tea.MouseMsg, contentX, contentY int) (boo
 		return true, nil
 	}
 
-	inputAreaLines := a.inputHeight - 1
-	line := contentY - innerY
-	if line >= inputAreaLines {
+	cwdLines := a.inputCwdLineCount()
+	inputAreaLines := a.inputHeight - 1 - cwdLines
+	line := contentY - innerY - cwdLines
+	if line < 0 || line >= inputAreaLines {
 		if msg.Action == tea.MouseActionRelease {
 			a.inputSelection.EndSelection()
 		}
@@ -1766,16 +2119,23 @@ func (a App) renderCommandPalette(totalWidth int) string {
 	}
 	var lines []string
 	lines = append(lines, a.renderPaletteHeader(contentWidth))
+	lines = append(lines, metaStyle.Render("Search: "+a.paletteQuery))
 	lines = append(lines, "")
-	lines = append(lines, panelTitleStyle.Render(a.paletteTitle()))
-	if a.paletteQuery != "" {
-		lines = append(lines, metaStyle.Render("Search: "+a.paletteQuery))
-	}
 	selectedIndex := a.paletteIndex
-	if selectedIndex < 0 || selectedIndex >= len(items) {
-		selectedIndex = 0
+	if selectedIndex < 0 || selectedIndex >= len(items) || items[selectedIndex].Header {
+		selectedIndex = firstSelectableIndex(items)
 	}
 	for i, item := range items {
+		if item.Header {
+			if len(lines) > 0 {
+				last := strings.TrimSpace(stripANSICodes(lines[len(lines)-1]))
+				if last != "" {
+					lines = append(lines, "")
+				}
+			}
+			lines = append(lines, paletteSectionStyle.Render(item.Label))
+			continue
+		}
 		line := a.formatPaletteLine(item.Label, item.Desc, contentWidth)
 		style := normalRowStyle
 		if i == selectedIndex {
@@ -1792,22 +2152,84 @@ func (a App) renderCommandPalette(totalWidth int) string {
 	return padLeftLines(panel, padding)
 }
 
-func (a App) renderPaletteHeader(width int) string {
-	left := "Commands"
+func (a App) renderDirPrompt(totalWidth int) string {
+	if totalWidth <= 0 {
+		return ""
+	}
+	promptWidth := totalWidth - 6
+	if promptWidth > 70 {
+		promptWidth = 70
+	}
+	if promptWidth < 30 {
+		promptWidth = totalWidth - 4
+	}
+	if promptWidth < 20 {
+		promptWidth = totalWidth
+	}
+	frameW, _ := commandPaletteStyle.GetFrameSize()
+	contentWidth := promptWidth - frameW
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
+	input := a.dirPromptInput
+	promptCells := lipgloss.Width(input.Prompt)
+	input.Width = maxInt(contentWidth-promptCells, suggestedMinWidth)
+	inputLine := input.View()
+
+	lines := []string{
+		a.renderDirPromptHeader(contentWidth),
+		"",
+		metaStyle.Render("Current: " + formatCwdDisplay(a.cwd, contentWidth)),
+		"",
+		inputLine,
+	}
+	if strings.TrimSpace(a.dirPromptError) != "" {
+		lines = append(lines, "", dirPromptErrorStyle.Render(a.dirPromptError))
+	}
+	start, _ := a.dirPromptWindow()
+	visible := a.dirPromptVisibleMatches()
+	if len(visible) > 0 {
+		lines = append(lines, "", paletteSectionStyle.Render("Suggestions"))
+		for i, match := range visible {
+			line := match
+			if lipgloss.Width(line) > contentWidth {
+				line = truncateToWidth(line, contentWidth)
+			}
+			style := metaStyle
+			if start+i == a.dirPromptIndex {
+				style = selectedRowStyle
+			}
+			lines = append(lines, style.Render(line))
+		}
+	}
+
+	content := strings.Join(lines, "\n")
+	panel := commandPaletteStyle.Width(promptWidth).Render(content)
+	padding := (totalWidth - promptWidth) / 2
+	return padLeftLines(panel, padding)
+}
+
+func (a App) renderDirPromptHeader(width int) string {
+	left := paletteHeaderTitleStyle.Render("Change Directory")
 	right := metaStyle.Render("Esc")
-	leftLine := lipgloss.PlaceHorizontal(width, lipgloss.Left, left)
-	rightLine := lipgloss.PlaceHorizontal(width, lipgloss.Right, right)
-	return overlayStatusLine(leftLine, rightLine, width)
+	return buildStatusLine(left, right, width)
+}
+
+func (a App) renderPaletteHeader(width int) string {
+	left := paletteHeaderTitleStyle.Render(a.paletteTitle())
+	right := metaStyle.Render("Esc")
+	return buildStatusLine(left, right, width)
 }
 
 func (a App) paletteTitle() string {
 	switch a.paletteStage {
 	case paletteStageModels:
-		return "Switch Model"
-	case paletteStageAgents:
-		return "Switch Agent"
+		return "Models"
 	case paletteStageSessions:
-		return "Switch Session"
+		return "Sessions"
+	case paletteStageTeams:
+		return "Teams"
 	default:
 		return "Suggested"
 	}
@@ -1817,23 +2239,58 @@ func (a App) paletteItems() []paletteItem {
 	switch a.paletteStage {
 	case paletteStageModels:
 		return a.modelPaletteItems()
-	case paletteStageAgents:
-		return a.agentPaletteItems()
 	case paletteStageSessions:
 		return a.sessionPaletteItems()
+	case paletteStageTeams:
+		return a.teamPaletteItems()
 	default:
-		return []paletteItem{
-			{Label: "Switch Model", Action: paletteActionOpenModels},
-			{Label: "Switch Agent", Action: paletteActionOpenAgents},
-			{Label: "Switch Session", Action: paletteActionOpenSessions},
+		return nil
+	}
+}
+
+func (a App) paletteSections() []paletteSection {
+	switch a.paletteStage {
+	case paletteStageModels:
+		return []paletteSection{{Label: "Models", Items: a.modelPaletteItems()}}
+	case paletteStageSessions:
+		return []paletteSection{{Label: "Sessions", Items: a.sessionPaletteItems()}}
+	case paletteStageTeams:
+		return []paletteSection{{Label: "Teams", Items: a.teamPaletteItems()}}
+	default:
+		suggested := []paletteItem{
+			{Label: "Models", Action: paletteActionOpenModels},
+			{Label: "Sessions", Action: paletteActionOpenSessions},
 			{Label: "New Session", Action: paletteActionNewSession},
+		}
+		return []paletteSection{
+			{Label: "Suggested", Items: suggested},
+			{Label: "Mode", Items: a.agentPaletteItems()},
 		}
 	}
 }
 
 func (a App) paletteVisibleItems() []paletteItem {
-	items := a.paletteItems()
+	sections := a.paletteSections()
 	query := strings.TrimSpace(a.paletteQuery)
+	var visible []paletteItem
+	for _, section := range sections {
+		items := filterPaletteItems(section.Items, query)
+		if len(items) == 0 {
+			continue
+		}
+		visible = append(visible, paletteItem{Label: section.Label, Header: true})
+		visible = append(visible, items...)
+	}
+	return visible
+}
+
+func (a *App) resetPaletteIndex() {
+	items := a.paletteVisibleItems()
+	a.paletteIndex = firstSelectableIndex(items)
+}
+
+func filterPaletteItems(items []paletteItem, query string) []paletteItem {
+	query = strings.TrimSpace(query)
 	if query == "" {
 		return items
 	}
@@ -1847,6 +2304,34 @@ func (a App) paletteVisibleItems() []paletteItem {
 		}
 	}
 	return filtered
+}
+
+func firstSelectableIndex(items []paletteItem) int {
+	for i, item := range items {
+		if !item.Header {
+			return i
+		}
+	}
+	return 0
+}
+
+func nextSelectableIndex(items []paletteItem, start, delta int) int {
+	if len(items) == 0 {
+		return 0
+	}
+	idx := start
+	for i := 0; i < len(items); i++ {
+		idx += delta
+		if idx < 0 {
+			idx = len(items) - 1
+		} else if idx >= len(items) {
+			idx = 0
+		}
+		if !items[idx].Header {
+			return idx
+		}
+	}
+	return start
 }
 
 func (a App) modelPaletteItems() []paletteItem {
@@ -1872,10 +2357,22 @@ func (a App) modelPaletteItems() []paletteItem {
 }
 
 func (a App) agentPaletteItems() []paletteItem {
-	items := []paletteItem{{Label: "Copilt", Action: paletteActionSelectAgent, Value: "copilt"}}
+	items := []paletteItem{{Label: "Agent", Action: paletteActionSelectAgent, Value: "agent"}}
 	for _, team := range a.teams {
 		label := fmt.Sprintf("%s(Team)", team.Name)
 		items = append(items, paletteItem{Label: label, Action: paletteActionSelectAgent, Value: team.Name})
+	}
+	return items
+}
+
+func (a App) teamPaletteItems() []paletteItem {
+	items := make([]paletteItem, 0, len(a.teams))
+	for _, team := range a.teams {
+		label := fmt.Sprintf("%s(Team)", team.Name)
+		items = append(items, paletteItem{Label: label, Action: paletteActionSelectAgent, Value: team.Name})
+	}
+	if len(items) == 0 {
+		return []paletteItem{{Label: "No teams", Action: paletteActionSelectAgent, Value: ""}}
 	}
 	return items
 }
@@ -1887,6 +2384,16 @@ func (a App) sessionPaletteItems() []paletteItem {
 	items := make([]paletteItem, 0, len(a.sessions))
 	for _, s := range a.sessions {
 		desc := formatRelativeTime(s.UpdatedAt)
+		if a.db != nil {
+			count, err := a.db.CountPendingPromptsForSession(s.ID)
+			if err == nil && count > 0 {
+				if desc == "" {
+					desc = fmt.Sprintf("🔔%d", count)
+				} else {
+					desc = fmt.Sprintf("%s • 🔔%d", desc, count)
+				}
+			}
+		}
 		items = append(items, paletteItem{Label: s.Name, Desc: desc, Action: paletteActionSelectSession, Value: s.ID})
 	}
 	return items
@@ -2003,12 +2510,15 @@ func (a *App) layoutPanels() {
 
 	// Fixed input rendered height: content + frame
 	inputLines := InputLineCount(a.input)
-	inputAreaLines := inputLines + 1
-	if inputAreaLines < 2 {
-		inputAreaLines = 2
+	extraLines := 1 + a.inputCwdLineCount()
+	inputAreaLines := inputLines + extraLines
+	minInputArea := extraLines + 1
+	if inputAreaLines < minInputArea {
+		inputAreaLines = minInputArea
 	}
-	if inputAreaLines > maxInputLines+1 {
-		inputAreaLines = maxInputLines + 1
+	maxInputArea := maxInputLines + extraLines
+	if inputAreaLines > maxInputArea {
+		inputAreaLines = maxInputArea
 	}
 	a.inputHeight = inputAreaLines + 1
 	inputRendered := a.inputHeight + panelFH
@@ -2092,6 +2602,7 @@ func (a *App) layoutPanels() {
 		a.inputYEnd = a.inputYStart + inputRendered - 1
 		a.historyYStart = 1
 		a.historyYEnd = a.historyYStart + available - 1
+		a.updateInputPrompt()
 		return
 	}
 
@@ -2154,6 +2665,7 @@ func (a *App) layoutPanels() {
 
 	a.inputYStart = y
 	a.inputYEnd = y + inputRendered - 1
+	a.updateInputPrompt()
 }
 
 func loadCommandsCmd(database *db.DB) tea.Cmd {
@@ -2189,13 +2701,42 @@ func loadSessionMessagesCmd(database *db.DB, sessionID string) tea.Cmd {
 		if err != nil {
 			return sessionMessagesErrorMsg{err: err}
 		}
+
+		pending, err := database.ListPendingPrompts(sessionID, 0)
+		if err != nil {
+			return sessionMessagesErrorMsg{err: err}
+		}
+		if len(pending) > 0 {
+			for _, prompt := range pending {
+				msg := &db.AgentMessage{
+					ID:        generateID(),
+					SessionID: sessionID,
+					Role:      "assistant",
+					Content:   prompt.Content,
+					CreatedAt: prompt.CreatedAt,
+				}
+				if err := database.CreateAgentMessage(msg); err != nil {
+					return sessionMessagesErrorMsg{err: err}
+				}
+				if err := database.ResolvePendingPrompt(prompt.PromptID); err != nil {
+					return sessionMessagesErrorMsg{err: err}
+				}
+			}
+			if err := database.WritePendingPromptsCount(config.PendingPromptsCountPath()); err != nil {
+				return sessionMessagesErrorMsg{err: err}
+			}
+			messages, err = database.ListAgentMessages(sessionID)
+			if err != nil {
+				return sessionMessagesErrorMsg{err: err}
+			}
+		}
 		return sessionMessagesLoadedMsg{sessionID: sessionID, messages: messages}
 	}
 }
 
-func createSessionCmd(database *db.DB) tea.Cmd {
+func createSessionCmd(database *db.DB, cwd string) tea.Cmd {
 	return func() tea.Msg {
-		session, err := createSession(database)
+		session, err := createSession(database, cwd)
 		if err != nil {
 			return sessionsErrorMsg{err: err}
 		}
@@ -2219,7 +2760,67 @@ func createMessageCmd(database *db.DB, sessionID, role, content string) tea.Cmd 
 	}
 }
 
-func createSession(database *db.DB) (db.AgentSession, error) {
+func (a *App) enqueuePendingPrompt(content string, createdAt int64) error {
+	if a.db == nil {
+		return fmt.Errorf("database is nil")
+	}
+	sessionID := strings.TrimSpace(a.activeSessionID)
+	if sessionID == "" {
+		return fmt.Errorf("active session is empty")
+	}
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return fmt.Errorf("content is empty")
+	}
+	promptID := generateID()
+	prompt := &db.PendingPrompt{
+		PromptID:  promptID,
+		SessionID: sessionID,
+		Content:   trimmed,
+		CreatedAt: createdAt,
+		Status:    db.PendingPromptStatusPending,
+	}
+	if err := a.db.CreatePendingPrompt(prompt); err != nil {
+		return err
+	}
+	a.pendingPromptID = promptID
+	if err := a.updatePendingPromptCount(); err != nil {
+		if a.logger != nil {
+			a.logger.Warn("failed to update pending prompt count", zap.Error(err))
+		}
+	}
+	return nil
+}
+
+func (a *App) resolvePendingPrompt() {
+	if a.pendingPromptID == "" {
+		return
+	}
+	if a.db == nil {
+		a.pendingPromptID = ""
+		return
+	}
+	if err := a.db.ResolvePendingPrompt(a.pendingPromptID); err != nil {
+		if a.logger != nil {
+			a.logger.Warn("failed to resolve pending prompt", zap.Error(err))
+		}
+	}
+	if err := a.updatePendingPromptCount(); err != nil {
+		if a.logger != nil {
+			a.logger.Warn("failed to update pending prompt count", zap.Error(err))
+		}
+	}
+	a.pendingPromptID = ""
+}
+
+func (a *App) updatePendingPromptCount() error {
+	if a.db == nil {
+		return fmt.Errorf("database is nil")
+	}
+	return a.db.WritePendingPromptsCount(config.PendingPromptsCountPath())
+}
+
+func createSession(database *db.DB, cwd string) (db.AgentSession, error) {
 	if database == nil {
 		return db.AgentSession{}, fmt.Errorf("database is nil")
 	}
@@ -2227,6 +2828,7 @@ func createSession(database *db.DB) (db.AgentSession, error) {
 	session := db.AgentSession{
 		ID:        generateID(),
 		Name:      name,
+		Cwd:       strings.TrimSpace(cwd),
 		CreatedAt: time.Now().UnixNano(),
 		UpdatedAt: time.Now().UnixNano(),
 	}
@@ -2236,23 +2838,413 @@ func createSession(database *db.DB) (db.AgentSession, error) {
 	return session, nil
 }
 
-func formatSessionMessages(messages []db.AgentMessage) []string {
+func formatSessionMessages(messages []db.AgentMessage) []AgentMessage {
 	if len(messages) == 0 {
 		return nil
 	}
-	output := make([]string, 0, len(messages))
+	output := make([]AgentMessage, 0, len(messages))
 	for _, msg := range messages {
 		content := strings.TrimSpace(msg.Content)
 		if content == "" {
 			continue
 		}
-		if msg.Role == "user" {
-			output = append(output, fmt.Sprintf("> %s", content))
-			continue
-		}
-		output = append(output, content)
+		output = append(output, AgentMessage{Role: msg.Role, Content: content})
 	}
 	return output
+}
+
+func (a *App) updateInputPrompt() {
+	a.input.SetPrompt(inputPrompt)
+	promptCells := lipgloss.Width(a.dirPromptInput.Prompt)
+	if a.leftContentW > 0 {
+		a.dirPromptInput.Width = maxInt(a.leftContentW-promptCells, suggestedMinWidth)
+	}
+}
+
+func (a App) inputCwdLineCount() int {
+	if strings.TrimSpace(a.cwd) == "" {
+		return 0
+	}
+	return 1
+}
+
+func (a App) renderInputCwdLine(contentWidth int) string {
+	if strings.TrimSpace(a.cwd) == "" || contentWidth <= 0 {
+		return ""
+	}
+	prefix := ""
+	maxWidth := contentWidth
+	if maxWidth < 1 {
+		return metaStyle.Render(truncateToWidth(prefix, contentWidth))
+	}
+	display := formatCwdDisplay(a.cwd, maxWidth)
+	line := prefix + display
+	if lipgloss.Width(line) > contentWidth {
+		line = truncateToWidth(line, contentWidth)
+	}
+	return metaStyle.Render(line)
+}
+
+func (a *App) setActiveSessionID(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	a.activeSessionID = sessionID
+	if sessionID == "" {
+		_ = os.Unsetenv("TERMIA_SESSION_ID")
+		return
+	}
+	_ = os.Setenv("TERMIA_SESSION_ID", sessionID)
+}
+
+func (a *App) setCwd(cwd string) {
+	if strings.TrimSpace(cwd) == "" {
+		return
+	}
+	a.cwd = cwd
+	a.recordSessionCwd(a.activeSessionID, cwd)
+	a.updateInputPrompt()
+	a.syncCwdToShell(cwd)
+}
+
+func (a *App) recordSessionCwd(sessionID, cwd string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	if strings.TrimSpace(cwd) == "" {
+		return
+	}
+	if a.sessionCwds == nil {
+		a.sessionCwds = make(map[string]string)
+	}
+	a.sessionCwds[sessionID] = cwd
+	a.updateSessionCwd(sessionID, cwd)
+	if a.db == nil {
+		return
+	}
+	if err := a.db.UpdateAgentSessionCwd(sessionID, cwd, time.Now().UnixNano()); err != nil {
+		if a.logger != nil {
+			a.logger.Warn("failed to update session cwd", zap.Error(err))
+		}
+	}
+}
+
+func (a *App) ensureSessionCwd(sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	if a.sessionCwds == nil {
+		a.sessionCwds = make(map[string]string)
+	}
+	if stored := strings.TrimSpace(a.sessionCwds[sessionID]); stored != "" {
+		return
+	}
+	if strings.TrimSpace(a.cwd) == "" {
+		return
+	}
+	a.recordSessionCwd(sessionID, a.cwd)
+}
+
+func (a *App) applySessionCwd(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	a.setActiveSessionID(sessionID)
+	if a.sessionCwds == nil {
+		a.sessionCwds = make(map[string]string)
+	}
+	stored, ok := a.sessionCwds[sessionID]
+	if !ok || strings.TrimSpace(stored) == "" {
+		stored = a.sessionCwdFromList(sessionID)
+		if strings.TrimSpace(stored) == "" {
+			a.recordSessionCwd(sessionID, a.cwd)
+			return
+		}
+		a.sessionCwds[sessionID] = stored
+	}
+	if stored == a.cwd {
+		a.syncCwdToShell(stored)
+		return
+	}
+	if err := os.Chdir(stored); err != nil {
+		a.statusMsg = fmt.Sprintf("Failed to switch directory: %v", err)
+		return
+	}
+	a.setCwd(stored)
+}
+
+func (a *App) cacheSessionCwds(sessions []db.AgentSession) {
+	if len(sessions) == 0 {
+		return
+	}
+	if a.sessionCwds == nil {
+		a.sessionCwds = make(map[string]string)
+	}
+	for _, session := range sessions {
+		a.cacheSessionCwd(session)
+	}
+}
+
+func (a *App) cacheSessionCwd(session db.AgentSession) {
+	sessionID := strings.TrimSpace(session.ID)
+	if sessionID == "" {
+		return
+	}
+	stored := strings.TrimSpace(session.Cwd)
+	if stored == "" {
+		return
+	}
+	if a.sessionCwds == nil {
+		a.sessionCwds = make(map[string]string)
+	}
+	if existing := strings.TrimSpace(a.sessionCwds[sessionID]); existing != "" {
+		return
+	}
+	a.sessionCwds[sessionID] = stored
+}
+
+func (a *App) sessionCwdFromList(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	for _, session := range a.sessions {
+		if session.ID != sessionID {
+			continue
+		}
+		return strings.TrimSpace(session.Cwd)
+	}
+	return ""
+}
+
+func (a *App) updateSessionCwd(sessionID, cwd string) {
+	if sessionID == "" {
+		return
+	}
+	for i := range a.sessions {
+		if a.sessions[i].ID != sessionID {
+			continue
+		}
+		a.sessions[i].Cwd = cwd
+		return
+	}
+}
+
+func (a *App) syncCwdToShell(cwd string) {
+	cdFile := strings.TrimSpace(os.Getenv("TERMIA_CD_FILE"))
+	if cdFile == "" {
+		if !a.cwdSyncWarned {
+			a.statusMsg = "Shell sync inactive (run 'termia init')."
+			a.cwdSyncWarned = true
+		}
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(cdFile), 0o700); err != nil {
+		if !a.cwdSyncWarned {
+			a.statusMsg = "Shell sync failed; using TUI-only CWD."
+			a.cwdSyncWarned = true
+		}
+		return
+	}
+	if err := os.WriteFile(cdFile, []byte(cwd), 0o600); err != nil {
+		if !a.cwdSyncWarned {
+			a.statusMsg = "Shell sync failed; using TUI-only CWD."
+			a.cwdSyncWarned = true
+		}
+		return
+	}
+}
+
+func formatCwdPrompt(cwd string, contentWidth int) string {
+	if strings.TrimSpace(cwd) == "" || contentWidth <= 0 {
+		return inputPrompt
+	}
+	maxPromptWidth := contentWidth - suggestedMinWidth
+	if maxPromptWidth < lipgloss.Width(inputPrompt) {
+		return inputPrompt
+	}
+	suffix := " > "
+	maxPathWidth := maxPromptWidth - lipgloss.Width(suffix)
+	if maxPathWidth < 1 {
+		return inputPrompt
+	}
+	display := formatCwdDisplay(cwd, maxPathWidth)
+	return display + suffix
+}
+
+func formatCwdDisplay(cwd string, maxWidth int) string {
+	display := tildePath(cwd)
+	if maxWidth <= 0 {
+		return display
+	}
+	if lipgloss.Width(display) <= maxWidth {
+		return display
+	}
+	return truncateMiddle(display, maxWidth)
+}
+
+func tildePath(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == home {
+		return "~"
+	}
+	sep := string(os.PathSeparator)
+	if strings.HasPrefix(path, home+sep) {
+		return "~" + sep + strings.TrimPrefix(path, home+sep)
+	}
+	return path
+}
+
+func truncateMiddle(input string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(input) <= maxWidth {
+		return input
+	}
+	ellipsis := "…"
+	if maxWidth <= lipgloss.Width(ellipsis) {
+		return truncate.String(input, uint(maxWidth))
+	}
+	leftWidth := (maxWidth - lipgloss.Width(ellipsis)) / 2
+	rightWidth := maxWidth - lipgloss.Width(ellipsis) - leftWidth
+	left := truncate.String(input, uint(leftWidth))
+	right := tailByWidth(input, rightWidth)
+	return left + ellipsis + right
+}
+
+func tailByWidth(input string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(input)
+	cur := 0
+	for i := len(runes) - 1; i >= 0; i-- {
+		cur += lipgloss.Width(string(runes[i]))
+		if cur >= width {
+			return string(runes[i:])
+		}
+	}
+	return input
+}
+
+func resolveDirPath(input, cwd string) (string, error) {
+	if strings.TrimSpace(input) == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	resolved := expandTilde(input)
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(cwd, resolved)
+	}
+	resolved = filepath.Clean(resolved)
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("not a directory")
+	}
+	return resolved, nil
+}
+
+func completeDirPrompt(input, cwd string) (string, []string) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "~" {
+		return "~" + string(os.PathSeparator), []string{"~" + string(os.PathSeparator)}
+	}
+	dirPart, base := splitDirInput(input)
+	searchDir := dirPart
+	if searchDir == "" {
+		searchDir = "."
+	}
+	searchDir = expandTilde(searchDir)
+	if !filepath.IsAbs(searchDir) {
+		searchDir = filepath.Join(cwd, searchDir)
+	}
+	searchDir = filepath.Clean(searchDir)
+	entries, err := os.ReadDir(searchDir)
+	if err != nil {
+		return input, nil
+	}
+	var matches []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, base) {
+			matches = append(matches, name)
+		}
+	}
+	sort.Strings(matches)
+	suggestions := make([]string, 0, len(matches))
+	for _, match := range matches {
+		suggestions = append(suggestions, match+string(os.PathSeparator))
+	}
+	if len(matches) == 0 {
+		return input, suggestions
+	}
+	if len(matches) == 1 {
+		return dirPart + matches[0] + string(os.PathSeparator), suggestions
+	}
+	prefix := commonPrefix(matches)
+	if len(prefix) > len(base) {
+		return dirPart + prefix, suggestions
+	}
+	return input, suggestions
+}
+
+func splitDirInput(input string) (string, string) {
+	if input == "" {
+		return "", ""
+	}
+	sep := string(os.PathSeparator)
+	idx := strings.LastIndex(input, sep)
+	if idx == -1 {
+		return "", input
+	}
+	return input[:idx+1], input[idx+1:]
+}
+
+func commonPrefix(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	prefix := values[0]
+	for _, value := range values[1:] {
+		for !strings.HasPrefix(value, prefix) {
+			if prefix == "" {
+				return ""
+			}
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	return prefix
+}
+
+func expandTilde(path string) string {
+	if path == "" {
+		return path
+	}
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return home
+		}
+		return path
+	}
+	sep := string(os.PathSeparator)
+	if strings.HasPrefix(path, "~"+sep) {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return filepath.Join(home, strings.TrimPrefix(path, "~"+sep))
+		}
+	}
+	return path
 }
 
 func generateID() string {

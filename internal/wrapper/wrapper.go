@@ -4,10 +4,13 @@ package wrapper
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/creack/pty"
+	"github.com/muesli/cancelreader"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"github.com/termia/termia/internal/recorder"
@@ -23,6 +26,7 @@ type Wrapper struct {
 	ptmx          *os.File
 	cmd           *exec.Cmd
 	db            *db.DB
+	cfg           *config.Config
 	recorder      *recorder.Recorder
 	markerR       *os.File
 	markerW       *os.File
@@ -30,6 +34,16 @@ type Wrapper struct {
 	done          chan struct{}
 	noRecord      bool
 	transcriptDir string
+
+	bridgeState   *bridgeState
+	bridgeInput   cancelreader.CancelReader
+	bridgeInputMu sync.Mutex
+
+	sockPath     string
+	sockListener net.Listener
+
+	tuiMu     sync.Mutex
+	tuiActive bool
 
 	// Terminal state restoration
 	oldState *term.State
@@ -123,7 +137,9 @@ func (w *Wrapper) Start() error {
 	cmd.Env = append(cmd.Env,
 		fmt.Sprintf("TERMIA_SHELL_DIR=%s", config.ShellDir()),
 		fmt.Sprintf("TERMIA_HISTORY_QUEUE=%s", config.HistoryQueuePath()),
+		fmt.Sprintf("TERMIA_PENDING_PROMPTS_COUNT=%s", config.PendingPromptsCountPath()),
 		fmt.Sprintf("TERMIA_SHELL=%s", w.shell),
+		fmt.Sprintf("TERMIA_SOCK=%s", w.socketPath()),
 		fmt.Sprintf("TERMIA_BIN=%s", binPath),
 		"TERMIA_INTERNAL=1",
 		"TERMIA_INTERNAL_PATTERN=^(echo \"🚀 Termia active! Type 'tui' for history, 'tai' for AI help.\")$",
@@ -169,6 +185,16 @@ func (w *Wrapper) Start() error {
 		w.recorder = rec
 	}
 
+	cfg, err := config.LoadOrDefault()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+	w.cfg = cfg
+
+	if err := w.startServer(); err != nil {
+		return fmt.Errorf("failed to start wrapper socket server: %w", err)
+	}
+
 	// Start goroutines
 	w.startBridge()
 	w.startMarkerReader()
@@ -188,6 +214,8 @@ func (w *Wrapper) Wait() error {
 
 	// Signal done
 	close(w.done)
+
+	w.stopServer()
 
 	// Close PTY
 	if w.ptmx != nil {
@@ -221,6 +249,8 @@ func (w *Wrapper) Close() error {
 	if w.cmd != nil && w.cmd.Process != nil {
 		w.cmd.Process.Kill()
 	}
+
+	w.stopServer()
 
 	// Close marker reader
 	if w.markerR != nil {

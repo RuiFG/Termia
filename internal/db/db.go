@@ -63,7 +63,7 @@ func (d *DB) Conn() *sql.DB {
 
 // schemaVersion is bumped whenever schema.sql changes.
 // Migrate() skips execution if PRAGMA user_version already matches.
-const schemaVersion = 4
+const schemaVersion = 6
 
 // Migrate executes the embedded schema SQL to create or update database tables.
 // Uses PRAGMA user_version to skip re-execution on subsequent opens, which
@@ -83,6 +83,11 @@ func (d *DB) Migrate() error {
 	if _, err := d.conn.Exec(embedded.SchemaSQL); err != nil {
 		return fmt.Errorf("failed to execute schema: %w", err)
 	}
+	if currentVersion < 6 {
+		if err := d.ensureAgentSessionsCwd(); err != nil {
+			return err
+		}
+	}
 
 	// Stamp version so future opens skip migration
 	if _, err := d.conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
@@ -90,5 +95,37 @@ func (d *DB) Migrate() error {
 	}
 
 	d.logger.Debug("database migrations completed", zap.Int("version", schemaVersion))
+	return nil
+}
+
+func (d *DB) ensureAgentSessionsCwd() error {
+	rows, err := d.conn.Query("PRAGMA table_info(agent_sessions)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect agent_sessions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("failed to scan agent_sessions columns: %w", err)
+		}
+		if name == "cwd" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read agent_sessions columns: %w", err)
+	}
+	if _, err := d.conn.Exec("ALTER TABLE agent_sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("failed to add agent_sessions cwd: %w", err)
+	}
 	return nil
 }

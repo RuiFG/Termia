@@ -75,6 +75,8 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("prompt is required")
 	}
 
+	_ = os.Setenv("TERMIA_APPROVAL_MODE", "prompt")
+
 	// Open database
 	database, err := db.Open(config.DBPath(), logger)
 	if err != nil {

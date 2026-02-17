@@ -208,10 +208,10 @@ func (m HistoryDetailModel) renderHeader() string {
 		rightParts = append(rightParts, loadingStyle.Render("loading..."))
 	} else {
 		scrollPct := fmt.Sprintf("%.0f%%", m.scrollPercent()*100)
-		rightParts = append(rightParts, metaStyle.Render(scrollPct))
+		rightParts = append(rightParts, metadataLabelStyle.Render("POS:")+" "+metaStyle.Render(scrollPct))
 	}
-	rightParts = append(rightParts, metaStyle.Render("Esc"))
-	right := strings.Join(rightParts, " | ")
+	rightParts = append(rightParts, metadataLabelStyle.Render("ESC"))
+	right := strings.Join(rightParts, "   ")
 	cmdText := strings.ReplaceAll(cmd.Command, "\n", " ")
 	cmdText = strings.ReplaceAll(cmdText, "\r", "")
 	cwdText := strings.TrimSpace(cmd.Cwd)
@@ -221,12 +221,12 @@ func (m HistoryDetailModel) renderHeader() string {
 	}
 	leftParts := []string{}
 	if cwdText != "" {
-		leftParts = append(leftParts, cwdStyle.Render(cwdText))
+		leftParts = append(leftParts, metadataLabelStyle.Render("CWD:")+" "+cwdStyle.Render(cwdText))
 	}
 	if cmdText != "" {
-		leftParts = append(leftParts, cmdText)
+		leftParts = append(leftParts, lipgloss.NewStyle().Bold(true).Foreground(colorOnSurface).Render(cmdText))
 	}
-	left := strings.Join(leftParts, " | ")
+	left := strings.Join(leftParts, "   ")
 	header := buildStatusLine(left, right, innerWidth)
 	return previewHeaderStyle.Width(m.width).Render(header)
 }
@@ -458,26 +458,26 @@ func (m HistoryDetailModel) detailInfoLines() []string {
 		return nil
 	}
 	cmd := m.command
-	parts := []string{fmt.Sprintf("Command: %s", cmd.Command)}
+	parts := []string{
+		metadataLabelStyle.Render("COMMAND: ") + cmd.Command,
+	}
 	if cmd.Cwd != "" {
-		parts = append(parts, fmt.Sprintf("CWD: %s", cmd.Cwd))
+		parts = append(parts, metadataLabelStyle.Render("CWD:     ")+cmd.Cwd)
 	}
 	if relative := formatRelativeTime(cmd.TsStart); relative != "" {
-		parts = append(parts, fmt.Sprintf("Time: %s", relative))
+		parts = append(parts, metadataLabelStyle.Render("TIME:    ")+relative)
 	}
 	exitStr := "?"
 	if cmd.ExitCode != nil {
 		exitStr = fmt.Sprintf("%d", *cmd.ExitCode)
 	}
-	parts = append(parts, fmt.Sprintf("Exit: %s", exitStr))
+	parts = append(parts, metadataLabelStyle.Render("EXIT:    ")+exitStr)
 	if dur := formatDuration(cmd.DurationMs); dur != "" {
-		parts = append(parts, fmt.Sprintf("Duration: %s", dur))
+		parts = append(parts, metadataLabelStyle.Render("DUR:     ")+dur)
 	}
-	info := strings.Join(parts, "\n")
+
+	info := "\n" + strings.Join(parts, "\n") + "\n\n"
 	lines := wrapContent(info, m.width)
-	if len(lines) > 0 {
-		lines = append(lines, "")
-	}
 	return lines
 }
 

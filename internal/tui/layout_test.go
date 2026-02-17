@@ -37,14 +37,16 @@ func TestInputHeightAlwaysBlankLine(t *testing.T) {
 	app.input.SetValue("hello")
 	app.layoutPanels()
 	inputLines := InputLineCount(app.input)
-	if app.inputHeight != inputLines+2 {
-		t.Fatalf("expected input height %d, got %d", inputLines+2, app.inputHeight)
+	expected := inputLines + 2 + app.inputCwdLineCount()
+	if app.inputHeight != expected {
+		t.Fatalf("expected input height %d, got %d", expected, app.inputHeight)
 	}
 
 	app.input.SetValue("line1\nline2")
 	app.layoutPanels()
 	inputLines = InputLineCount(app.input)
-	if app.inputHeight != inputLines+2 {
-		t.Fatalf("expected input height %d, got %d", inputLines+2, app.inputHeight)
+	expected = inputLines + 2 + app.inputCwdLineCount()
+	if app.inputHeight != expected {
+		t.Fatalf("expected input height %d, got %d", expected, app.inputHeight)
 	}
 }

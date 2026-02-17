@@ -145,5 +145,5 @@ func PreviewHelp() string {
 
 // AgentHelp returns short help text for agent mode.
 func AgentHelp() string {
-	return "type a message | /help: commands | tab: switch | esc: back"
+	return "type a message | ctrl+x: mode/cd | ctrl+p: commands | tab: switch | esc: back"
 }

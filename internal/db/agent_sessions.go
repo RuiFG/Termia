@@ -8,6 +8,7 @@ import (
 type AgentSession struct {
 	ID        string
 	Name      string
+	Cwd       string
 	CreatedAt int64
 	UpdatedAt int64
 }
@@ -18,10 +19,10 @@ func (d *DB) CreateAgentSession(session *AgentSession) error {
 		return fmt.Errorf("session is nil")
 	}
 	query := `
-		INSERT INTO agent_sessions (id, name, created_at, updated_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO agent_sessions (id, name, cwd, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
 	`
-	_, err := d.conn.Exec(query, session.ID, session.Name, session.CreatedAt, session.UpdatedAt)
+	_, err := d.conn.Exec(query, session.ID, session.Name, session.Cwd, session.CreatedAt, session.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to create agent session: %w", err)
 	}
@@ -31,7 +32,7 @@ func (d *DB) CreateAgentSession(session *AgentSession) error {
 // ListAgentSessions returns sessions ordered by updated time desc.
 func (d *DB) ListAgentSessions(limit int) ([]AgentSession, error) {
 	query := `
-		SELECT id, name, created_at, updated_at
+		SELECT id, name, cwd, created_at, updated_at
 		FROM agent_sessions
 		ORDER BY updated_at DESC
 	`
@@ -47,7 +48,7 @@ func (d *DB) ListAgentSessions(limit int) ([]AgentSession, error) {
 	var sessions []AgentSession
 	for rows.Next() {
 		var s AgentSession
-		if err := rows.Scan(&s.ID, &s.Name, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.Cwd, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan agent session: %w", err)
 		}
 		sessions = append(sessions, s)
@@ -66,6 +67,17 @@ func (d *DB) UpdateAgentSessionUpdatedAt(sessionID string, updatedAt int64) erro
 	_, err := d.conn.Exec("UPDATE agent_sessions SET updated_at = ? WHERE id = ?", updatedAt, sessionID)
 	if err != nil {
 		return fmt.Errorf("failed to update agent session: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) UpdateAgentSessionCwd(sessionID, cwd string, updatedAt int64) error {
+	if sessionID == "" {
+		return fmt.Errorf("session id is empty")
+	}
+	_, err := d.conn.Exec("UPDATE agent_sessions SET cwd = ?, updated_at = ? WHERE id = ?", cwd, updatedAt, sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to update session cwd: %w", err)
 	}
 	return nil
 }

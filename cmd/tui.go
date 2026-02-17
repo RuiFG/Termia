@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/config"
-	"github.com/termia/termia/internal/db"
-	"github.com/termia/termia/internal/tui"
-	"go.uber.org/zap"
 )
 
 var tuiCmd *cobra.Command
@@ -30,52 +28,74 @@ func init() {
 }
 
 func tuiRun(cmd *cobra.Command, args []string) error {
-
-	// Open database
-	database, err := db.Open(config.DBPath(), logger)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-	defer database.Close()
-
-	// Send pause RPC to wrapper via Unix socket
-	if err := sendWrapperRPC("pause"); err != nil {
-		logger.Debug("failed to send pause RPC", zap.Error(err))
-	}
-
-	// Call tui.Run — this blocks until TUI exits
-	err = tui.Run(database, cfg, logger)
-
-	// After TUI exits, send resume RPC
-	if resumeErr := sendWrapperRPC("resume"); resumeErr != nil {
-		logger.Debug("failed to send resume RPC", zap.Error(resumeErr))
-	}
-
-	return err
+	return sendWrapperRPC("tui")
 }
 
 func sendWrapperRPC(command string) error {
 	sockPath := os.Getenv("TERMIA_SOCK")
 	if sockPath == "" {
-		logger.Debug("no wrapper socket, running standalone")
-		return nil
+		return fmt.Errorf("no wrapper socket found; start a Termia-wrapped shell first")
 	}
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
-		return fmt.Errorf("failed to dial wrapper socket: %w", err)
+		return fmt.Errorf("failed to connect to wrapper socket: %w", err)
 	}
 	defer conn.Close()
 
-	payload := map[string]string{"cmd": command}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal RPC payload: %w", err)
+	cdFile := strings.TrimSpace(os.Getenv("TERMIA_CD_FILE"))
+	payload := wrapperRPCPayload{Cmd: command}
+	if cdFile != "" {
+		payload.CdFile = cdFile
 	}
-
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("failed to write RPC command: %w", err)
+	if cwd, err := os.Getwd(); err == nil {
+		payload.Cwd = cwd
+	}
+	env := collectLLMEnv(cfg)
+	if len(env) > 0 {
+		payload.Env = env
+	}
+	encoder := json.NewEncoder(conn)
+	if err := encoder.Encode(payload); err != nil {
+		return fmt.Errorf("failed to send wrapper command: %w", err)
 	}
 
 	return nil
+}
+
+type wrapperRPCPayload struct {
+	Cmd    string            `json:"cmd"`
+	CdFile string            `json:"cd_file,omitempty"`
+	Cwd    string            `json:"cwd,omitempty"`
+	Env    map[string]string `json:"env,omitempty"`
+}
+
+func collectLLMEnv(cfg *config.Config) map[string]string {
+	if cfg == nil {
+		return nil
+	}
+	env := make(map[string]string)
+	addEnvValue(env, cfg.LLM.OpenAI.APIKeyEnv)
+	addEnvValue(env, cfg.LLM.Anthropic.APIKeyEnv)
+	addEnvValue(env, cfg.LLM.Ollama.APIKeyEnv)
+	addEnvValue(env, cfg.LLM.DeepSeek.APIKeyEnv)
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
+func addEnvValue(values map[string]string, key string) {
+	if values == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return
+	}
+	values[key] = value
 }

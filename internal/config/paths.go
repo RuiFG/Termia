@@ -33,6 +33,10 @@ func HistoryQueuePath() string {
 	return filepath.Join(TermiaDir(), "history.queue")
 }
 
+func PendingPromptsCountPath() string {
+	return filepath.Join(TermiaDir(), "pending_prompts.count")
+}
+
 // ShellDir returns the directory for shell integration files.
 func ShellDir() string {
 	return filepath.Join(TermiaDir(), "shell")

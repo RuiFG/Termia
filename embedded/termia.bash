@@ -10,7 +10,24 @@ export TERMIA_INTEGRATION_LOADED=1
 # ─── Injected shell functions ───────────────────────────────
 
 tui() {
-    "${TERMIA_BIN:-termia}" tui "$@"
+    local cd_file=""
+    if command -v mktemp >/dev/null 2>&1; then
+        cd_file="$(mktemp "${TERMIA_SHELL_DIR:-/tmp}/termia-cd.XXXXXX")"
+    else
+        cd_file="${TERMIA_SHELL_DIR:-/tmp}/termia-cd.$$"
+        : >"$cd_file"
+    fi
+    TERMIA_CD_FILE="$cd_file" "${TERMIA_BIN:-termia}" tui "$@"
+    local exit_code=$?
+    if [[ -n "$cd_file" && -s "$cd_file" ]]; then
+        local new_dir
+        new_dir="$(cat "$cd_file")"
+        if [[ -n "$new_dir" ]]; then
+            builtin cd -- "$new_dir" 2>/dev/null || true
+        fi
+    fi
+    [[ -n "$cd_file" ]] && rm -f "$cd_file"
+    return $exit_code
 }
 
 tai() {
@@ -23,6 +40,8 @@ tai() {
 
 _termia_cmd_id=""
 _termia_last_cmd=""
+_termia_prompt_hint=""
+_termia_prompt_base=""
 
 _termia_osc133() {
     local seq="$1"
@@ -53,6 +72,23 @@ _termia_dealias() {
     fi
 
     printf "%s" "$cmdline"
+}
+
+_termia_update_prompt_hint() {
+    local count_file="${TERMIA_PENDING_PROMPTS_COUNT:-}"
+    local count=""
+    if [[ -n "$count_file" && -f "$count_file" ]]; then
+        read -r count < "$count_file"
+    fi
+    if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]; then
+        _termia_prompt_hint="🔔${count} "
+    else
+        _termia_prompt_hint=""
+    fi
+    if [[ -z "$_termia_prompt_base" ]]; then
+        _termia_prompt_base="$PS1"
+    fi
+    PS1="${_termia_prompt_hint}${_termia_prompt_base}"
 }
 
 _termia_import_history_queue() {
@@ -160,7 +196,10 @@ trap '_termia_debug_trap' DEBUG
 # DEBUG trap firings are ignored by the _termia_preexec_ready guard.
 #
 # Bash 5+ supports PROMPT_COMMAND as an array. We handle both forms.
-_termia_arm_preexec() { _termia_preexec_ready=1; }
+_termia_arm_preexec() {
+    _termia_update_prompt_hint
+    _termia_preexec_ready=1
+}
 
 if [[ ${BASH_VERSINFO[0]:-0} -ge 5 ]] && declare -p PROMPT_COMMAND 2>/dev/null | grep -q '^declare -a'; then
     # Array form (bash 5+): prepend our handler, append arming function
@@ -168,9 +207,9 @@ if [[ ${BASH_VERSINFO[0]:-0} -ge 5 ]] && declare -p PROMPT_COMMAND 2>/dev/null |
 else
     # String form (bash 4 and default): semicolon-separated
     if [[ -z "$PROMPT_COMMAND" ]]; then
-        PROMPT_COMMAND='_termia_prompt_command; _termia_preexec_ready=1'
+        PROMPT_COMMAND='_termia_prompt_command; _termia_arm_preexec'
     else
-        PROMPT_COMMAND="_termia_prompt_command; ${PROMPT_COMMAND}; _termia_preexec_ready=1"
+        PROMPT_COMMAND="_termia_prompt_command; ${PROMPT_COMMAND}; _termia_arm_preexec"
     fi
 fi
 

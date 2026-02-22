@@ -1,0 +1,1 @@
+ok  	github.com/termia/termia/internal/diagnostics	0.948s

@@ -18,11 +18,15 @@ type activeCmd struct {
 
 // Recorder is an async recording engine that handles command markers and transcript writing
 type Recorder struct {
-	db         *db.DB
-	transcript *TranscriptWriter
-	logger     *zap.Logger
-	commands   map[string]*activeCmd // tracks in-flight commands by CmdID
-	mu         sync.Mutex
+	db           *db.DB
+	transcript   *TranscriptWriter
+	logger       *zap.Logger
+	commands     map[string]*activeCmd // tracks in-flight commands by CmdID
+	mu           sync.Mutex
+	markerCh     chan *Marker
+	markerWG     sync.WaitGroup
+	markerMu     sync.Mutex
+	markerClosed bool
 }
 
 // New creates a new Recorder instance
@@ -33,16 +37,60 @@ func New(database *db.DB, transcriptDir string, logger *zap.Logger) (*Recorder, 
 		return nil, fmt.Errorf("failed to create transcript writer: %w", err)
 	}
 
-	return &Recorder{
+	r := &Recorder{
 		db:         database,
 		transcript: tw,
 		logger:     logger,
 		commands:   make(map[string]*activeCmd),
-	}, nil
+		markerCh:   make(chan *Marker, 100),
+	}
+
+	r.markerWG.Add(1)
+	go r.markerLoop()
+
+	return r, nil
 }
 
 // HandleMarker processes command markers from shell hooks
 func (r *Recorder) HandleMarker(m *Marker) error {
+	r.markerMu.Lock()
+	if r.markerClosed {
+		r.markerMu.Unlock()
+		if r.logger != nil {
+			r.logger.Warn("marker received after recorder closed")
+		}
+		return nil
+	}
+	if m == nil {
+		r.markerMu.Unlock()
+		return fmt.Errorf("marker is nil")
+	}
+	r.markerCh <- m
+	r.markerMu.Unlock()
+	return nil
+}
+
+func (r *Recorder) markerLoop() {
+	defer r.markerWG.Done()
+	for m := range r.markerCh {
+		if m == nil {
+			if r.logger != nil {
+				r.logger.Warn("nil marker received")
+			}
+			continue
+		}
+		if err := r.processMarker(m); err != nil {
+			if r.logger != nil {
+				r.logger.Error("failed to process marker",
+					zap.Error(err),
+					zap.String("cmd_id", m.CmdID),
+					zap.String("phase", m.Phase))
+			}
+		}
+	}
+}
+
+func (r *Recorder) processMarker(m *Marker) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -152,6 +200,19 @@ func (r *Recorder) TranscriptPath() string {
 
 // Close closes the recorder and transcript writer
 func (r *Recorder) Close() error {
+	r.markerMu.Lock()
+	if !r.markerClosed {
+		if len(r.markerCh) > 0 {
+			r.logger.Warn("closing recorder with pending markers",
+				zap.Int("count", len(r.markerCh)))
+		}
+		r.markerClosed = true
+		close(r.markerCh)
+	}
+	r.markerMu.Unlock()
+
+	r.markerWG.Wait()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

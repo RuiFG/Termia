@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,12 +75,30 @@ func InstallIntegration(shellType ShellType) error {
 
 	// Write scripts to file
 	integrationPath := filepath.Join(shellDir, integrationFile)
-	if err := os.WriteFile(integrationPath, []byte(script), 0755); err != nil {
+	integrationContent := []byte(script)
+	if existing, err := os.ReadFile(integrationPath); err == nil {
+		if !bytes.Equal(existing, integrationContent) {
+			if err := os.WriteFile(integrationPath, integrationContent, 0755); err != nil {
+				return fmt.Errorf("failed to write integration script: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read integration script: %w", err)
+	} else if err := os.WriteFile(integrationPath, integrationContent, 0755); err != nil {
 		return fmt.Errorf("failed to write integration script: %w", err)
 	}
 
 	shimPath := filepath.Join(shellDir, shimFile)
-	if err := os.WriteFile(shimPath, []byte(shim), 0755); err != nil {
+	shimContent := []byte(shim)
+	if existing, err := os.ReadFile(shimPath); err == nil {
+		if !bytes.Equal(existing, shimContent) {
+			if err := os.WriteFile(shimPath, shimContent, 0755); err != nil {
+				return fmt.Errorf("failed to write shim script: %w", err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read shim script: %w", err)
+	} else if err := os.WriteFile(shimPath, shimContent, 0755); err != nil {
 		return fmt.Errorf("failed to write shim script: %w", err)
 	}
 

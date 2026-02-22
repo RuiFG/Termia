@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/diagnostics"
@@ -149,6 +150,7 @@ func (w *Wrapper) startTUI(cdFile, cwd string, env map[string]string) {
 
 func (w *Wrapper) runTUI(cdFile, cwd string, env map[string]string) error {
 	w.Pause()
+	time.Sleep(100 * time.Millisecond)
 	defer w.Resume()
 	prevCwd, _ := os.Getwd()
 	if cwd != "" {

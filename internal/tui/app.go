@@ -144,6 +144,8 @@ type App struct {
 	agentMode        AgentMode
 	chordPending     bool
 	thinkLevel       ThinkLevel
+	firstUpdate      *bool
+	firstView        *bool
 	statusMsg        string
 	contentSelection textSelection
 	inputSelection   textSelection
@@ -285,6 +287,8 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		cwd = ""
 	}
 	input := NewInputModel()
+	firstUpdate := false
+	firstView := false
 	app := App{
 		db:               database,
 		cfg:              cfg,
@@ -293,6 +297,8 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		middleMode:       ModeAgent,  // Default to Agent view
 		agentMode:        AgentModeAgent,
 		thinkLevel:       ThinkMedium,
+		firstUpdate:      &firstUpdate,
+		firstView:        &firstView,
 		history:          NewHistoryModel(keys),
 		preview:          NewPreviewModel(keys),
 		detail:           NewHistoryDetailModel(keys),
@@ -339,6 +345,12 @@ func (a App) Init() tea.Cmd {
 
 // Update handles all messages.
 func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if !*a.firstUpdate {
+		stop := diagnostics.Track("tui.app.first_update", nil)
+		stop()
+		*a.firstUpdate = true
+	}
+
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -1677,6 +1689,12 @@ func (a App) toggleFavorite() (tea.Model, tea.Cmd) {
 
 // View renders the complete TUI.
 func (a App) View() string {
+	if !*a.firstView {
+		stop := diagnostics.Track("tui.app.first_view", nil)
+		stop()
+		*a.firstView = true
+	}
+
 	if !a.ready {
 		return loadingStyle.Render("  Starting Termia...")
 	}
@@ -3644,16 +3662,25 @@ func mouseMotionFilter(model tea.Model, msg tea.Msg) tea.Msg {
 
 // Run starts the TUI.
 func Run(database *db.DB, cfg *config.Config, logger *zap.Logger) error {
+	stop := diagnostics.Track("tui.run.new_app", nil)
 	app := New(database, cfg, logger)
+	stop()
+
+	stop = diagnostics.Track("tui.run.new_program", nil)
 	program := tea.NewProgram(app,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 		tea.WithFPS(30),
 		tea.WithFilter(mouseMotionFilter),
 	)
+	stop()
+
+	stop = diagnostics.Track("tui.run.program_run", nil)
 	if _, err := program.Run(); err != nil {
+		stop()
 		return fmt.Errorf("failed to run TUI: %w", err)
 	}
+	stop()
 	return nil
 }
 

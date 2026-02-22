@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/termia/termia/internal/diagnostics"
@@ -29,29 +30,38 @@ type ShellInfo struct {
 	Version string // e.g., "zsh 5.9"
 }
 
+var (
+	cachedShellInfo ShellInfo
+	detectOnce      sync.Once
+)
+
 // Detect detects the current shell from environment variables
 func Detect() ShellInfo {
-	// Read $SHELL env var
-	shellPath := os.Getenv("SHELL")
-	if shellPath == "" {
-		// Default to /bin/bash if not found
-		shellPath = "/bin/bash"
-	}
-	if IsTermiaShellPath(shellPath) {
-		shellPath = "/bin/bash"
-	}
+	detectOnce.Do(func() {
+		// Read $SHELL env var
+		shellPath := os.Getenv("SHELL")
+		if shellPath == "" {
+			// Default to /bin/bash if not found
+			shellPath = "/bin/bash"
+		}
+		if IsTermiaShellPath(shellPath) {
+			shellPath = "/bin/bash"
+		}
 
-	// Determine type from path
-	shellType := DetectFromPath(shellPath)
+		// Determine type from path
+		shellType := DetectFromPath(shellPath)
 
-	// Try to get version
-	version := getShellVersion(shellPath)
+		// Try to get version
+		version := getShellVersion(shellPath)
 
-	return ShellInfo{
-		Type:    shellType,
-		Path:    shellPath,
-		Version: version,
-	}
+		cachedShellInfo = ShellInfo{
+			Type:    shellType,
+			Path:    shellPath,
+			Version: version,
+		}
+	})
+
+	return cachedShellInfo
 }
 
 // DetectFromPath parses shell type from path string

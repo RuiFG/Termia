@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -115,8 +117,17 @@ type WriteFileRsp struct {
 	Result string `json:"result"`
 }
 
+type AskReq struct {
+	Questions []AskQuestion `json:"questions"`
+}
+
+type AskRsp struct {
+	Answers []AskAnswer `json:"answers,omitempty"`
+	Pending bool        `json:"pending"`
+}
+
 // CreateTools returns the toolset available to the agent as Eino tools.
-func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
+func CreateTools(database *db.DB, requireApproval bool, provider ApprovalProvider) []tool.BaseTool {
 	queryCommandsTool := utils.NewTool(&schema.ToolInfo{
 		Name: "query_commands",
 		Desc: "Query recent command history. Filter by search text or get recent commands.",
@@ -224,11 +235,11 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("read file: %s", path))
+			decision, err := requestApprovalOrEnqueue(database, fmt.Sprintf("read file: %s", path), provider)
 			if err != nil {
 				return nil, err
 			}
-			if !approved {
+			if decision.Type != ApprovalDecisionApprove {
 				return &ReadFileRsp{Content: ""}, nil
 			}
 		}
@@ -259,11 +270,11 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("grep path: %s", path))
+			decision, err := requestApprovalOrEnqueue(database, fmt.Sprintf("grep path: %s", path), provider)
 			if err != nil {
 				return nil, err
 			}
-			if !approved {
+			if decision.Type != ApprovalDecisionApprove {
 				return &GrepRsp{Matches: ""}, nil
 			}
 		}
@@ -295,11 +306,11 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("edit file: %s", path))
+			decision, err := requestApprovalOrEnqueue(database, fmt.Sprintf("edit file: %s", path), provider)
 			if err != nil {
 				return nil, err
 			}
-			if !approved {
+			if decision.Type != ApprovalDecisionApprove {
 				return &EditFileRsp{Result: "user rejected edit"}, nil
 			}
 		}
@@ -338,11 +349,11 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, err
 		}
 		if requireApproval {
-			approved, err := requestApprovalOrEnqueue(database, fmt.Sprintf("write file: %s", path))
+			decision, err := requestApprovalOrEnqueue(database, fmt.Sprintf("write file: %s", path), provider)
 			if err != nil {
 				return nil, err
 			}
-			if !approved {
+			if decision.Type != ApprovalDecisionApprove {
 				return &WriteFileRsp{Result: "user rejected write"}, nil
 			}
 		}
@@ -350,6 +361,115 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, fmt.Errorf("write file: %w", err)
 		}
 		return &WriteFileRsp{Result: "written"}, nil
+	})
+
+	askTool := utils.NewTool(&schema.ToolInfo{
+		Name: "ask",
+		Desc: "Ask the user one or more questions before proceeding.",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"questions": {
+				Type:     schema.Array,
+				Required: true,
+				Desc:     "Questions to ask",
+				ElemInfo: &schema.ParameterInfo{
+					Type: schema.Object,
+					SubParams: map[string]*schema.ParameterInfo{
+						"question": {Type: schema.String, Required: true, Desc: "Full question text"},
+						"header":   {Type: schema.String, Required: true, Desc: "Short label"},
+						"options": {
+							Type:     schema.Array,
+							Required: true,
+							Desc:     "Options (3-4) including Type Your Answer",
+							ElemInfo: &schema.ParameterInfo{
+								Type: schema.Object,
+								SubParams: map[string]*schema.ParameterInfo{
+									"title":       {Type: schema.String, Required: true, Desc: "Option title"},
+									"description": {Type: schema.String, Desc: "Option description"},
+								},
+							},
+						},
+						"multiple": {Type: schema.Boolean, Desc: "Allow multiple selections"},
+					},
+				},
+			},
+		}),
+	}, func(ctx context.Context, req *AskReq) (*AskRsp, error) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if len(req.Questions) == 0 {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: "ask tool requires at least one question"}}, Pending: false}, nil
+		}
+		normalized := make([]AskQuestion, 0, len(req.Questions))
+		for _, question := range req.Questions {
+			norm, err := NormalizeAskQuestion(question)
+			if err != nil {
+				return &AskRsp{Answers: []AskAnswer{{Question: strings.TrimSpace(question.Question), SelectionNote: err.Error()}}, Pending: false}, nil
+			}
+			normalized = append(normalized, norm)
+		}
+
+		approvalMode := strings.ToLower(strings.TrimSpace(os.Getenv("TERMIA_APPROVAL_MODE")))
+		tuiActive := os.Getenv("TERMIA_TUI_ACTIVE") == "1"
+		wrapped := os.Getenv("TERMIA_WRAPPED") == "1"
+		if approvalMode == "prompt" && !tuiActive && !wrapped {
+			answers, err := promptAskQuestionsCLI(normalized)
+			if err != nil {
+				return nil, err
+			}
+			return &AskRsp{Answers: answers, Pending: false}, nil
+		}
+		if !tuiActive && !wrapped {
+			answers, err := promptAskQuestionsCLI(normalized)
+			if err != nil {
+				return nil, err
+			}
+			return &AskRsp{Answers: answers, Pending: false}, nil
+		}
+		if database == nil {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: "ask tool requires initialized database"}}, Pending: false}, nil
+		}
+
+		askPayload := struct {
+			Questions []AskQuestion `json:"questions"`
+		}{Questions: normalized}
+		payloadBytes, err := json.Marshal(askPayload)
+		if err != nil {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: fmt.Sprintf("ask tool failed to encode payload: %v", err)}}, Pending: false}, nil
+		}
+		payloadJSON, err := db.MarshalPendingPromptPayload(db.PendingPromptPayload{
+			Type:    db.PendingPromptTypeAsk,
+			Payload: payloadBytes,
+		})
+		if err != nil {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: fmt.Sprintf("ask tool failed to encode pending prompt: %v", err)}}, Pending: false}, nil
+		}
+		content := strings.TrimSpace(normalized[0].Question)
+		if content == "" {
+			content = "ask"
+		}
+		promptID, err := enqueuePendingPromptRecord(database, content, db.PendingPromptTypeAsk, payloadJSON)
+		if err != nil {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: fmt.Sprintf("ask tool failed to enqueue prompt: %v", err)}}, Pending: false}, nil
+		}
+		if strings.TrimSpace(promptID) == "" {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: "ask tool failed to enqueue prompt"}}, Pending: false}, nil
+		}
+		responseJSON, err := waitForPendingPromptResponse(ctx, database, promptID)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: fmt.Sprintf("ask tool failed waiting for response: %v", err)}}, Pending: false}, nil
+		}
+		if strings.TrimSpace(responseJSON) == "" {
+			return &AskRsp{Pending: false}, nil
+		}
+		var answers []AskAnswer
+		if err := json.Unmarshal([]byte(responseJSON), &answers); err != nil {
+			return &AskRsp{Answers: []AskAnswer{{SelectionNote: fmt.Sprintf("invalid ask response: %v", err)}}, Pending: false}, nil
+		}
+		return &AskRsp{Answers: answers, Pending: false}, nil
 	})
 
 	runCommandTool := utils.NewTool(&schema.ToolInfo{
@@ -368,11 +488,25 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 			return nil, fmt.Errorf("command is required")
 		}
 		if requireApproval {
-			approved, err := requestApprovalOrEnqueue(database, cmdLine)
+			decision, err := requestApprovalOrEnqueue(database, cmdLine, provider)
 			if err != nil {
 				return nil, err
 			}
-			if !approved {
+			switch decision.Type {
+			case ApprovalDecisionApprove:
+			case ApprovalDecisionEdit:
+				edited := strings.TrimSpace(decision.Command)
+				if edited == "" {
+					return &RunCommandRsp{Stdout: "", Stderr: "edited command is empty", ExitCode: 130}, nil
+				}
+				cmdLine = edited
+			case ApprovalDecisionRephrase:
+				rephrase := strings.TrimSpace(decision.Rephrase)
+				if rephrase == "" {
+					rephrase = "user requested rephrase"
+				}
+				return &RunCommandRsp{Stdout: "", Stderr: fmt.Sprintf("user rephrase: %s", rephrase), ExitCode: 130}, nil
+			default:
 				return &RunCommandRsp{Stdout: "", Stderr: "user rejected command", ExitCode: 130}, nil
 			}
 		}
@@ -445,6 +579,7 @@ func CreateTools(database *db.DB, requireApproval bool) []tool.BaseTool {
 		grepTool,
 		editFileTool,
 		writeFileTool,
+		askTool,
 	}
 }
 
@@ -727,58 +862,104 @@ func promptCommandApproval(command string) (bool, error) {
 	return choice == "y" || choice == "yes", nil
 }
 
-func requestApprovalOrEnqueue(database *db.DB, message string) (bool, error) {
+func requestApprovalOrEnqueue(database *db.DB, message string, provider ApprovalProvider) (ApprovalDecision, error) {
 	approvalMode := strings.ToLower(strings.TrimSpace(os.Getenv("TERMIA_APPROVAL_MODE")))
+	if provider != nil {
+		return provider.RequestApproval(context.Background(), ApprovalPrompt{Command: message})
+	}
 	if approvalMode == "prompt" {
-		return promptCommandApproval(message)
+		approved, err := promptCommandApproval(message)
+		if err != nil {
+			return ApprovalDecision{Type: ApprovalDecisionReject, Reason: err.Error()}, err
+		}
+		if approved {
+			return ApprovalDecision{Type: ApprovalDecisionApprove}, nil
+		}
+		return ApprovalDecision{Type: ApprovalDecisionReject}, nil
 	}
 	if os.Getenv("TERMIA_WRAPPED") == "1" && os.Getenv("TERMIA_TUI_ACTIVE") != "1" {
 		if _, err := enqueuePendingPrompt(database, message); err != nil {
-			return false, err
+			return ApprovalDecision{Type: ApprovalDecisionReject, Reason: err.Error()}, err
 		}
-		return false, nil
+		return ApprovalDecision{Type: ApprovalDecisionReject, Reason: "pending user approval"}, nil
 	}
-	return promptCommandApproval(message)
+	if os.Getenv("TERMIA_TUI_ACTIVE") == "1" {
+		if _, err := enqueuePendingPrompt(database, message); err != nil {
+			return ApprovalDecision{Type: ApprovalDecisionReject, Reason: err.Error()}, err
+		}
+		return ApprovalDecision{Type: ApprovalDecisionReject, Reason: "pending user approval"}, nil
+	}
+	approved, err := promptCommandApproval(message)
+	if err != nil {
+		return ApprovalDecision{Type: ApprovalDecisionReject, Reason: err.Error()}, err
+	}
+	if approved {
+		return ApprovalDecision{Type: ApprovalDecisionApprove}, nil
+	}
+	return ApprovalDecision{Type: ApprovalDecisionReject}, nil
 }
 
 func enqueuePendingPrompt(database *db.DB, content string) (bool, error) {
+	return enqueuePendingPromptWithPayload(database, content, db.PendingPromptTypeCommand, "")
+}
+
+func enqueuePendingPromptWithPayload(database *db.DB, content string, promptType string, payloadJSON string) (bool, error) {
+	promptID, err := enqueuePendingPromptRecord(database, content, promptType, payloadJSON)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(promptID) != "", nil
+}
+
+func enqueuePendingPromptRecord(database *db.DB, content string, promptType string, payloadJSON string) (string, error) {
 	if database == nil {
-		return false, nil
+		return "", nil
 	}
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
-		return false, nil
+		return "", nil
 	}
 
-	sessionID := strings.TrimSpace(os.Getenv("TERMIA_SESSION_ID"))
-	if sessionID == "" {
-		sessions, err := database.ListAgentSessions(1)
-		if err != nil {
-			return false, err
-		}
-		if len(sessions) == 0 {
-			return false, nil
-		}
-		sessionID = sessions[0].ID
+	sessionID, err := resolvePendingPromptSessionID(database)
+	if err != nil {
+		return "", err
 	}
 	if sessionID == "" {
-		return false, nil
+		return "", nil
 	}
 
+	promptID := uuid.New().String()
 	prompt := &db.PendingPrompt{
-		PromptID:  uuid.New().String(),
-		SessionID: sessionID,
-		Content:   trimmed,
-		CreatedAt: time.Now().UnixNano(),
-		Status:    db.PendingPromptStatusPending,
+		PromptID:    promptID,
+		SessionID:   sessionID,
+		Content:     trimmed,
+		PromptType:  strings.TrimSpace(promptType),
+		PayloadJSON: strings.TrimSpace(payloadJSON),
+		CreatedAt:   time.Now().UnixNano(),
+		Status:      db.PendingPromptStatusPending,
 	}
 	if err := database.CreatePendingPrompt(prompt); err != nil {
-		return false, err
+		return "", err
 	}
 	if err := database.WritePendingPromptsCount(config.PendingPromptsCountPath()); err != nil {
-		return true, err
+		return promptID, err
 	}
-	return true, nil
+	return promptID, nil
+}
+
+func resolvePendingPromptSessionID(database *db.DB) (string, error) {
+	sessionID := strings.TrimSpace(os.Getenv("TERMIA_SESSION_ID"))
+	if sessionID != "" {
+		return sessionID, nil
+	}
+	sessions, err := database.ListAgentSessions(1)
+	if err != nil {
+		return "", err
+	}
+	if len(sessions) == 0 {
+		return "", nil
+	}
+	return sessions[0].ID, nil
 }
 
 func runShellCommand(ctx context.Context, command string, cwd string, outputWriter io.Writer) (string, string, int, error) {

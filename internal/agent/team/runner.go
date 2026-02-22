@@ -46,7 +46,7 @@ func NewTeamRunner(ctx context.Context, cfg *config.Config, database *db.DB, log
 		return nil, err
 	}
 
-	tools := agent.CreateTools(database, cfg.Agent.RequireApproval)
+	tools := agent.CreateTools(database, cfg.Agent.RequireApproval, nil)
 	toolMap, err := indexTools(ctx, tools)
 	if err != nil {
 		return nil, err

@@ -119,8 +119,12 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
     prompt_id       TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL,
     content         TEXT NOT NULL,
+    prompt_type     TEXT NOT NULL DEFAULT 'command',
+    payload_json    TEXT,
+    response_json   TEXT,
     created_at      INTEGER NOT NULL,
     status          TEXT NOT NULL,
+    resolved_at     INTEGER,
 
     FOREIGN KEY (session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE
 );

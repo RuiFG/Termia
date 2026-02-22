@@ -101,7 +101,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create model: %w", err)
 	}
-	tools := agent.CreateTools(database, cfg.Agent.RequireApproval)
+	tools := agent.CreateTools(database, cfg.Agent.RequireApproval, agent.NewCLIApprovalProvider())
 	reactRunner, err := agent.NewReactRunner(context.Background(), model, tools, database, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create react runner: %w", err)

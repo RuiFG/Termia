@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -157,10 +158,24 @@ type App struct {
 	activeTeamRoles []string
 
 	// Sessions
-	sessions        []db.AgentSession
-	activeSessionID string
-	responseBuffer  []string
-	pendingPromptID string
+	sessions                 []db.AgentSession
+	activeSessionID          string
+	responseBuffer           []string
+	pendingPromptID          string
+	pendingPromptSessionID   string
+	agentRunning             bool
+	agentCancel              context.CancelFunc
+	agentLastEsc             time.Time
+	agentProgressStep        int
+	approvalInput            ApprovalInput
+	approvalDecision         *agent.ApprovalDecision
+	approvalRequests         chan approvalRequest
+	approvalResponseCh       chan agent.ApprovalDecision
+	askInput                 AskInput
+	askAnswers               []agent.AskAnswer
+	pendingPrompts           map[string][]db.PendingPrompt
+	approvalDecisionPromptID string
+	askAnswersPromptID       string
 
 	// Command palette
 	paletteOpen  bool
@@ -210,11 +225,18 @@ type agentChunkMsg struct {
 	stream <-chan string
 }
 
+type agentStartMsg struct {
+	stream <-chan string
+	err    error
+}
+
 type agentDoneMsg struct{}
 
 type agentErrorMsg struct {
 	err error
 }
+
+type agentProgressTickMsg struct{}
 
 type sessionsLoadedMsg struct {
 	sessions []db.AgentSession
@@ -235,6 +257,7 @@ type sessionCreatedMsg struct {
 type sessionMessagesLoadedMsg struct {
 	sessionID string
 	messages  []db.AgentMessage
+	pending   []db.PendingPrompt
 }
 
 type favoriteToggledMsg struct {
@@ -262,27 +285,31 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 	}
 	input := NewInputModel()
 	app := App{
-		db:              database,
-		cfg:             cfg,
-		logger:          logger,
-		focus:           FocusInput, // Start with input focused (standard TUI pattern)
-		middleMode:      ModeAgent,  // Default to Agent view
-		agentMode:       AgentModeAgent,
-		thinkLevel:      ThinkMedium,
-		history:         NewHistoryModel(keys),
-		preview:         NewPreviewModel(keys),
-		detail:          NewHistoryDetailModel(keys),
-		agent:           NewAgentModel(keys),
-		modal:           NewModalModel(),
-		input:           input,
-		keys:            keys,
-		teams:           teams,
-		activeTeamName:  activeName,
-		activeTeamRoles: activeRoles,
-		launchCwd:       cwd,
-		cwd:             cwd,
-		sessionCwds:     make(map[string]string),
-		dirPromptInput:  newDirPromptInput(),
+		db:               database,
+		cfg:              cfg,
+		logger:           logger,
+		focus:            FocusInput, // Start with input focused (standard TUI pattern)
+		middleMode:       ModeAgent,  // Default to Agent view
+		agentMode:        AgentModeAgent,
+		thinkLevel:       ThinkMedium,
+		history:          NewHistoryModel(keys),
+		preview:          NewPreviewModel(keys),
+		detail:           NewHistoryDetailModel(keys),
+		agent:            NewAgentModel(keys),
+		modal:            NewModalModel(),
+		input:            input,
+		approvalInput:    NewApprovalInput(),
+		approvalRequests: make(chan approvalRequest),
+		askInput:         NewAskInput(),
+		keys:             keys,
+		teams:            teams,
+		activeTeamName:   activeName,
+		activeTeamRoles:  activeRoles,
+		launchCwd:        cwd,
+		cwd:              cwd,
+		sessionCwds:      make(map[string]string),
+		pendingPrompts:   make(map[string][]db.PendingPrompt),
+		dirPromptInput:   newDirPromptInput(),
 	}
 	app.updateInputPrompt()
 	return app
@@ -301,6 +328,7 @@ func (a App) Init() tea.Cmd {
 		loadCommandsCmd(a.db),
 		loadSessionsCmd(a.db),
 		waitForCommandExecutedCmd(),
+		waitForApprovalRequestCmd(a.approvalRequests),
 		a.input.Focus(),
 	)
 }
@@ -348,6 +376,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.cacheSessionCwd(msg.session)
 		a.ensureSessionCwd(msg.session.ID)
 		a.applySessionCwd(msg.session.ID)
+		a.input.SetHistory(nil)
 		a.agent.SetMessages(nil)
 		return a, nil
 
@@ -356,7 +385,18 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.agent.SetMessages(formatSessionMessages(msg.messages))
+		a.input.SetHistory(buildInputHistory(msg.messages))
+		a.pendingPrompts[msg.sessionID] = msg.pending
+		a.activatePendingPrompt()
 		return a, nil
+
+	case approvalRequestMsg:
+		a.approvalResponseCh = msg.request.response
+		a.approvalInput.SetPrompt(msg.request.prompt)
+		a.approvalInput.SetWidth(a.leftContentW)
+		a.focus = FocusInput
+		a.updateFocusState()
+		return a, waitForApprovalRequestCmd(a.approvalRequests)
 
 	case sessionMessagesErrorMsg:
 		if a.logger != nil {
@@ -408,9 +448,36 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, readAgentChunkCmd(msg.stream)
 
+	case agentStartMsg:
+		if msg.err != nil {
+			_ = os.Unsetenv("TERMIA_SESSION_ID")
+			a.agent.AppendToLast(fmt.Sprintf("Error: %v", msg.err))
+			a.agentRunning = false
+			a.agentCancel = nil
+			a.agentLastEsc = time.Time{}
+			a.agentProgressStep = 0
+			return a, nil
+		}
+		if msg.stream == nil {
+			_ = os.Unsetenv("TERMIA_SESSION_ID")
+			a.agent.AppendToLast("Error: agent stream unavailable")
+			a.agentRunning = false
+			a.agentCancel = nil
+			a.agentLastEsc = time.Time{}
+			a.agentProgressStep = 0
+			return a, nil
+		}
+		return a, readAgentChunkCmd(msg.stream)
+
 	case agentDoneMsg:
 		_ = os.Unsetenv("TERMIA_SESSION_ID")
-		a.resolvePendingPrompt()
+		a.agentRunning = false
+		a.agentCancel = nil
+		a.agentLastEsc = time.Time{}
+		a.agentProgressStep = 0
+		if a.statusMsg == "Stopping agent..." {
+			a.statusMsg = ""
+		}
 		if a.activeSessionID == "" {
 			return a, nil
 		}
@@ -423,11 +490,33 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentErrorMsg:
 		_ = os.Unsetenv("TERMIA_SESSION_ID")
-		a.resolvePendingPrompt()
 		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", msg.err))
+		a.agentRunning = false
+		a.agentCancel = nil
+		a.agentLastEsc = time.Time{}
+		a.agentProgressStep = 0
+		if a.statusMsg == "Stopping agent..." {
+			a.statusMsg = ""
+		}
+		return a, nil
+
+	case agentProgressTickMsg:
+		if a.agentRunning {
+			a.agentProgressStep = (a.agentProgressStep + 1) % 3
+			if !a.agentLastEsc.IsZero() && time.Since(a.agentLastEsc) > time.Second {
+				a.agentLastEsc = time.Time{}
+			}
+			return a, agentProgressTickCmd()
+		}
 		return a, nil
 
 	case tea.KeyMsg:
+		if a.agentRunning && msg.Type != tea.KeyEsc {
+			a.agentLastEsc = time.Time{}
+		}
+		if a.agentRunning && msg.Type == tea.KeyEsc && !a.modal.IsOpen() && !a.dirPromptOpen && !a.paletteOpen && !a.approvalInput.Active() && !a.askInput.Active() {
+			return a.handleAgentEsc()
+		}
 		if a.modal.IsOpen() {
 			return a.handleModalKey(msg)
 		}
@@ -838,6 +927,20 @@ func (a App) submitDirPrompt() (tea.Model, tea.Cmd) {
 
 // handleInputKey processes key events when input is focused.
 func (a App) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if a.approvalInput.Active() {
+		decision, cmd := a.approvalInput.Update(msg)
+		if decision != nil {
+			return a.handleApprovalDecision(*decision)
+		}
+		return a, cmd
+	}
+	if a.askInput.Active() {
+		answers, cmd := a.askInput.Update(msg)
+		if answers != nil {
+			return a.handleAskAnswers(*answers)
+		}
+		return a, cmd
+	}
 	switch msg.Type {
 	case tea.KeyEnter:
 		if a.input.SelectSlashSuggestion() {
@@ -859,6 +962,178 @@ func (a App) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	a.input, cmd = a.input.Update(msg)
 	return a, cmd
+}
+
+func (a App) handleApprovalDecision(decision agent.ApprovalDecision) (tea.Model, tea.Cmd) {
+	promptID := a.pendingPromptID
+	promptSessionID := a.pendingPromptSessionID
+	if a.db != nil && promptID != "" {
+		payload, err := json.Marshal(decision)
+		if err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to encode approval decision", zap.Error(err))
+			}
+			a.statusMsg = "Error: failed to encode approval decision"
+			return a, nil
+		}
+		if err := a.db.ResolvePendingPromptWithResponse(promptID, string(payload)); err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to resolve approval prompt", zap.Error(err))
+			}
+			a.statusMsg = "Error: failed to resolve approval prompt"
+			return a, nil
+		}
+		_ = a.updatePendingPromptCount()
+	}
+	a.approvalDecision = &decision
+	a.approvalDecisionPromptID = promptID
+	a.pendingPromptID = ""
+	a.pendingPromptSessionID = ""
+	a.dequeuePendingPrompt(promptSessionID, promptID)
+	if a.approvalResponseCh != nil {
+		select {
+		case a.approvalResponseCh <- decision:
+		default:
+		}
+		a.approvalResponseCh = nil
+	}
+	a.approvalInput.Mode = ApprovalModeNone
+	a.approvalInput.editedValue = ""
+	a.approvalInput.editInput.SetValue("")
+	a.approvalInput.rephrase.SetValue("")
+	a.activatePendingPrompt()
+	return a, nil
+}
+
+func (a App) handleAskAnswers(answers []agent.AskAnswer) (tea.Model, tea.Cmd) {
+	promptID := a.pendingPromptID
+	promptSessionID := a.pendingPromptSessionID
+	if a.db != nil && promptID != "" {
+		payload, err := json.Marshal(answers)
+		if err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to encode ask answers", zap.Error(err))
+			}
+			a.statusMsg = "Error: failed to encode ask answers"
+			return a, nil
+		}
+		if err := a.db.ResolvePendingPromptWithResponse(promptID, string(payload)); err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to resolve ask prompt", zap.Error(err))
+			}
+			a.statusMsg = "Error: failed to resolve ask prompt"
+			return a, nil
+		}
+		_ = a.updatePendingPromptCount()
+	}
+	a.askAnswers = answers
+	a.askAnswersPromptID = promptID
+	a.pendingPromptID = ""
+	a.pendingPromptSessionID = ""
+	a.dequeuePendingPrompt(promptSessionID, promptID)
+	a.askInput.Mode = AskModeNone
+	a.askInput.Questions = nil
+	a.askInput.Answers = nil
+	a.askInput.Selected = nil
+	a.askInput.Index = 0
+	a.askInput.Cursor = 0
+	a.askInput.Custom.SetValue("")
+	a.activatePendingPrompt()
+	return a, nil
+}
+
+func (a *App) activatePendingPrompt() {
+	if a.approvalInput.Active() || a.askInput.Active() {
+		return
+	}
+	if strings.TrimSpace(a.activeSessionID) == "" {
+		return
+	}
+	for {
+		prompts := a.pendingPrompts[a.activeSessionID]
+		if len(prompts) == 0 {
+			a.pendingPromptID = ""
+			a.pendingPromptSessionID = ""
+			return
+		}
+		prompt := prompts[0]
+		payload := db.ParsePendingPromptPayload(prompt)
+		if strings.TrimSpace(prompt.PromptType) != "" {
+			payload.Type = strings.TrimSpace(prompt.PromptType)
+		}
+		switch payload.Type {
+		case db.PendingPromptTypeAsk:
+			var askPayload struct {
+				Questions []agent.AskQuestion `json:"questions"`
+			}
+			if len(payload.Payload) == 0 {
+				a.handleInvalidPendingPrompt(prompt, "Error: ask payload missing")
+				continue
+			}
+			if err := json.Unmarshal(payload.Payload, &askPayload); err != nil {
+				a.handleInvalidPendingPrompt(prompt, fmt.Sprintf("Error: invalid ask payload: %v", err))
+				continue
+			}
+			a.pendingPromptID = prompt.PromptID
+			a.pendingPromptSessionID = prompt.SessionID
+			a.askInput.SetQuestions(askPayload.Questions)
+			a.askInput.SetWidth(a.leftContentW)
+			return
+		default:
+			command := strings.TrimSpace(payload.Command)
+			if command == "" {
+				command = strings.TrimSpace(prompt.Content)
+			}
+			a.pendingPromptID = prompt.PromptID
+			a.pendingPromptSessionID = prompt.SessionID
+			a.approvalInput.SetPrompt(agent.ApprovalPrompt{Command: command})
+			a.approvalInput.SetWidth(a.leftContentW)
+			return
+		}
+	}
+}
+
+func (a *App) handleInvalidPendingPrompt(prompt db.PendingPrompt, message string) {
+	a.statusMsg = message
+	if a.db != nil && prompt.PromptID != "" {
+		if err := a.db.ResolvePendingPromptWithResponse(prompt.PromptID, ""); err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to resolve invalid pending prompt", zap.Error(err))
+			}
+		}
+		if err := a.updatePendingPromptCount(); err != nil {
+			if a.logger != nil {
+				a.logger.Warn("failed to update pending prompt count", zap.Error(err))
+			}
+		}
+	}
+	a.dequeuePendingPrompt(prompt.SessionID, prompt.PromptID)
+	if a.pendingPromptID == prompt.PromptID {
+		a.pendingPromptID = ""
+		a.pendingPromptSessionID = ""
+	}
+}
+
+func (a *App) dequeuePendingPrompt(sessionID string, promptID string) {
+	if sessionID == "" || promptID == "" {
+		return
+	}
+	prompts := a.pendingPrompts[sessionID]
+	if len(prompts) == 0 {
+		return
+	}
+	for idx, prompt := range prompts {
+		if prompt.PromptID != promptID {
+			continue
+		}
+		prompts = append(prompts[:idx], prompts[idx+1:]...)
+		break
+	}
+	if len(prompts) == 0 {
+		delete(a.pendingPrompts, sessionID)
+		return
+	}
+	a.pendingPrompts[sessionID] = prompts
 }
 
 // handleHistoryKey processes key events when history is focused.
@@ -1047,6 +1322,8 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		return a, tea.Quit
 	}
 
+	a.input.AddHistory(val)
+
 	// Check for slash command
 	if cmd := a.input.ParseSlashCommand(); cmd != nil {
 		a.input.Reset()
@@ -1083,25 +1360,15 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	var (
-		stream <-chan string
-		err    error
-	)
-	if a.agentMode == AgentModeAgent {
-		stream, err = a.runAgentQuery(val)
-	} else {
-		stream, err = a.runTeamQuery(val)
-	}
-	if err != nil {
-		_ = os.Unsetenv("TERMIA_SESSION_ID")
-		a.resolvePendingPrompt()
-		a.agent.AppendToLast(fmt.Sprintf("Error: %v", err))
-		a.input.Reset()
-		return a, nil
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.agentCancel = cancel
+	a.agentRunning = true
+	a.agentLastEsc = time.Time{}
+	a.agentProgressStep = 0
+	startCmd := a.startAgentRunCmd(ctx, val)
 
 	a.input.Reset()
-	return a, readAgentChunkCmd(stream)
+	return a, tea.Batch(startCmd, agentProgressTickCmd())
 }
 
 func (a App) openModalSelected() (tea.Model, tea.Cmd) {
@@ -1195,7 +1462,7 @@ func copyToClipboardCmd(text string) tea.Cmd {
 	}
 }
 
-func (a *App) runTeamQuery(query string) (<-chan string, error) {
+func (a *App) runTeamQuery(ctx context.Context, query string) (<-chan string, error) {
 	if a.db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
@@ -1209,15 +1476,15 @@ func (a *App) runTeamQuery(query string) (<-chan string, error) {
 	}
 	_ = agentCfg
 
-	teamRunner, err := team.NewTeamRunner(context.Background(), cfg, a.db, a.logger)
+	teamRunner, err := team.NewTeamRunner(ctx, cfg, a.db, a.logger)
 	if err != nil {
 		return nil, err
 	}
 
-	return teamRunner.Run(context.Background(), query, nil)
+	return teamRunner.Run(ctx, query, nil)
 }
 
-func (a *App) runAgentQuery(query string) (<-chan string, error) {
+func (a *App) runAgentQuery(ctx context.Context, query string) (<-chan string, error) {
 	if a.db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
@@ -1229,13 +1496,28 @@ func (a *App) runAgentQuery(query string) (<-chan string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create model: %w", err)
 	}
-	tools := agent.CreateTools(a.db, a.cfg.Agent.RequireApproval)
-	reactRunner, err := agent.NewReactRunner(context.Background(), model, tools, a.db, a.logger)
+	tools := agent.CreateTools(a.db, a.cfg.Agent.RequireApproval, newTUIApprovalProvider(a.approvalRequests))
+	reactRunner, err := agent.NewReactRunner(ctx, model, tools, a.db, a.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create react runner: %w", err)
 	}
 
-	return reactRunner.Run(context.Background(), query, nil)
+	return reactRunner.Run(ctx, query, nil)
+}
+
+func (a App) startAgentRunCmd(ctx context.Context, query string) tea.Cmd {
+	return func() tea.Msg {
+		var (
+			stream <-chan string
+			err    error
+		)
+		if a.agentMode == AgentModeAgent {
+			stream, err = a.runAgentQuery(ctx, query)
+		} else {
+			stream, err = a.runTeamQuery(ctx, query)
+		}
+		return agentStartMsg{stream: stream, err: err}
+	}
 }
 
 func (a App) teamConfig() *config.Config {
@@ -1259,6 +1541,12 @@ func readAgentChunkCmd(stream <-chan string) tea.Cmd {
 		}
 		return agentChunkMsg{chunk: chunk, stream: stream}
 	}
+}
+
+func agentProgressTickCmd() tea.Cmd {
+	return tea.Tick(350*time.Millisecond, func(time.Time) tea.Msg {
+		return agentProgressTickMsg{}
+	})
 }
 
 // handleSlashResult processes the result of a slash command.
@@ -1547,6 +1835,11 @@ func panelInnerOrigin(style lipgloss.Style, xStart, yStart int) (int, int) {
 func (a App) renderInput(contentWidth int) string {
 	// Build inner content: input view + always-on status line
 	inputView := RenderInputSection(a.input)
+	if a.approvalInput.Active() {
+		inputView = a.approvalInput.View(contentWidth)
+	} else if a.askInput.Active() {
+		inputView = a.askInput.View(contentWidth)
+	}
 
 	// Status line: agent label + model + thinking level + citations
 	citedCount := a.history.CitedCount()
@@ -1559,7 +1852,7 @@ func (a App) renderInput(contentWidth int) string {
 	statusLine := buildStatusLine(status, badge, contentWidth)
 
 	inputLines := strings.Split(inputView, "\n")
-	if a.inputSelection.HasSelection() {
+	if !a.approvalInput.Active() && !a.askInput.Active() && a.inputSelection.HasSelection() {
 		inputLines = a.inputSelection.HighlightLines(contentWidth)
 	}
 	cwdLine := a.renderInputCwdLine(contentWidth)
@@ -1613,6 +1906,46 @@ func (a App) renderAgentStatusLine() string {
 		parts = append(parts, a.thinkLevelStyle().Render(thinkLabel))
 	}
 	return strings.Join(parts, "  ")
+}
+
+func (a App) renderAgentRunHint() string {
+	if !a.agentRunning {
+		return ""
+	}
+	dots := a.agentProgressDots()
+	if !a.agentLastEsc.IsZero() && time.Since(a.agentLastEsc) <= time.Second {
+		label := "Esc again to stop"
+		if dots != "" {
+			label = fmt.Sprintf("%s %s", label, dots)
+		}
+		return metaStyle.Render(label)
+	}
+	return metaStyle.Render(dots)
+}
+
+func (a App) agentProgressDots() string {
+	if !a.agentRunning {
+		return ""
+	}
+	count := (a.agentProgressStep % 3) + 1
+	dots := strings.Repeat(".", count)
+	pad := strings.Repeat(" ", 3-count)
+	return dots + pad
+}
+
+func (a App) handleAgentEsc() (tea.Model, tea.Cmd) {
+	if !a.agentRunning || a.agentCancel == nil {
+		return a, nil
+	}
+	now := time.Now()
+	if !a.agentLastEsc.IsZero() && now.Sub(a.agentLastEsc) <= time.Second {
+		a.agentCancel()
+		a.statusMsg = "Stopping agent..."
+		a.agentLastEsc = time.Time{}
+		return a, nil
+	}
+	a.agentLastEsc = now
+	return a, nil
 }
 
 func (a App) renderAgentLabel() string {
@@ -1681,10 +2014,14 @@ func trimTrailingBlankLines(content string) string {
 }
 
 func (a App) renderStatusBar(contentWidth int) string {
-	left := ""
-	if a.statusMsg != "" {
-		left = a.statusMsg
+	leftParts := []string{}
+	if hint := a.renderAgentRunHint(); hint != "" {
+		leftParts = append(leftParts, hint)
 	}
+	if a.statusMsg != "" {
+		leftParts = append(leftParts, a.statusMsg)
+	}
+	left := strings.TrimSpace(strings.Join(leftParts, "  "))
 	right := a.renderStatusHints()
 	line := buildStatusLine(left, right, contentWidth)
 	pw := statusBarStyle.GetHorizontalPadding()
@@ -2510,6 +2847,11 @@ func (a *App) layoutPanels() {
 
 	// Fixed input rendered height: content + frame
 	inputLines := InputLineCount(a.input)
+	if a.approvalInput.Active() {
+		inputLines = maxInt(inputLines, countLines(a.approvalInput.View(innerW)))
+	} else if a.askInput.Active() {
+		inputLines = maxInt(inputLines, countLines(a.askInput.View(innerW)))
+	}
 	extraLines := 1 + a.inputCwdLineCount()
 	inputAreaLines := inputLines + extraLines
 	minInputArea := extraLines + 1
@@ -2706,31 +3048,7 @@ func loadSessionMessagesCmd(database *db.DB, sessionID string) tea.Cmd {
 		if err != nil {
 			return sessionMessagesErrorMsg{err: err}
 		}
-		if len(pending) > 0 {
-			for _, prompt := range pending {
-				msg := &db.AgentMessage{
-					ID:        generateID(),
-					SessionID: sessionID,
-					Role:      "assistant",
-					Content:   prompt.Content,
-					CreatedAt: prompt.CreatedAt,
-				}
-				if err := database.CreateAgentMessage(msg); err != nil {
-					return sessionMessagesErrorMsg{err: err}
-				}
-				if err := database.ResolvePendingPrompt(prompt.PromptID); err != nil {
-					return sessionMessagesErrorMsg{err: err}
-				}
-			}
-			if err := database.WritePendingPromptsCount(config.PendingPromptsCountPath()); err != nil {
-				return sessionMessagesErrorMsg{err: err}
-			}
-			messages, err = database.ListAgentMessages(sessionID)
-			if err != nil {
-				return sessionMessagesErrorMsg{err: err}
-			}
-		}
-		return sessionMessagesLoadedMsg{sessionID: sessionID, messages: messages}
+		return sessionMessagesLoadedMsg{sessionID: sessionID, messages: messages, pending: pending}
 	}
 }
 
@@ -2784,6 +3102,7 @@ func (a *App) enqueuePendingPrompt(content string, createdAt int64) error {
 		return err
 	}
 	a.pendingPromptID = promptID
+	a.pendingPromptSessionID = sessionID
 	if err := a.updatePendingPromptCount(); err != nil {
 		if a.logger != nil {
 			a.logger.Warn("failed to update pending prompt count", zap.Error(err))
@@ -2798,6 +3117,7 @@ func (a *App) resolvePendingPrompt() {
 	}
 	if a.db == nil {
 		a.pendingPromptID = ""
+		a.pendingPromptSessionID = ""
 		return
 	}
 	if err := a.db.ResolvePendingPrompt(a.pendingPromptID); err != nil {
@@ -2811,6 +3131,7 @@ func (a *App) resolvePendingPrompt() {
 		}
 	}
 	a.pendingPromptID = ""
+	a.pendingPromptSessionID = ""
 }
 
 func (a *App) updatePendingPromptCount() error {
@@ -2853,11 +3174,37 @@ func formatSessionMessages(messages []db.AgentMessage) []AgentMessage {
 	return output
 }
 
+func buildInputHistory(messages []db.AgentMessage) []string {
+	if len(messages) == 0 {
+		return nil
+	}
+	entries := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if strings.TrimSpace(msg.Role) != "user" {
+			continue
+		}
+		value := strings.TrimSpace(msg.Content)
+		if value == "" {
+			continue
+		}
+		if len(entries) > 0 && entries[len(entries)-1] == value {
+			continue
+		}
+		entries = append(entries, value)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return entries
+}
+
 func (a *App) updateInputPrompt() {
 	a.input.SetPrompt(inputPrompt)
 	promptCells := lipgloss.Width(a.dirPromptInput.Prompt)
 	if a.leftContentW > 0 {
 		a.dirPromptInput.Width = maxInt(a.leftContentW-promptCells, suggestedMinWidth)
+		a.approvalInput.SetWidth(a.leftContentW)
+		a.askInput.SetWidth(a.leftContentW)
 	}
 }
 

@@ -1,24 +1,33 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type PendingPrompt struct {
-	PromptID  string
-	SessionID string
-	Content   string
-	CreatedAt int64
-	Status    string
+	PromptID     string
+	SessionID    string
+	Content      string
+	PromptType   string
+	PayloadJSON  string
+	ResponseJSON string
+	CreatedAt    int64
+	Status       string
+	ResolvedAt   *int64
 }
 
 const (
 	PendingPromptStatusPending  = "pending"
 	PendingPromptStatusResolved = "resolved"
+
+	PendingPromptTypeCommand = "command"
+	PendingPromptTypeAsk     = "ask"
 )
 
 func (d *DB) CreatePendingPrompt(prompt *PendingPrompt) error {
@@ -48,15 +57,24 @@ func (d *DB) CreatePendingPrompt(prompt *PendingPrompt) error {
 		return fmt.Errorf("invalid pending prompt status: %s", status)
 	}
 
+	promptType := strings.TrimSpace(prompt.PromptType)
+	if promptType == "" {
+		promptType = PendingPromptTypeCommand
+	}
+	if promptType != PendingPromptTypeCommand && promptType != PendingPromptTypeAsk {
+		return fmt.Errorf("invalid pending prompt type: %s", promptType)
+	}
+
 	query := `
-        INSERT INTO pending_prompts (prompt_id, session_id, content, created_at, status)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO pending_prompts (prompt_id, session_id, content, prompt_type, payload_json, response_json, created_at, status, resolved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
-	_, err := d.conn.Exec(query, promptID, sessionID, content, prompt.CreatedAt, status)
+	_, err := d.conn.Exec(query, promptID, sessionID, content, promptType, prompt.PayloadJSON, prompt.ResponseJSON, prompt.CreatedAt, status, prompt.ResolvedAt)
 	if err != nil {
 		return fmt.Errorf("failed to create pending prompt: %w", err)
 	}
 	prompt.Status = status
+	prompt.PromptType = promptType
 	return nil
 }
 
@@ -65,7 +83,7 @@ func (d *DB) ListPendingPrompts(sessionID string, limit int) ([]PendingPrompt, e
 		return nil, fmt.Errorf("database is nil")
 	}
 	query := `
-        SELECT prompt_id, session_id, content, created_at, status
+        SELECT prompt_id, session_id, content, prompt_type, payload_json, response_json, created_at, status, resolved_at
         FROM pending_prompts
         WHERE status = ?
     `
@@ -88,8 +106,31 @@ func (d *DB) ListPendingPrompts(sessionID string, limit int) ([]PendingPrompt, e
 	var prompts []PendingPrompt
 	for rows.Next() {
 		var prompt PendingPrompt
-		if err := rows.Scan(&prompt.PromptID, &prompt.SessionID, &prompt.Content, &prompt.CreatedAt, &prompt.Status); err != nil {
+		var payload sql.NullString
+		var response sql.NullString
+		var resolved sql.NullInt64
+		if err := rows.Scan(
+			&prompt.PromptID,
+			&prompt.SessionID,
+			&prompt.Content,
+			&prompt.PromptType,
+			&payload,
+			&response,
+			&prompt.CreatedAt,
+			&prompt.Status,
+			&resolved,
+		); err != nil {
 			return nil, fmt.Errorf("failed to scan pending prompt: %w", err)
+		}
+		if payload.Valid {
+			prompt.PayloadJSON = payload.String
+		}
+		if response.Valid {
+			prompt.ResponseJSON = response.String
+		}
+		if resolved.Valid {
+			value := resolved.Int64
+			prompt.ResolvedAt = &value
 		}
 		prompts = append(prompts, prompt)
 	}
@@ -97,6 +138,49 @@ func (d *DB) ListPendingPrompts(sessionID string, limit int) ([]PendingPrompt, e
 		return nil, fmt.Errorf("failed to iterate pending prompts: %w", err)
 	}
 	return prompts, nil
+}
+
+func (d *DB) GetPendingPrompt(promptID string) (PendingPrompt, error) {
+	if d == nil {
+		return PendingPrompt{}, fmt.Errorf("database is nil")
+	}
+	promptID = strings.TrimSpace(promptID)
+	if promptID == "" {
+		return PendingPrompt{}, fmt.Errorf("prompt id is empty")
+	}
+	query := `
+        SELECT prompt_id, session_id, content, prompt_type, payload_json, response_json, created_at, status, resolved_at
+        FROM pending_prompts
+        WHERE prompt_id = ?
+    `
+	var prompt PendingPrompt
+	var payload sql.NullString
+	var response sql.NullString
+	var resolved sql.NullInt64
+	if err := d.conn.QueryRow(query, promptID).Scan(
+		&prompt.PromptID,
+		&prompt.SessionID,
+		&prompt.Content,
+		&prompt.PromptType,
+		&payload,
+		&response,
+		&prompt.CreatedAt,
+		&prompt.Status,
+		&resolved,
+	); err != nil {
+		return PendingPrompt{}, fmt.Errorf("failed to get pending prompt: %w", err)
+	}
+	if payload.Valid {
+		prompt.PayloadJSON = payload.String
+	}
+	if response.Valid {
+		prompt.ResponseJSON = response.String
+	}
+	if resolved.Valid {
+		value := resolved.Int64
+		prompt.ResolvedAt = &value
+	}
+	return prompt, nil
 }
 
 func (d *DB) CountPendingPrompts() (int, error) {
@@ -137,7 +221,42 @@ func (d *DB) ResolvePendingPrompt(promptID string) error {
 	if promptID == "" {
 		return fmt.Errorf("prompt id is empty")
 	}
-	result, err := d.conn.Exec("UPDATE pending_prompts SET status = ? WHERE prompt_id = ?", PendingPromptStatusResolved, promptID)
+	resolvedAt := time.Now().UnixNano()
+	result, err := d.conn.Exec(
+		"UPDATE pending_prompts SET status = ?, resolved_at = ? WHERE prompt_id = ?",
+		PendingPromptStatusResolved,
+		resolvedAt,
+		promptID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to resolve pending prompt: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("pending prompt not found: %s", promptID)
+	}
+	return nil
+}
+
+func (d *DB) ResolvePendingPromptWithResponse(promptID string, responseJSON string) error {
+	if d == nil {
+		return fmt.Errorf("database is nil")
+	}
+	promptID = strings.TrimSpace(promptID)
+	if promptID == "" {
+		return fmt.Errorf("prompt id is empty")
+	}
+	resolvedAt := time.Now().UnixNano()
+	result, err := d.conn.Exec(
+		"UPDATE pending_prompts SET status = ?, response_json = ?, resolved_at = ? WHERE prompt_id = ?",
+		PendingPromptStatusResolved,
+		strings.TrimSpace(responseJSON),
+		resolvedAt,
+		promptID,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to resolve pending prompt: %w", err)
 	}

@@ -63,7 +63,7 @@ func (d *DB) Conn() *sql.DB {
 
 // schemaVersion is bumped whenever schema.sql changes.
 // Migrate() skips execution if PRAGMA user_version already matches.
-const schemaVersion = 6
+const schemaVersion = 7
 
 // Migrate executes the embedded schema SQL to create or update database tables.
 // Uses PRAGMA user_version to skip re-execution on subsequent opens, which
@@ -85,6 +85,11 @@ func (d *DB) Migrate() error {
 	}
 	if currentVersion < 6 {
 		if err := d.ensureAgentSessionsCwd(); err != nil {
+			return err
+		}
+	}
+	if currentVersion < 7 {
+		if err := d.ensurePendingPromptsColumns(); err != nil {
 			return err
 		}
 	}
@@ -126,6 +131,55 @@ func (d *DB) ensureAgentSessionsCwd() error {
 	}
 	if _, err := d.conn.Exec("ALTER TABLE agent_sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("failed to add agent_sessions cwd: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) ensurePendingPromptsColumns() error {
+	rows, err := d.conn.Query("PRAGMA table_info(pending_prompts)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect pending_prompts: %w", err)
+	}
+	defer rows.Close()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("failed to scan pending_prompts columns: %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read pending_prompts columns: %w", err)
+	}
+
+	if !existing["prompt_type"] {
+		if _, err := d.conn.Exec("ALTER TABLE pending_prompts ADD COLUMN prompt_type TEXT NOT NULL DEFAULT 'command'"); err != nil {
+			return fmt.Errorf("failed to add pending_prompts prompt_type: %w", err)
+		}
+	}
+	if !existing["payload_json"] {
+		if _, err := d.conn.Exec("ALTER TABLE pending_prompts ADD COLUMN payload_json TEXT"); err != nil {
+			return fmt.Errorf("failed to add pending_prompts payload_json: %w", err)
+		}
+	}
+	if !existing["response_json"] {
+		if _, err := d.conn.Exec("ALTER TABLE pending_prompts ADD COLUMN response_json TEXT"); err != nil {
+			return fmt.Errorf("failed to add pending_prompts response_json: %w", err)
+		}
+	}
+	if !existing["resolved_at"] {
+		if _, err := d.conn.Exec("ALTER TABLE pending_prompts ADD COLUMN resolved_at INTEGER"); err != nil {
+			return fmt.Errorf("failed to add pending_prompts resolved_at: %w", err)
+		}
 	}
 	return nil
 }

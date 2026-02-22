@@ -5,6 +5,7 @@ package wrapper
 import (
 	"bufio"
 
+	"github.com/termia/termia/internal/diagnostics"
 	"github.com/termia/termia/internal/recorder"
 	"go.uber.org/zap"
 )
@@ -30,6 +31,15 @@ func (w *Wrapper) startMarkerReader() {
 				w.logger.Warn("failed to parse marker", zap.Error(err), zap.String("line", string(line)))
 				continue
 			}
+
+			w.firstMarkerOnce.Do(func() {
+				fields := map[string]string{
+					"cmd_id": marker.CmdID,
+					"phase":  marker.Phase,
+				}
+				stop := diagnostics.Track("startup.wrapper.first_marker", fields)
+				stop()
+			})
 
 			if w.recorder != nil && !w.noRecord {
 				if err := w.recorder.HandleMarker(marker); err != nil {

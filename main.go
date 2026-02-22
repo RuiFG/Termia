@@ -4,9 +4,11 @@ import (
 	"os"
 
 	"github.com/termia/termia/cmd"
+	"github.com/termia/termia/internal/diagnostics"
 )
 
 func main() {
+	diagnostics.Track("startup.main", nil)()
 	if cmd.ShouldRunWrapper(os.Args[1:]) {
 		if err := cmd.ExecuteWrapper(os.Args[1:]); err != nil {
 			os.Exit(cmd.ExitCode(err))

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,6 +37,7 @@ func Track(step string, fields map[string]string) func() {
 
 		timestamp := time.Now().Format(time.RFC3339Nano)
 		fmt.Fprintf(file, "ts=%s pid=%d step=%s elapsed_ms=%d", timestamp, os.Getpid(), step, elapsedMs)
+		fmt.Fprintf(file, " args=[%s]", strings.Join(os.Args, " "))
 
 		if len(fields) > 0 {
 			keys := make([]string, 0, len(fields))

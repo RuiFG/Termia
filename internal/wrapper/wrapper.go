@@ -36,9 +36,10 @@ type Wrapper struct {
 	noRecord      bool
 	transcriptDir string
 
-	bridgeState   *bridgeState
-	bridgeInput   cancelreader.CancelReader
-	bridgeInputMu sync.Mutex
+	bridgeState     *bridgeState
+	bridgeInput     cancelreader.CancelReader
+	bridgeInputMu   sync.Mutex
+	firstMarkerOnce sync.Once
 
 	sockPath     string
 	sockListener net.Listener
@@ -119,7 +120,9 @@ func (w *Wrapper) Start() error {
 		cmd = exec.Command(args[0], cmdArgs...)
 	case shell.ShellZsh:
 		cmd = exec.Command(w.shell, w.args...)
-		extraEnv = append(extraEnv, fmt.Sprintf("ZDOTDIR=%s", config.ShellDir()))
+		if os.Getenv("TERMIA_SKIP_ZDOTDIR") != "1" {
+			extraEnv = append(extraEnv, fmt.Sprintf("ZDOTDIR=%s", config.ShellDir()))
+		}
 	default:
 		cmd = exec.Command(w.shell, w.args...)
 	}

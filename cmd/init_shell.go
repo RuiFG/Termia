@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/termia/termia/internal/diagnostics"
 	"github.com/termia/termia/internal/shell"
 	"golang.org/x/term"
 )
@@ -70,6 +71,8 @@ func initShellRun(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "# echo '%s' >> ~/.config/fish/config.fish\n", initScript)
 		}
 	}
+
+	diagnostics.Track("startup.init.done", nil)()
 
 	return nil
 }

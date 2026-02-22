@@ -38,6 +38,9 @@ type InputModel struct {
 	pasteBlocks      map[rune]pasteBlock
 	pasteSeq         int
 	prompt           string
+	history          []string
+	historyIndex     int
+	historyDraft     string
 }
 
 type pasteBlock struct {
@@ -104,6 +107,7 @@ func NewInputModel() InputModel {
 		slashSuggestions: suggestions,
 		pasteBlocks:      make(map[rune]pasteBlock),
 		prompt:           inputPrompt,
+		historyIndex:     0,
 	}
 }
 
@@ -182,6 +186,8 @@ func (m *InputModel) SetValue(s string) {
 	} else {
 		m.useTextarea = false
 	}
+	m.historyIndex = len(m.history)
+	m.historyDraft = ""
 }
 
 // Reset clears the input.
@@ -191,6 +197,31 @@ func (m *InputModel) Reset() {
 	m.useTextarea = false
 	m.slashIndex = 0
 	m.resetPasteBlocks()
+	m.historyIndex = len(m.history)
+	m.historyDraft = ""
+}
+
+func (m *InputModel) SetHistory(entries []string) {
+	if len(entries) == 0 {
+		m.history = nil
+		m.historyIndex = 0
+		m.historyDraft = ""
+		return
+	}
+	cleaned := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		value := strings.TrimSpace(entry)
+		if value == "" {
+			continue
+		}
+		if len(cleaned) > 0 && cleaned[len(cleaned)-1] == value {
+			continue
+		}
+		cleaned = append(cleaned, value)
+	}
+	m.history = cleaned
+	m.historyIndex = len(m.history)
+	m.historyDraft = ""
 }
 
 // SetWidth updates the input width (content width).
@@ -259,11 +290,21 @@ func (m InputModel) Update(msg tea.Msg) (InputModel, tea.Cmd) {
 		}
 		switch msg.Type {
 		case tea.KeyUp:
-			m.moveSlashSelection(-1)
-			return m, nil
+			if len(m.SlashSuggestions()) > 0 {
+				m.moveSlashSelection(-1)
+				return m, nil
+			}
+			if m.moveHistory(-1) {
+				return m, nil
+			}
 		case tea.KeyDown:
-			m.moveSlashSelection(1)
-			return m, nil
+			if len(m.SlashSuggestions()) > 0 {
+				m.moveSlashSelection(1)
+				return m, nil
+			}
+			if m.moveHistory(1) {
+				return m, nil
+			}
 		case tea.KeyEnter:
 			// Avoid inserting newlines on Enter; App handles submission.
 			if m.useTextarea {
@@ -281,12 +322,84 @@ func (m InputModel) Update(msg tea.Msg) (InputModel, tea.Cmd) {
 	}
 	if before != m.RawValue() {
 		m.slashIndex = 0
+		if m.historyIndex != len(m.history) {
+			m.historyDraft = m.RawValue()
+			m.historyIndex = len(m.history)
+		}
 	}
 
 	m.cleanupPasteBlocks()
 	m.syncTextareaMode()
 
 	return m, cmd
+}
+
+func (m *InputModel) AddHistory(value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	if len(m.history) > 0 && m.history[len(m.history)-1] == value {
+		m.historyIndex = len(m.history)
+		m.historyDraft = ""
+		return
+	}
+	m.history = append(m.history, value)
+	m.historyIndex = len(m.history)
+	m.historyDraft = ""
+}
+
+func (m *InputModel) moveHistory(delta int) bool {
+	if len(m.history) == 0 {
+		return false
+	}
+	if delta < 0 {
+		if m.historyIndex == 0 {
+			return true
+		}
+		draft := m.historyDraft
+		nextIndex := m.historyIndex
+		if m.historyIndex == len(m.history) {
+			draft = m.RawValue()
+			nextIndex = len(m.history) - 1
+		} else {
+			nextIndex = m.historyIndex - 1
+		}
+		value := m.history[nextIndex]
+		m.SetValue(value)
+		m.historyIndex = clampHistoryIndex(nextIndex, len(m.history))
+		m.historyDraft = draft
+		return true
+	}
+	if delta > 0 {
+		if m.historyIndex == len(m.history) {
+			return true
+		}
+		draft := m.historyDraft
+		if m.historyIndex == len(m.history)-1 {
+			m.SetValue(draft)
+			m.historyIndex = len(m.history)
+			m.historyDraft = draft
+			return true
+		}
+		nextIndex := m.historyIndex + 1
+		value := m.history[nextIndex]
+		m.SetValue(value)
+		m.historyIndex = clampHistoryIndex(nextIndex, len(m.history))
+		m.historyDraft = draft
+		return true
+	}
+	return false
+}
+
+func clampHistoryIndex(idx int, length int) int {
+	if idx < 0 {
+		return 0
+	}
+	if idx > length {
+		return length
+	}
+	return idx
 }
 
 // SlashSuggestions returns available slash command suggestions.

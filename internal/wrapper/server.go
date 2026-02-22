@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/termia/termia/internal/config"
+	"github.com/termia/termia/internal/diagnostics"
 	"github.com/termia/termia/internal/tui"
 	"go.uber.org/zap"
 	"golang.org/x/term"
@@ -205,21 +206,27 @@ func (w *Wrapper) runTUI(cdFile, cwd string, env map[string]string) error {
 	}()
 
 	if w.oldState != nil {
+		stop := diagnostics.Track("tui.term.restore", nil)
 		if err := term.Restore(int(os.Stdin.Fd()), w.oldState); err != nil {
 			w.logger.Warn("failed to restore terminal before tui", zap.Error(err))
 		}
+		stop()
 	}
 
 	cfg := w.cfg
 	if cfg == nil {
 		var err error
+		stop := diagnostics.Track("tui.config.load", nil)
 		cfg, err = config.LoadOrDefault()
+		stop()
 		if err != nil {
 			return err
 		}
 	}
 
+	stop := diagnostics.Track("tui.run", nil)
 	tuiErr := tui.Run(w.db, cfg, w.logger)
+	stop()
 	if _, err := term.MakeRaw(int(os.Stdin.Fd())); err != nil {
 		if tuiErr != nil {
 			w.logger.Error("failed to re-enter raw mode after tui", zap.Error(err))

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/termia/termia/embedded"
+	"github.com/termia/termia/internal/diagnostics"
 	"go.uber.org/zap"
 	_ "modernc.org/sqlite"
 )
@@ -27,7 +28,10 @@ func Open(dbPath string, logger *zap.Logger) (*DB, error) {
 	}
 
 	// Test connection
-	if err := conn.Ping(); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.db.ping", nil)()
+		return conn.Ping()
+	}(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
@@ -38,7 +42,10 @@ func Open(dbPath string, logger *zap.Logger) (*DB, error) {
 	}
 
 	// Run migrations
-	if err := db.Migrate(); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.db.migrate", nil)()
+		return db.Migrate()
+	}(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to migrate database: %w", err)
 	}

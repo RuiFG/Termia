@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/termia/termia/internal/diagnostics"
 )
 
 // ShellType represents the type of shell
@@ -91,7 +93,10 @@ func getShellVersion(shellPath string) string {
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 
-	if err := cmd.Run(); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.shell.version", nil)()
+		return cmd.Run()
+	}(); err != nil {
 		return ""
 	}
 

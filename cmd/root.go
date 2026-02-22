@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/config"
+	"github.com/termia/termia/internal/diagnostics"
 	"go.uber.org/zap"
 )
 
@@ -69,13 +70,19 @@ func prepare() error {
 
 	// Load or create default config
 	var err error
-	cfg, err = config.LoadOrDefault()
-	if err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.prepare.config_load", nil)()
+		cfg, err = config.LoadOrDefault()
+		return err
+	}(); err != nil {
 		return err
 	}
 
 	// Ensure all required directories exist
-	if err := config.EnsureDirs(); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.prepare.ensure_dirs", nil)()
+		return config.EnsureDirs()
+	}(); err != nil {
 		return err
 	}
 

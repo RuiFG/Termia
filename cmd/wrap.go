@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 
 	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/diagnostics"
 	"github.com/termia/termia/internal/shell"
 	"github.com/termia/termia/internal/wrapper"
 	"go.uber.org/zap"
@@ -60,21 +62,40 @@ func ExecuteWrapper(rawArgs []string) error {
 
 func runWrapper(shellArgs []string, noRecordFlag bool) error {
 	// Detect shell
-	shellInfo := shell.Detect()
+	var shellInfo shell.ShellInfo
+	func() {
+		defer diagnostics.Track("startup.shell.detect", nil)()
+		shellInfo = shell.Detect()
+	}()
 
 	if isNonInteractive(shellArgs) {
 		return execShell(shellInfo.Path, shellArgs)
 	}
 
 	// Open database
-	database, err := db.Open(config.DBPath(), logger)
-	if err != nil {
+	dbPath := config.DBPath()
+	fields := map[string]string{
+		"db_path": dbPath,
+	}
+	if info, statErr := os.Stat(dbPath); statErr == nil {
+		fields["db_bytes"] = strconv.FormatInt(info.Size(), 10)
+	}
+	var database *db.DB
+	if err := func() error {
+		defer diagnostics.Track("startup.db.open", fields)()
+		var err error
+		database, err = db.Open(dbPath, logger)
+		return err
+	}(); err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 	defer database.Close()
 
 	// Install shell integration
-	if err := shell.InstallIntegration(shellInfo.Type); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.shell.install_integration", nil)()
+		return shell.InstallIntegration(shellInfo.Type)
+	}(); err != nil {
 		logger.Warn("failed to install shell integration", zap.Error(err))
 	}
 
@@ -87,14 +108,22 @@ func runWrapper(shellArgs []string, noRecordFlag bool) error {
 		Logger:   logger,
 	}
 
-	w, err := wrapper.New(opts)
-	if err != nil {
+	var w *wrapper.Wrapper
+	if err := func() error {
+		defer diagnostics.Track("startup.wrapper.new", nil)()
+		var err error
+		w, err = wrapper.New(opts)
+		return err
+	}(); err != nil {
 		return fmt.Errorf("failed to create wrapper: %w", err)
 	}
 	defer w.Close()
 
 	// Start wrapper
-	if err := w.Start(); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.wrapper.start", nil)()
+		return w.Start()
+	}(); err != nil {
 		return fmt.Errorf("failed to start wrapper: %w", err)
 	}
 

@@ -21,6 +21,7 @@ import (
 	"github.com/termia/termia/internal/agent/team"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/diagnostics"
 	"go.uber.org/zap"
 )
 
@@ -318,7 +319,10 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 // Init loads the initial data asynchronously.
 func (a App) Init() tea.Cmd {
 	if a.db != nil {
-		if err := a.updatePendingPromptCount(); err != nil {
+		stop := diagnostics.Track("tui.init.pending_prompt_count", nil)
+		err := a.updatePendingPromptCount()
+		stop()
+		if err != nil {
 			if a.logger != nil {
 				a.logger.Warn("failed to sync pending prompt count", zap.Error(err))
 			}
@@ -3012,7 +3016,9 @@ func (a *App) layoutPanels() {
 
 func loadCommandsCmd(database *db.DB) tea.Cmd {
 	return func() tea.Msg {
+		stop := diagnostics.Track("tui.db.list_commands", nil)
 		commands, err := database.ListRecentCommands(200)
+		stop()
 		if err != nil {
 			return commandsErrorMsg{err: err}
 		}
@@ -3029,7 +3035,9 @@ func waitForCommandExecutedCmd() tea.Cmd {
 
 func loadSessionsCmd(database *db.DB) tea.Cmd {
 	return func() tea.Msg {
+		stop := diagnostics.Track("tui.db.list_sessions", nil)
 		sessions, err := database.ListAgentSessions(200)
+		stop()
 		if err != nil {
 			return sessionsErrorMsg{err: err}
 		}
@@ -3039,12 +3047,16 @@ func loadSessionsCmd(database *db.DB) tea.Cmd {
 
 func loadSessionMessagesCmd(database *db.DB, sessionID string) tea.Cmd {
 	return func() tea.Msg {
+		stop := diagnostics.Track("tui.db.list_messages", nil)
 		messages, err := database.ListAgentMessages(sessionID)
+		stop()
 		if err != nil {
 			return sessionMessagesErrorMsg{err: err}
 		}
 
+		stop = diagnostics.Track("tui.db.list_pending_prompts", nil)
 		pending, err := database.ListPendingPrompts(sessionID, 0)
+		stop()
 		if err != nil {
 			return sessionMessagesErrorMsg{err: err}
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/muesli/cancelreader"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/diagnostics"
 	"github.com/termia/termia/internal/recorder"
 	"github.com/termia/termia/internal/shell"
 	"go.uber.org/zap"
@@ -153,8 +154,13 @@ func (w *Wrapper) Start() error {
 	cmd.ExtraFiles = []*os.File{w.markerW}
 
 	// Start PTY
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
+	var ptmx *os.File
+	if err := func() error {
+		defer diagnostics.Track("startup.wrapper.pty_start", nil)()
+		var err error
+		ptmx, err = pty.Start(cmd)
+		return err
+	}(); err != nil {
 		return fmt.Errorf("failed to start PTY: %w", err)
 	}
 
@@ -178,20 +184,33 @@ func (w *Wrapper) Start() error {
 	}
 
 	if !w.noRecord {
-		rec, err := recorder.New(w.db, w.transcriptDir, w.logger)
-		if err != nil {
+		var rec *recorder.Recorder
+		if err := func() error {
+			defer diagnostics.Track("startup.recorder.new", nil)()
+			var err error
+			rec, err = recorder.New(w.db, w.transcriptDir, w.logger)
+			return err
+		}(); err != nil {
 			return fmt.Errorf("failed to create recorder: %w", err)
 		}
 		w.recorder = rec
 	}
 
-	cfg, err := config.LoadOrDefault()
-	if err != nil {
+	var cfg *config.Config
+	if err := func() error {
+		defer diagnostics.Track("startup.wrapper.config_load", nil)()
+		var err error
+		cfg, err = config.LoadOrDefault()
+		return err
+	}(); err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 	w.cfg = cfg
 
-	if err := w.startServer(); err != nil {
+	if err := func() error {
+		defer diagnostics.Track("startup.wrapper.start_server", nil)()
+		return w.startServer()
+	}(); err != nil {
 		return fmt.Errorf("failed to start wrapper socket server: %w", err)
 	}
 

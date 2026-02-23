@@ -161,7 +161,10 @@ _termia_prompt_command() {
 
     [[ -n "$TERMIA_NO_RECORD" ]] && { _termia_cmd_id=""; _termia_last_cmd=""; return; }
     if [[ -n "$TERMIA_INTERNAL" ]] && [[ -n "$TERMIA_INTEGRATION_LOADED" ]]; then
-        _termia_cmd_id=""; _termia_last_cmd=""; return
+        unset TERMIA_INTERNAL
+        _termia_cmd_id=""
+        _termia_last_cmd=""
+        return
     fi
 
     _termia_import_history_queue

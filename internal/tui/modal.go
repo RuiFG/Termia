@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -518,6 +519,9 @@ func highlightLineRangeWithWidth(line string, lineWidth, startCol, endCol int, h
 	if startCol >= endCol {
 		return line
 	}
+	if strings.ContainsRune(line, '\x1b') {
+		return highlightANSIStyledLineRange(line, startCol, endCol)
+	}
 	if startCol == 0 && endCol >= lineWidth {
 		return modalSelectionStyle.Render(line)
 	}
@@ -526,6 +530,69 @@ func highlightLineRangeWithWidth(line string, lineWidth, startCol, endCol int, h
 		return line
 	}
 	return prefix + modalSelectionStyle.Render(selected) + suffix
+}
+
+func highlightANSIStyledLineRange(line string, startCol, endCol int) string {
+	var out strings.Builder
+	curWidth := 0
+	activeSGR := ""
+	emittedSGR := ""
+
+	writeActive := func(style string) {
+		if emittedSGR == style {
+			return
+		}
+		if emittedSGR != "" {
+			out.WriteString("\x1b[0m")
+			emittedSGR = ""
+		}
+		if style != "" {
+			out.WriteString(style)
+			emittedSGR = style
+		}
+	}
+
+	for i := 0; i < len(line); {
+		if seq, size, ok := nextANSIEscape(line[i:]); ok {
+			activeSGR = updateActiveSGR(activeSGR, seq)
+			if !strings.HasPrefix(seq, "\x1b[") || !strings.HasSuffix(seq, "m") {
+				out.WriteString(seq)
+			}
+			i += size
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if r == utf8.RuneError && size == 0 {
+			break
+		}
+		cell := line[i : i+size]
+		rw := lipgloss.Width(cell)
+		inSelection := rw > 0 && curWidth < endCol && curWidth+rw > startCol
+
+		if inSelection {
+			out.WriteString("\x1b[0m\x1b[7m")
+			out.WriteString(cell)
+			out.WriteString("\x1b[0m")
+			emittedSGR = ""
+			if activeSGR != "" {
+				out.WriteString(activeSGR)
+				emittedSGR = activeSGR
+			}
+		} else {
+			writeActive(activeSGR)
+			out.WriteString(cell)
+		}
+
+		curWidth += rw
+		i += size
+	}
+
+	if emittedSGR != "" {
+		out.WriteString("\x1b[0m")
+	}
+
+	return out.String()
 }
 
 func splitByCellRange(line string, startCol, endCol int) (string, string, string) {

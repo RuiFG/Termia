@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS agent_events (
 CREATE TABLE IF NOT EXISTS agent_sessions (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'assistant',
+    team_name       TEXT NOT NULL DEFAULT '',
+    spec_snapshot_json TEXT NOT NULL DEFAULT '',
     cwd             TEXT NOT NULL DEFAULT '',
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
@@ -98,6 +101,7 @@ CREATE TABLE IF NOT EXISTS agent_messages (
     session_id      TEXT NOT NULL,
     role            TEXT NOT NULL,
     content         TEXT NOT NULL,
+    metadata_json   TEXT NOT NULL DEFAULT '',
     created_at      INTEGER NOT NULL,
 
     FOREIGN KEY (session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE

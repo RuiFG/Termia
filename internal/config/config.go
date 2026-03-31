@@ -9,11 +9,11 @@ import (
 
 // Config represents the complete Termia configuration structure.
 type Config struct {
-	General GeneralConfig   `toml:"general"`
-	LLM     LLMConfig       `toml:"llm"`
-	TUI     TUIConfig       `toml:"tui"`
-	Sync    SyncConfig      `toml:"sync"`
-	Agent   AgentTeamConfig `toml:"agent_team"`
+	General GeneralConfig      `toml:"general"`
+	LLM     LLMConfig          `toml:"llm"`
+	TUI     TUIConfig          `toml:"tui"`
+	Sync    SyncConfig         `toml:"sync"`
+	Agent   AgentRuntimeConfig `toml:"agent"`
 }
 
 // GeneralConfig contains general application settings.
@@ -59,25 +59,14 @@ type SyncConfig struct {
 	EncryptLocal        bool   `toml:"encrypt_local"`
 }
 
-// AgentTeamConfig contains agent team settings.
-type AgentTeamConfig struct {
-	Roles           []string           `toml:"roles"`
-	RequireApproval bool               `toml:"require_approval"`
-	MCPServers      []MCPServerConfig  `toml:"mcp_servers"`
-	Teams           []AgentTeamProfile `toml:"teams"`
-}
-
-// AgentTeamProfile defines a named team configuration.
-type AgentTeamProfile struct {
-	Name  string   `toml:"name"`
-	Roles []string `toml:"roles"`
-}
-
-// MCPServerConfig describes an MCP server placeholder configuration.
-type MCPServerConfig struct {
-	Name     string   `toml:"name"`
-	Endpoint string   `toml:"endpoint"`
-	Tools    []string `toml:"tools"`
+// AgentRuntimeConfig contains runtime settings for assistant/team execution.
+type AgentRuntimeConfig struct {
+	DefaultMode                string `toml:"default_mode"`
+	DefaultTeam                string `toml:"default_team"`
+	TeamsDir                   string `toml:"teams_dir"`
+	RequireCommandConfirmation bool   `toml:"require_command_confirmation"`
+	DefaultStreamMaxLines      int    `toml:"default_stream_max_lines"`
+	DefaultStreamTimeoutMs     int    `toml:"default_stream_timeout_ms"`
 }
 
 // Load reads and parses a TOML configuration file from the given path.

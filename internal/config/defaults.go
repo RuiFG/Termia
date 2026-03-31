@@ -54,11 +54,13 @@ func DefaultConfig() *Config {
 			AutoSyncIntervalMin: 15,
 			EncryptLocal:        true,
 		},
-		Agent: AgentTeamConfig{
-			Roles:           []string{"coordinator", "researcher"},
-			RequireApproval: true,
-			MCPServers:      nil,
-			Teams:           nil,
+		Agent: AgentRuntimeConfig{
+			DefaultMode:                "assistant",
+			DefaultTeam:                "",
+			TeamsDir:                   "",
+			RequireCommandConfirmation: true,
+			DefaultStreamMaxLines:      120,
+			DefaultStreamTimeoutMs:     3000,
 		},
 	}
 }

@@ -1,212 +1,173 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/termia/termia/internal/agent"
 )
 
-type ApprovalMode int
-
-const (
-	ApprovalModeNone ApprovalMode = iota
-	ApprovalModePrompt
-	ApprovalModeEdit
-	ApprovalModeConfirmEdit
-	ApprovalModeRephrase
-)
-
 type ApprovalInput struct {
-	Prompt      agent.ApprovalPrompt
-	Mode        ApprovalMode
-	editInput   textinput.Model
-	rephrase    textarea.Model
-	editedValue string
+	Request agent.HITLRequest
+	active  bool
+	cursor  int
 }
 
 func NewApprovalInput() ApprovalInput {
-	edit := textinput.New()
-	edit.Placeholder = ""
-	edit.Prompt = "> "
-	edit.PromptStyle = inputPromptStyle
-	edit.CharLimit = 500
-	edit.Cursor.Style = inputCursorStyle
-	edit.Cursor.Blink = false
-
-	rp := textarea.New()
-	rp.Placeholder = ""
-	rp.Prompt = "> "
-	rp.SetWidth(suggestedMinWidth)
-	rp.SetHeight(3)
-	rp.ShowLineNumbers = false
-	rp.EndOfBufferCharacter = 0
-	focusedStyle, blurredStyle := textarea.DefaultStyles()
-	focusedStyle.CursorLine = lipgloss.NewStyle()
-	focusedStyle.CursorLineNumber = lipgloss.NewStyle()
-	focusedStyle.EndOfBuffer = lipgloss.NewStyle()
-	focusedStyle.Text = lipgloss.NewStyle()
-	focusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colorMuted)
-	focusedStyle.Prompt = inputPromptStyle
-	blurredStyle = focusedStyle
-	rp.FocusedStyle = focusedStyle
-	rp.BlurredStyle = blurredStyle
-	rp.Cursor.Style = inputCursorStyle
-	rp.Cursor.Blink = false
-	promptWidth := lipgloss.Width("> ")
-	rp.SetPromptFunc(promptWidth, func(lineIdx int) string {
-		if lineIdx == 0 {
-			return "> "
-		}
-		return ""
-	})
-
-	return ApprovalInput{
-		Mode:      ApprovalModeNone,
-		editInput: edit,
-		rephrase:  rp,
-	}
+	return ApprovalInput{}
 }
 
-func (m *ApprovalInput) SetPrompt(prompt agent.ApprovalPrompt) {
-	m.Prompt = prompt
-	m.Mode = ApprovalModePrompt
-	m.editedValue = ""
-	m.editInput.SetValue("")
-	m.rephrase.SetValue("")
+func (m *ApprovalInput) SetRequest(request agent.HITLRequest) {
+	m.Request = request
+	m.active = true
+	m.cursor = 0
 }
 
 func (m ApprovalInput) Active() bool {
-	return m.Mode != ApprovalModeNone
+	return m.active
 }
 
 func (m *ApprovalInput) SetWidth(width int) {
-	inputWidth := maxInt(width-lipgloss.Width(m.editInput.Prompt), suggestedMinWidth)
-	m.editInput.Width = inputWidth
-	m.rephrase.SetWidth(inputWidth)
+	_ = width
 }
 
 func (m ApprovalInput) View(contentWidth int) string {
-	lines := []string{}
-	switch m.Mode {
-	case ApprovalModeEdit:
-		lines = append(lines, "Edit command:")
-		lines = append(lines, m.editInput.View())
-		lines = append(lines, "Enter=confirm  Esc=cancel")
-	case ApprovalModeConfirmEdit:
-		lines = append(lines, "Confirm edited command:")
-		lines = append(lines, "  "+m.editedValue)
-		lines = append(lines, "Enter=approve  E=edit  R=reject")
-	case ApprovalModeRephrase:
-		lines = append(lines, "Describe desired action:")
-		lines = append(lines, m.rephrase.View())
-		lines = append(lines, "Ctrl+J=submit  Esc=cancel")
-	case ApprovalModePrompt:
-		lines = append(lines, "Proposed command:")
-		lines = append(lines, "  "+strings.TrimSpace(m.Prompt.Command))
-		if strings.TrimSpace(m.Prompt.RiskNote) != "" {
-			lines = append(lines, "")
-			lines = append(lines, "Risk/Note:")
-			lines = append(lines, "  "+strings.TrimSpace(m.Prompt.RiskNote))
-		}
-		lines = append(lines, "")
-		lines = append(lines, "Enter=approve  E=edit  R=reject  N=natural language")
+	width := maxInt(1, contentWidth)
+	lines := []string{hitlTitleStyle.Render(approvalTitle(m.Request))}
+	if strings.TrimSpace(m.Request.Command) != "" {
+		lines = append(lines, renderCodeBlockLine(strings.TrimSpace(m.Request.Command), width)...)
 	}
+	meta := approvalMetaLine(m.Request)
+	if meta != "" {
+		lines = append(lines, hitlSubtitleStyle.Render(meta))
+	}
+	if prompt := approvalPrompt(m.Request); prompt != "" {
+		lines = append(lines, renderStyledParagraph(prompt, "", width, hitlHintStyle)...)
+	}
+	lines = append(lines, "")
+	lines = append(lines, renderApprovalActions(m.cursor))
 	return strings.Join(lines, "\n")
 }
 
-func (m *ApprovalInput) Update(msg tea.Msg) (*agent.ApprovalDecision, tea.Cmd) {
+func (m *ApprovalInput) Update(msg tea.Msg) (*agent.HITLResponse, tea.Cmd) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		return nil, nil
 	}
-	switch m.Mode {
-	case ApprovalModePrompt:
-		return m.handlePromptKey(keyMsg)
-	case ApprovalModeEdit:
-		return m.handleEditKey(keyMsg)
-	case ApprovalModeConfirmEdit:
-		return m.handleConfirmKey(keyMsg)
-	case ApprovalModeRephrase:
-		return m.handleRephraseKey(keyMsg)
+	switch {
+	case keyMsg.Type == tea.KeyLeft || keyMsg.Type == tea.KeyShiftTab:
+		m.cursor = 0
+		return nil, nil
+	case keyMsg.Type == tea.KeyRight || keyMsg.Type == tea.KeyTab:
+		m.cursor = 1
+		return nil, nil
+	case keyMsg.Type == tea.KeyUp:
+		m.cursor = 0
+		return nil, nil
+	case keyMsg.Type == tea.KeyDown:
+		m.cursor = 1
+		return nil, nil
+	case keyMsg.Type == tea.KeyEnter:
+		resp := approvalResponse(m.cursor == 0)
+		m.active = false
+		return resp, nil
+	case keyMsg.Type == tea.KeyEsc:
+		resp := approvalResponse(false)
+		m.active = false
+		return resp, nil
+	case strings.EqualFold(keyMsg.String(), "y"):
+		resp := approvalResponse(true)
+		m.active = false
+		return resp, nil
+	case strings.EqualFold(keyMsg.String(), "n"):
+		resp := approvalResponse(false)
+		m.active = false
+		return resp, nil
+	case strings.EqualFold(keyMsg.String(), "r"):
+		resp := approvalResponse(false)
+		m.active = false
+		return resp, nil
 	default:
 		return nil, nil
 	}
 }
 
-func (m *ApprovalInput) handlePromptKey(msg tea.KeyMsg) (*agent.ApprovalDecision, tea.Cmd) {
-	key := strings.ToLower(msg.String())
-	switch {
-	case msg.Type == tea.KeyEnter:
-		decision := agent.ApprovalDecision{Type: agent.ApprovalDecisionApprove}
-		return &decision, nil
-	case key == "e":
-		m.Mode = ApprovalModeEdit
-		m.editInput.SetValue(strings.TrimSpace(m.Prompt.Command))
-		return nil, m.editInput.Focus()
-	case key == "r":
-		decision := agent.ApprovalDecision{Type: agent.ApprovalDecisionReject}
-		return &decision, nil
-	case key == "n":
-		m.Mode = ApprovalModeRephrase
-		m.rephrase.SetValue("")
-		return nil, m.rephrase.Focus()
-	}
-	return nil, nil
+func (m ApprovalInput) String() string {
+	return fmt.Sprintf("active=%v tool=%s", m.active, m.Request.OriginalTool)
 }
 
-func (m *ApprovalInput) handleEditKey(msg tea.KeyMsg) (*agent.ApprovalDecision, tea.Cmd) {
-	if msg.Type == tea.KeyEsc {
-		m.Mode = ApprovalModePrompt
-		return nil, nil
+func approvalTitle(request agent.HITLRequest) string {
+	if strings.TrimSpace(request.Command) != "" {
+		return "Allow command"
 	}
-	if msg.Type == tea.KeyEnter {
-		value := strings.TrimSpace(m.editInput.Value())
-		if value == "" {
-			return nil, nil
-		}
-		m.editedValue = value
-		m.Mode = ApprovalModeConfirmEdit
-		return nil, nil
+	if title := strings.TrimSpace(request.Title); title != "" && !strings.EqualFold(title, "Confirmation Required") {
+		return title
 	}
-	updated, cmd := m.editInput.Update(msg)
-	m.editInput = updated
-	return nil, cmd
+	return "Allow action"
 }
 
-func (m *ApprovalInput) handleConfirmKey(msg tea.KeyMsg) (*agent.ApprovalDecision, tea.Cmd) {
-	key := strings.ToLower(msg.String())
-	switch {
-	case msg.Type == tea.KeyEnter:
-		decision := agent.ApprovalDecision{Type: agent.ApprovalDecisionEdit, Command: strings.TrimSpace(m.editedValue)}
-		return &decision, nil
-	case key == "e":
-		m.Mode = ApprovalModeEdit
-		return nil, m.editInput.Focus()
-	case key == "r", msg.Type == tea.KeyEsc:
-		decision := agent.ApprovalDecision{Type: agent.ApprovalDecisionReject}
-		return &decision, nil
+func approvalMetaLine(request agent.HITLRequest) string {
+	parts := make([]string, 0, 2)
+	if cwd := strings.TrimSpace(request.Cwd); cwd != "" {
+		parts = append(parts, cwd)
 	}
-	return nil, nil
+	if tool := strings.TrimSpace(request.OriginalTool); tool != "" && !strings.EqualFold(tool, "command") {
+		parts = append(parts, "tool "+tool)
+	}
+	return strings.Join(parts, "  ")
 }
 
-func (m *ApprovalInput) handleRephraseKey(msg tea.KeyMsg) (*agent.ApprovalDecision, tea.Cmd) {
-	if msg.Type == tea.KeyEsc {
-		m.Mode = ApprovalModePrompt
-		return nil, nil
+func approvalPrompt(request agent.HITLRequest) string {
+	if note := strings.TrimSpace(request.RiskNote); note != "" {
+		return note
 	}
-	if msg.Type == tea.KeyCtrlJ {
-		value := strings.TrimSpace(m.rephrase.Value())
-		if value == "" {
-			return nil, nil
-		}
-		decision := agent.ApprovalDecision{Type: agent.ApprovalDecisionRephrase, Rephrase: value}
-		return &decision, nil
+	prompt := strings.TrimSpace(request.Prompt)
+	if isGenericApprovalPrompt(prompt) {
+		return ""
 	}
-	updated, cmd := m.rephrase.Update(msg)
-	m.rephrase = updated
-	return nil, cmd
+	return prompt
+}
+
+func isGenericApprovalPrompt(prompt string) bool {
+	if prompt == "" {
+		return true
+	}
+	if strings.EqualFold(prompt, "Approval required.") {
+		return true
+	}
+	lower := strings.ToLower(prompt)
+	return strings.Contains(lower, "approve or reject the tool call")
+}
+
+func renderApprovalActions(cursor int) string {
+	allow := renderApprovalActionChoice("Allow", "Enter / Y", cursor == 0, false)
+	reject := renderApprovalActionChoice("Reject", "Esc / N", cursor == 1, true)
+	return allow + "  " + reject
+}
+
+func renderApprovalActionChoice(label, hint string, focused bool, danger bool) string {
+	titleStyle := hitlChoiceTitleStyle
+	hintStyle := hitlChoiceDescStyle
+	if focused {
+		titleStyle = hitlChoiceFocusStyle
+	}
+	if danger && focused {
+		titleStyle = hitlChoiceFocusStyle
+	}
+	return titleStyle.Render(label) + " " + hintStyle.Render(hint)
+}
+
+func approvalResponse(confirmed bool) *agent.HITLResponse {
+	if confirmed {
+		return &agent.HITLResponse{Confirmed: true}
+	}
+	return &agent.HITLResponse{
+		Confirmed: false,
+		Payload: map[string]any{
+			"status":  "rejected",
+			"reason":  "User rejected this tool call.",
+			"message": "Do not execute the tool. Ask the user for an alternative if needed.",
+		},
+	}
 }

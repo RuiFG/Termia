@@ -2,115 +2,105 @@ package agent
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/termia/termia/internal/config"
 )
 
-const DefaultSystemPrompt = `You are Termia, a transparent terminal assistant. Provide clear, concise analysis of terminal activity and tasks. Use the provided command history as ground truth, ask clarifying questions only when essential, and avoid inventing outputs or files that do not exist. When suggesting shell commands, prefer using the command tool so execution is approved by the user.`
+const (
+	defaultAssistantName = "assistant"
+	defaultUserID        = "user"
+	defaultAppName       = "termia"
+)
 
-// AgentConfig contains runtime configuration for the LLM agent.
-type AgentConfig struct {
-	Provider     string
-	Model        string
-	APIKey       string
-	BaseURL      string
-	MaxTokens    int
-	Temperature  float64
-	SystemPrompt string
-}
+const DefaultAssistantInstruction = `You are Termia, an AI terminal assistant.
 
-// NewAgentConfigFromConfig builds an AgentConfig from the application's LLM config.
-func NewAgentConfigFromConfig(llmCfg *config.LLMConfig) (*AgentConfig, error) {
-	if llmCfg == nil {
-		return nil, fmt.Errorf("llm config is nil")
+Operate with a terminal-first mindset:
+- Use tools instead of inventing files, output, or shell results.
+- Use request_input when you need a decision, choice, or clarification from the user.
+- Use read_file, read_files, list_dir, and stream_read when file or log context matters.
+- The command tool follows the session working directory by default. Only set cwd_mode=override with cwd when the user explicitly wants a one-off command in a different directory.
+- When a user message references terminal commands, treat the attached command metadata as the source of truth and use inspect_command_output if you need the actual command output.
+- If a tool confirmation is rejected, say the user declined the action. Do not describe it as a technical failure or an execution issue.
+- Be concise, direct, and execution-aware.`
+
+const DefaultCoordinatorInstruction = `You are the fixed coordinator for a Termia team.
+
+Decide whether to answer directly or delegate to the most suitable team member.
+When the task needs terminal or file interaction, prefer tools over speculation.
+The command tool follows the session working directory by default. Only set cwd_mode=override with cwd when the user explicitly wants a one-off command in a different directory.
+When a user message includes terminal command metadata, inspect outputs through inspect_command_output instead of assuming from the command text alone.
+If a tool confirmation is rejected, say the user declined the action. Do not describe it as a technical failure or an execution issue.
+Keep delegation focused and avoid bouncing the same task across multiple agents.`
+
+func AssistantSpecFromConfig(cfg *config.Config) (AgentSpec, error) {
+	if cfg == nil {
+		return AgentSpec{}, fmt.Errorf("config is nil")
 	}
 
-	providerCfg, providerName, err := resolveProviderConfig(llmCfg)
+	modelSpec, err := DefaultModelSpecFromConfig(&cfg.LLM)
 	if err != nil {
-		return nil, fmt.Errorf("resolve provider: %w", err)
+		return AgentSpec{}, err
 	}
 
-	return newAgentConfigFromProvider(llmCfg, providerName, providerCfg)
-}
-
-// NewAgentConfigFromProvider builds an AgentConfig from a specific provider name.
-func NewAgentConfigFromProvider(llmCfg *config.LLMConfig, providerName string) (*AgentConfig, error) {
-	if llmCfg == nil {
-		return nil, fmt.Errorf("llm config is nil")
-	}
-	providerCfg, resolvedName, err := resolveProviderConfigByName(llmCfg, providerName)
-	if err != nil {
-		return nil, fmt.Errorf("resolve provider: %w", err)
-	}
-	return newAgentConfigFromProvider(llmCfg, resolvedName, providerCfg)
-}
-
-func newAgentConfigFromProvider(_ *config.LLMConfig, providerName string, providerCfg *config.LLMProviderConfig) (*AgentConfig, error) {
-	if providerCfg == nil {
-		return nil, fmt.Errorf("provider config is nil")
-	}
-
-	apiKey := ""
-	if providerName != "ollama" || providerCfg.APIKeyEnv != "" {
-		resolved, err := resolveAPIKey(providerCfg.APIKeyEnv)
-		if err != nil {
-			return nil, fmt.Errorf("resolve api key: %w", err)
-		}
-		apiKey = resolved
-	}
-
-	if strings.TrimSpace(providerCfg.Model) == "" {
-		return nil, fmt.Errorf("model is required for provider %s", providerName)
-	}
-
-	return &AgentConfig{
-		Provider:     providerName,
-		Model:        providerCfg.Model,
-		APIKey:       apiKey,
-		BaseURL:      providerCfg.BaseURL,
-		MaxTokens:    providerCfg.MaxTokens,
-		Temperature:  0.2,
-		SystemPrompt: DefaultSystemPrompt,
+	return AgentSpec{
+		Name:        defaultAssistantName,
+		Description: "General purpose terminal assistant",
+		Instruction: DefaultAssistantInstruction,
+		Model:       modelSpec,
+		Tools:       defaultToolNames(),
 	}, nil
 }
 
-// resolveProviderConfig selects the provider configuration based on the default provider.
-func resolveProviderConfig(llmCfg *config.LLMConfig) (*config.LLMProviderConfig, string, error) {
+func DefaultModelSpecFromConfig(llmCfg *config.LLMConfig) (ModelSpec, error) {
 	if llmCfg == nil {
-		return nil, "", fmt.Errorf("llm config is nil")
+		return ModelSpec{}, fmt.Errorf("llm config is nil")
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(llmCfg.DefaultProvider))
-	return resolveProviderConfigByName(llmCfg, provider)
-}
-
-func resolveProviderConfigByName(llmCfg *config.LLMConfig, provider string) (*config.LLMProviderConfig, string, error) {
 	switch provider {
 	case "openai":
-		return &llmCfg.OpenAI, provider, nil
-	case "anthropic":
-		return &llmCfg.Anthropic, provider, nil
-	case "ollama":
-		return &llmCfg.Ollama, provider, nil
+		return modelSpecFromProviderConfig("openai", llmCfg.OpenAI)
 	case "deepseek":
-		return &llmCfg.DeepSeek, provider, nil
+		return modelSpecFromProviderConfig("deepseek", llmCfg.DeepSeek)
+	case "ollama":
+		return modelSpecFromProviderConfig("ollama", llmCfg.Ollama)
+	case "gemini", "google":
+		return modelSpecFromProviderConfig("gemini", config.LLMProviderConfig{
+			APIKeyEnv: "GOOGLE_API_KEY",
+			Model:     "gemini-2.5-flash",
+		})
 	default:
-		return nil, "", fmt.Errorf("unsupported provider: %s", provider)
+		return ModelSpec{}, fmt.Errorf("unsupported default provider %q", provider)
 	}
 }
 
-// resolveAPIKey reads the API key from the environment variable.
-func resolveAPIKey(envVar string) (string, error) {
-	if strings.TrimSpace(envVar) == "" {
-		return "", fmt.Errorf("api key environment variable is not configured")
+func modelSpecFromProviderConfig(provider string, cfg config.LLMProviderConfig) (ModelSpec, error) {
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if provider == "" {
+		return ModelSpec{}, fmt.Errorf("provider is empty")
+	}
+	if strings.TrimSpace(cfg.Model) == "" {
+		return ModelSpec{}, fmt.Errorf("model is required for provider %s", provider)
 	}
 
-	apiKey := strings.TrimSpace(os.Getenv(envVar))
-	if apiKey == "" {
-		return "", fmt.Errorf("api key not found in %s", envVar)
-	}
+	return ModelSpec{
+		Provider:  provider,
+		Model:     strings.TrimSpace(cfg.Model),
+		APIKeyEnv: strings.TrimSpace(cfg.APIKeyEnv),
+		BaseURL:   strings.TrimSpace(cfg.BaseURL),
+		MaxTokens: cfg.MaxTokens,
+	}, nil
+}
 
-	return apiKey, nil
+func defaultToolNames() []string {
+	return []string{
+		"command",
+		"inspect_command_output",
+		"request_input",
+		"read_file",
+		"read_files",
+		"list_dir",
+		"stream_read",
+	}
 }

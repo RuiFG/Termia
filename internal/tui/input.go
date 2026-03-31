@@ -26,21 +26,27 @@ type SlashSuggestion struct {
 	Desc string
 }
 
+type InputHistoryEntry struct {
+	Value           string
+	CitedCommandIDs []string
+}
+
 // InputModel is the bottom input bar component.
 type InputModel struct {
-	textInput        textinput.Model
-	textarea         textarea.Model
-	width            int
-	focused          bool
-	slashSuggestions []SlashSuggestion
-	slashIndex       int
-	useTextarea      bool
-	pasteBlocks      map[rune]pasteBlock
-	pasteSeq         int
-	prompt           string
-	history          []string
-	historyIndex     int
-	historyDraft     string
+	textInput                   textinput.Model
+	textarea                    textarea.Model
+	width                       int
+	focused                     bool
+	slashSuggestions            []SlashSuggestion
+	slashIndex                  int
+	useTextarea                 bool
+	pasteBlocks                 map[rune]pasteBlock
+	pasteSeq                    int
+	prompt                      string
+	history                     []InputHistoryEntry
+	historyIndex                int
+	historyDraft                string
+	historyDraftCitedCommandIDs []string
 }
 
 type pasteBlock struct {
@@ -98,6 +104,7 @@ func NewInputModel() InputModel {
 	ta.Focus()
 
 	suggestions := []SlashSuggestion{
+		{Name: "exit", Desc: "exit tui"},
 		{Name: "ralph-loop", Desc: "start ralph loop"},
 	}
 	return InputModel{
@@ -199,29 +206,44 @@ func (m *InputModel) Reset() {
 	m.resetPasteBlocks()
 	m.historyIndex = len(m.history)
 	m.historyDraft = ""
+	m.historyDraftCitedCommandIDs = nil
 }
 
 func (m *InputModel) SetHistory(entries []string) {
+	historyEntries := make([]InputHistoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		historyEntries = append(historyEntries, InputHistoryEntry{Value: entry})
+	}
+	m.SetHistoryEntries(historyEntries)
+}
+
+func (m *InputModel) SetHistoryEntries(entries []InputHistoryEntry) {
 	if len(entries) == 0 {
 		m.history = nil
 		m.historyIndex = 0
 		m.historyDraft = ""
+		m.historyDraftCitedCommandIDs = nil
 		return
 	}
-	cleaned := make([]string, 0, len(entries))
+	cleaned := make([]InputHistoryEntry, 0, len(entries))
 	for _, entry := range entries {
-		value := strings.TrimSpace(entry)
+		value := strings.TrimSpace(entry.Value)
 		if value == "" {
 			continue
 		}
-		if len(cleaned) > 0 && cleaned[len(cleaned)-1] == value {
+		normalized := InputHistoryEntry{
+			Value:           value,
+			CitedCommandIDs: cloneStringSlice(entry.CitedCommandIDs),
+		}
+		if len(cleaned) > 0 && sameHistoryEntry(cleaned[len(cleaned)-1], normalized) {
 			continue
 		}
-		cleaned = append(cleaned, value)
+		cleaned = append(cleaned, normalized)
 	}
 	m.history = cleaned
 	m.historyIndex = len(m.history)
 	m.historyDraft = ""
+	m.historyDraftCitedCommandIDs = nil
 }
 
 // SetWidth updates the input width (content width).
@@ -335,18 +357,28 @@ func (m InputModel) Update(msg tea.Msg) (InputModel, tea.Cmd) {
 }
 
 func (m *InputModel) AddHistory(value string) {
+	m.AddHistoryEntry(value, nil)
+}
+
+func (m *InputModel) AddHistoryEntry(value string, citedCommandIDs []string) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return
 	}
-	if len(m.history) > 0 && m.history[len(m.history)-1] == value {
+	entry := InputHistoryEntry{
+		Value:           value,
+		CitedCommandIDs: cloneStringSlice(citedCommandIDs),
+	}
+	if len(m.history) > 0 && sameHistoryEntry(m.history[len(m.history)-1], entry) {
 		m.historyIndex = len(m.history)
 		m.historyDraft = ""
+		m.historyDraftCitedCommandIDs = nil
 		return
 	}
-	m.history = append(m.history, value)
+	m.history = append(m.history, entry)
 	m.historyIndex = len(m.history)
 	m.historyDraft = ""
+	m.historyDraftCitedCommandIDs = nil
 }
 
 func (m *InputModel) moveHistory(delta int) bool {
@@ -365,7 +397,7 @@ func (m *InputModel) moveHistory(delta int) bool {
 		} else {
 			nextIndex = m.historyIndex - 1
 		}
-		value := m.history[nextIndex]
+		value := m.history[nextIndex].Value
 		m.SetValue(value)
 		m.historyIndex = clampHistoryIndex(nextIndex, len(m.history))
 		m.historyDraft = draft
@@ -383,7 +415,7 @@ func (m *InputModel) moveHistory(delta int) bool {
 			return true
 		}
 		nextIndex := m.historyIndex + 1
-		value := m.history[nextIndex]
+		value := m.history[nextIndex].Value
 		m.SetValue(value)
 		m.historyIndex = clampHistoryIndex(nextIndex, len(m.history))
 		m.historyDraft = draft
@@ -400,6 +432,50 @@ func clampHistoryIndex(idx int, length int) int {
 		return length
 	}
 	return idx
+}
+
+func (m InputModel) AtHistoryDraft() bool {
+	return m.historyIndex == len(m.history)
+}
+
+func (m InputModel) HistoryIndex() int {
+	return m.historyIndex
+}
+
+func (m InputModel) CurrentHistoryCitedCommandIDs() []string {
+	if m.historyIndex >= 0 && m.historyIndex < len(m.history) {
+		return cloneStringSlice(m.history[m.historyIndex].CitedCommandIDs)
+	}
+	return cloneStringSlice(m.historyDraftCitedCommandIDs)
+}
+
+func (m *InputModel) SetHistoryDraftCitedCommandIDs(ids []string) {
+	m.historyDraftCitedCommandIDs = cloneStringSlice(ids)
+}
+
+func sameHistoryEntry(left, right InputHistoryEntry) bool {
+	return left.Value == right.Value && sameStringSlice(left.CitedCommandIDs, right.CitedCommandIDs)
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneStringSlice(input []string) []string {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make([]string, len(input))
+	copy(cloned, input)
+	return cloned
 }
 
 // SlashSuggestions returns available slash command suggestions.

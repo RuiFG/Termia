@@ -477,7 +477,7 @@ func (m HistoryDetailModel) detailInfoLines() []string {
 	}
 
 	info := "\n" + strings.Join(parts, "\n") + "\n\n"
-	lines := wrapContent(info, m.width)
+	lines := wrapContent(stripANSICodes(info), m.width)
 	return lines
 }
 

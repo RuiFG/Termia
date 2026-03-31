@@ -60,19 +60,13 @@ endpoint = "https://api.termia.io"
 auto_sync_interval_min = 15
 encrypt_local = true            # E2E encryption
 
-[agent_team]
-# Enabled agent roles (allowlist)
-roles = ["coordinator", "researcher"]
-# Require approval before executing tools (bash/file)
-require_approval = true
+[agent]
+# Runtime defaults
+default_mode = "assistant"     # "assistant" | "team"
+default_team = ""              # Optional: name of a team file in ~/.termia/teams
+teams_dir = ""                 # Optional: override team directory
 
-# Named teams (optional)
-[[agent_team.teams]]
-name = "default"
-roles = ["coordinator", "researcher"]
-
-# MCP servers (placeholder)
-[[agent_team.mcp_servers]]
-name = ""
-endpoint = ""
-tools = []
+# Tool safety / streaming
+require_command_confirmation = true
+default_stream_max_lines = 120
+default_stream_timeout_ms = 3000

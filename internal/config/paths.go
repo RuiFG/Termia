@@ -42,9 +42,15 @@ func ShellDir() string {
 	return filepath.Join(TermiaDir(), "shell")
 }
 
-// AgentsDir returns the directory for agent role definitions.
+// TeamsDir returns the directory that stores team definition files.
+func TeamsDir() string {
+	return filepath.Join(TermiaDir(), "teams")
+}
+
+// AgentsDir returns the directory for agent/team definitions.
+// Deprecated: use TeamsDir.
 func AgentsDir() string {
-	return filepath.Join(TermiaDir(), "agents")
+	return TeamsDir()
 }
 
 // CacheDir returns the directory for cached data.
@@ -60,7 +66,7 @@ func EnsureDirs() error {
 		filepath.Dir(DBPath()), // db directory
 		TranscriptsDir(),
 		ShellDir(),
-		AgentsDir(),
+		TeamsDir(),
 		CacheDir(),
 	}
 

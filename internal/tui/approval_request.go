@@ -8,37 +8,57 @@ import (
 )
 
 type approvalRequest struct {
-	prompt   agent.ApprovalPrompt
-	response chan agent.ApprovalDecision
+	request  agent.HITLRequest
+	response chan agent.HITLResponse
 }
 
 type approvalRequestMsg struct {
 	request approvalRequest
 }
 
-type tuiApprovalProvider struct {
-	requests chan<- approvalRequest
+type askRequest struct {
+	request  agent.HITLRequest
+	response chan agent.HITLResponse
 }
 
-func newTUIApprovalProvider(requests chan<- approvalRequest) agent.ApprovalProvider {
-	return &tuiApprovalProvider{requests: requests}
+type askRequestMsg struct {
+	request askRequest
 }
 
-func (p *tuiApprovalProvider) RequestApproval(ctx context.Context, prompt agent.ApprovalPrompt) (agent.ApprovalDecision, error) {
-	if ctx.Err() != nil {
-		return agent.ApprovalDecision{Type: agent.ApprovalDecisionReject, Reason: ctx.Err().Error()}, ctx.Err()
+type tuiResponder struct {
+	approvals chan<- approvalRequest
+	asks      chan<- askRequest
+}
+
+func newTUIResponder(approvals chan<- approvalRequest, asks chan<- askRequest) agent.HITLResponder {
+	return &tuiResponder{
+		approvals: approvals,
+		asks:      asks,
 	}
-	response := make(chan agent.ApprovalDecision, 1)
-	select {
-	case p.requests <- approvalRequest{prompt: prompt, response: response}:
-	case <-ctx.Done():
-		return agent.ApprovalDecision{Type: agent.ApprovalDecisionReject, Reason: ctx.Err().Error()}, ctx.Err()
+}
+
+func (p *tuiResponder) Handle(ctx context.Context, request agent.HITLRequest) (agent.HITLResponse, error) {
+	response := make(chan agent.HITLResponse, 1)
+	switch request.Kind {
+	case agent.HITLKindConfirm:
+		select {
+		case p.approvals <- approvalRequest{request: request, response: response}:
+		case <-ctx.Done():
+			return agent.HITLResponse{}, ctx.Err()
+		}
+	default:
+		select {
+		case p.asks <- askRequest{request: request, response: response}:
+		case <-ctx.Done():
+			return agent.HITLResponse{}, ctx.Err()
+		}
 	}
+
 	select {
-	case decision := <-response:
-		return decision, nil
+	case resp := <-response:
+		return resp, nil
 	case <-ctx.Done():
-		return agent.ApprovalDecision{Type: agent.ApprovalDecisionReject, Reason: ctx.Err().Error()}, ctx.Err()
+		return agent.HITLResponse{}, ctx.Err()
 	}
 }
 
@@ -49,5 +69,15 @@ func waitForApprovalRequestCmd(ch <-chan approvalRequest) tea.Cmd {
 			return nil
 		}
 		return approvalRequestMsg{request: request}
+	}
+}
+
+func waitForAskRequestCmd(ch <-chan askRequest) tea.Cmd {
+	return func() tea.Msg {
+		request, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return askRequestMsg{request: request}
 	}
 }

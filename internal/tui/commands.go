@@ -29,6 +29,10 @@ func executeSlashCommand(cmd *SlashCommand, database *db.DB, cfg *config.LLMConf
 	_ = cfg
 
 	switch cmd.Name {
+	case "exit":
+		return func() tea.Msg {
+			return SlashCommandResult{Quit: true}
+		}
 	case "ralph-loop":
 		return func() tea.Msg {
 			return SlashCommandResult{Output: "Ralph loop started (placeholder)."}

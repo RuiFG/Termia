@@ -2,6 +2,8 @@ package recorder
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 type activeCmd struct {
 	dbID        string // UUID for DB record
 	startOffset int64
+	ignored     bool
 }
 
 // Recorder is an async recording engine that handles command markers and transcript writing
@@ -95,14 +98,16 @@ func (r *Recorder) processMarker(m *Marker) error {
 	defer r.mu.Unlock()
 
 	if m.IsStart() {
-		// Generate UUID for this command
-		dbID := uuid.New().String()
-
 		// Get current offset
 		offset := r.transcript.Offset()
+		shouldRecord := shouldRecordCommand(m.Command)
+		dbID := ""
+		if shouldRecord {
+			dbID = uuid.New().String()
+		}
 
 		// Create command record in DB
-		if r.db != nil {
+		if shouldRecord && r.db != nil {
 			commandText := m.Command
 			if commandText == "" {
 				commandText = "(unknown)"
@@ -127,6 +132,14 @@ func (r *Recorder) processMarker(m *Marker) error {
 		r.commands[m.CmdID] = &activeCmd{
 			dbID:        dbID,
 			startOffset: offset,
+			ignored:     !shouldRecord,
+		}
+
+		if !shouldRecord {
+			r.logger.Debug("command ignored",
+				zap.String("cmd_id", m.CmdID),
+				zap.String("command", m.Command))
+			return nil
 		}
 
 		r.logger.Debug("command started",
@@ -145,6 +158,12 @@ func (r *Recorder) processMarker(m *Marker) error {
 			r.logger.Warn("end marker for unknown command",
 				zap.String("cmd_id", m.CmdID))
 			return nil // Not fatal, just log it
+		}
+		if cmd.ignored {
+			delete(r.commands, m.CmdID)
+			r.logger.Debug("ignored command ended",
+				zap.String("cmd_id", m.CmdID))
+			return nil
 		}
 
 		// Get current offset
@@ -181,6 +200,34 @@ func (r *Recorder) processMarker(m *Marker) error {
 	}
 
 	return fmt.Errorf("unknown marker phase: %s", m.Phase)
+}
+
+func shouldRecordCommand(command string) bool {
+	fields := strings.Fields(strings.TrimSpace(strings.ToLower(command)))
+	if len(fields) == 0 {
+		return true
+	}
+
+	first := normalizeCommandToken(fields[0])
+	if first == "tui" || first == "tui.exe" {
+		return false
+	}
+	if len(fields) < 2 {
+		return true
+	}
+
+	second := normalizeCommandToken(fields[1])
+	return !(isTermiaExecutable(first) && second == "tui")
+}
+
+func normalizeCommandToken(token string) string {
+	token = strings.Trim(token, "\"'")
+	token = filepath.Base(token)
+	return strings.ToLower(token)
+}
+
+func isTermiaExecutable(token string) bool {
+	return token == "termia" || token == "termia.exe"
 }
 
 // RecordBytes writes data to the transcript file and returns the current byte offset

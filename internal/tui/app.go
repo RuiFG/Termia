@@ -18,7 +18,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/truncate"
 	"github.com/termia/termia/internal/agent"
-	"github.com/termia/termia/internal/agent/team"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"github.com/termia/termia/internal/diagnostics"
@@ -156,29 +155,26 @@ type App struct {
 	sessionCwds      map[string]string
 
 	// Team selection
-	teams           []config.AgentTeamProfile
-	activeTeamName  string
-	activeTeamRoles []string
+	teams          []agent.TeamSummary
+	activeTeamName string
 
 	// Sessions
-	sessions                 []db.AgentSession
-	activeSessionID          string
-	responseBuffer           []string
-	pendingPromptID          string
-	pendingPromptSessionID   string
-	agentRunning             bool
-	agentCancel              context.CancelFunc
-	agentLastEsc             time.Time
-	agentProgressStep        int
-	approvalInput            ApprovalInput
-	approvalDecision         *agent.ApprovalDecision
-	approvalRequests         chan approvalRequest
-	approvalResponseCh       chan agent.ApprovalDecision
-	askInput                 AskInput
-	askAnswers               []agent.AskAnswer
-	pendingPrompts           map[string][]db.PendingPrompt
-	approvalDecisionPromptID string
-	askAnswersPromptID       string
+	sessions               []db.AgentSession
+	activeSessionID        string
+	pendingTurnMessages    []AgentMessage
+	pendingPromptID        string
+	pendingPromptSessionID string
+	agentRunning           bool
+	agentCancel            context.CancelFunc
+	agentLastEsc           time.Time
+	agentProgressStep      int
+	approvalInput          ApprovalInput
+	approvalRequests       chan approvalRequest
+	approvalResponseCh     chan agent.HITLResponse
+	askInput               AskInput
+	askRequests            chan askRequest
+	askResponseCh          chan agent.HITLResponse
+	pendingPrompts         map[string][]db.PendingPrompt
 
 	// Command palette
 	paletteOpen  bool
@@ -223,13 +219,13 @@ type outputLoadedMsg struct {
 	content   string
 }
 
-type agentChunkMsg struct {
-	chunk  string
-	stream <-chan string
+type agentEventMsg struct {
+	event  agent.RuntimeEvent
+	stream <-chan agent.RuntimeEvent
 }
 
 type agentStartMsg struct {
-	stream <-chan string
+	stream <-chan agent.RuntimeEvent
 	err    error
 }
 
@@ -281,7 +277,7 @@ func newDirPromptInput() textinput.Model {
 // New creates a new App model.
 func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 	keys := DefaultKeyMap()
-	teams, activeName, activeRoles := resolveTeams(cfg.Agent)
+	teams, activeName := resolveTeams(cfg)
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = ""
@@ -289,13 +285,17 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 	input := NewInputModel()
 	firstUpdate := false
 	firstView := false
+	mode := AgentModeAgent
+	if strings.EqualFold(strings.TrimSpace(cfg.Agent.DefaultMode), string(agent.ModeTeam)) {
+		mode = AgentModeTeam
+	}
 	app := App{
 		db:               database,
 		cfg:              cfg,
 		logger:           logger,
 		focus:            FocusInput, // Start with input focused (standard TUI pattern)
 		middleMode:       ModeAgent,  // Default to Agent view
-		agentMode:        AgentModeAgent,
+		agentMode:        mode,
 		thinkLevel:       ThinkMedium,
 		firstUpdate:      &firstUpdate,
 		firstView:        &firstView,
@@ -308,10 +308,10 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		approvalInput:    NewApprovalInput(),
 		approvalRequests: make(chan approvalRequest),
 		askInput:         NewAskInput(),
+		askRequests:      make(chan askRequest),
 		keys:             keys,
 		teams:            teams,
 		activeTeamName:   activeName,
-		activeTeamRoles:  activeRoles,
 		launchCwd:        cwd,
 		cwd:              cwd,
 		sessionCwds:      make(map[string]string),
@@ -339,6 +339,7 @@ func (a App) Init() tea.Cmd {
 		loadSessionsCmd(a.db),
 		waitForCommandExecutedCmd(),
 		waitForApprovalRequestCmd(a.approvalRequests),
+		waitForAskRequestCmd(a.askRequests),
 		a.input.Focus(),
 	)
 }
@@ -370,9 +371,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.cacheSessionCwds(a.sessions)
 		if a.activeSessionID == "" {
 			if len(a.sessions) == 0 {
-				return a, createSessionCmd(a.db, a.launchCwd)
+				return a, createSessionCmd(a.db, a.launchCwd, a.currentRuntimeMode(), a.activeTeamName)
 			}
 			a.setActiveSessionID(a.sessions[0].ID)
+			a.applySessionRuntime(a.activeSessionID)
 			a.ensureSessionCwd(a.activeSessionID)
 			a.applySessionCwd(a.activeSessionID)
 			return a, loadSessionMessagesCmd(a.db, a.activeSessionID)
@@ -389,11 +391,17 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionCreatedMsg:
 		a.sessions = append([]db.AgentSession{msg.session}, a.sessions...)
 		a.setActiveSessionID(msg.session.ID)
+		a.applySessionRuntime(msg.session.ID)
 		a.cacheSessionCwd(msg.session)
 		a.ensureSessionCwd(msg.session.ID)
 		a.applySessionCwd(msg.session.ID)
-		a.input.SetHistory(nil)
+		a.input.SetHistoryEntries(nil)
 		a.agent.SetMessages(nil)
+		a.history.ClearCited()
+		a.pendingTurnMessages = nil
+		if a.ready {
+			a.layoutPanels()
+		}
 		return a, nil
 
 	case sessionMessagesLoadedMsg:
@@ -401,18 +409,34 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.agent.SetMessages(formatSessionMessages(msg.messages))
-		a.input.SetHistory(buildInputHistory(msg.messages))
+		a.pendingTurnMessages = nil
+		a.input.SetHistoryEntries(buildInputHistoryEntries(msg.messages))
 		a.pendingPrompts[msg.sessionID] = msg.pending
+		a.syncCitedCommandsFromInputHistory()
 		a.activatePendingPrompt()
 		return a, nil
 
 	case approvalRequestMsg:
 		a.approvalResponseCh = msg.request.response
-		a.approvalInput.SetPrompt(msg.request.prompt)
+		a.approvalInput.SetRequest(msg.request.request)
 		a.approvalInput.SetWidth(a.leftContentW)
 		a.focus = FocusInput
 		a.updateFocusState()
+		if a.ready {
+			a.layoutPanels()
+		}
 		return a, waitForApprovalRequestCmd(a.approvalRequests)
+
+	case askRequestMsg:
+		a.askResponseCh = msg.request.response
+		a.askInput.SetRequest(msg.request.request)
+		a.askInput.SetWidth(a.leftContentW)
+		a.focus = FocusInput
+		a.updateFocusState()
+		if a.ready {
+			a.layoutPanels()
+		}
+		return a, waitForAskRequestCmd(a.askRequests)
 
 	case sessionMessagesErrorMsg:
 		if a.logger != nil {
@@ -457,33 +481,61 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case SlashCommandResult:
 		return a.handleSlashResult(msg)
 
-	case agentChunkMsg:
-		if msg.chunk != "" {
-			a.agent.AppendToLast(msg.chunk)
-			a.responseBuffer = append(a.responseBuffer, msg.chunk)
+	case agentEventMsg:
+		switch msg.event.Kind {
+		case agent.RuntimeEventText:
+			if msg.event.Text != "" {
+				a.agent.AppendToLast(msg.event.Text)
+				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "assistant", msg.event.Text, true)
+			}
+		case agent.RuntimeEventToolCall:
+			if msg.event.ToolCall != nil {
+				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
+				a.agent.AppendToolCall(toolCall)
+				a.pendingTurnMessages = upsertTimelineToolCall(a.pendingTurnMessages, toolCall)
+			}
+		case agent.RuntimeEventToolResult:
+			if msg.event.ToolCall != nil {
+				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
+				a.agent.AppendToolCall(toolCall)
+				a.pendingTurnMessages = upsertTimelineToolCall(a.pendingTurnMessages, toolCall)
+			}
+		case agent.RuntimeEventCwd:
+			if cwd := strings.TrimSpace(msg.event.Cwd); cwd != "" {
+				a.setCwd(cwd)
+			}
+		case agent.RuntimeEventError:
+			if text := strings.TrimSpace(msg.event.Text); text != "" {
+				a.agent.MarkLatestPendingToolFailed(text)
+				a.agent.AddMessage("error", text)
+				a.pendingTurnMessages = markLatestPendingToolFailed(a.pendingTurnMessages, text)
+				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "error", text, false)
+			}
 		}
-		return a, readAgentChunkCmd(msg.stream)
+		return a, readAgentEventCmd(msg.stream)
 
 	case agentStartMsg:
 		if msg.err != nil {
 			_ = os.Unsetenv("TERMIA_SESSION_ID")
-			a.agent.AppendToLast(fmt.Sprintf("Error: %v", msg.err))
+			a.agent.AddMessage("error", fmt.Sprintf("Error: %v", msg.err))
 			a.agentRunning = false
 			a.agentCancel = nil
 			a.agentLastEsc = time.Time{}
 			a.agentProgressStep = 0
+			a.pendingTurnMessages = nil
 			return a, nil
 		}
 		if msg.stream == nil {
 			_ = os.Unsetenv("TERMIA_SESSION_ID")
-			a.agent.AppendToLast("Error: agent stream unavailable")
+			a.agent.AddMessage("error", "Error: agent stream unavailable")
 			a.agentRunning = false
 			a.agentCancel = nil
 			a.agentLastEsc = time.Time{}
 			a.agentProgressStep = 0
+			a.pendingTurnMessages = nil
 			return a, nil
 		}
-		return a, readAgentChunkCmd(msg.stream)
+		return a, readAgentEventCmd(msg.stream)
 
 	case agentDoneMsg:
 		_ = os.Unsetenv("TERMIA_SESSION_ID")
@@ -495,22 +547,26 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.statusMsg = ""
 		}
 		if a.activeSessionID == "" {
+			a.pendingTurnMessages = nil
 			return a, nil
 		}
-		response := strings.TrimSpace(strings.Join(a.responseBuffer, ""))
-		a.responseBuffer = nil
-		if response == "" {
+		messages := append([]AgentMessage(nil), a.pendingTurnMessages...)
+		a.pendingTurnMessages = nil
+		if len(messages) == 0 {
 			return a, nil
 		}
-		return a, createMessageCmd(a.db, a.activeSessionID, "assistant", response)
+		return a, createTimelineMessagesCmd(a.db, a.activeSessionID, messages)
 
 	case agentErrorMsg:
 		_ = os.Unsetenv("TERMIA_SESSION_ID")
-		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", msg.err))
+		errText := fmt.Sprintf("Error: %v", msg.err)
+		a.agent.MarkLatestPendingToolFailed(errText)
+		a.agent.AddMessage("error", errText)
 		a.agentRunning = false
 		a.agentCancel = nil
 		a.agentLastEsc = time.Time{}
 		a.agentProgressStep = 0
+		a.pendingTurnMessages = nil
 		if a.statusMsg == "Stopping agent..." {
 			a.statusMsg = ""
 		}
@@ -720,7 +776,8 @@ func (a App) handleChordKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case 'a':
 		a.agentMode = AgentModeAgent
 		a.middleMode = ModeAgent
-		a.statusMsg = "Mode set to Agent."
+		a.statusMsg = "Mode set to Assistant."
+		a.updateActiveSessionRuntime()
 	case 't':
 		a.openPaletteStage(paletteStageTeams)
 	case 'c':
@@ -944,16 +1001,22 @@ func (a App) submitDirPrompt() (tea.Model, tea.Cmd) {
 // handleInputKey processes key events when input is focused.
 func (a App) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if a.approvalInput.Active() {
-		decision, cmd := a.approvalInput.Update(msg)
-		if decision != nil {
-			return a.handleApprovalDecision(*decision)
+		response, cmd := a.approvalInput.Update(msg)
+		if response != nil {
+			return a.handleApprovalResponse(*response)
+		}
+		if a.ready {
+			a.layoutPanels()
 		}
 		return a, cmd
 	}
 	if a.askInput.Active() {
-		answers, cmd := a.askInput.Update(msg)
-		if answers != nil {
-			return a.handleAskAnswers(*answers)
+		response, cmd := a.askInput.Update(msg)
+		if response != nil {
+			return a.handleAskResponse(*response)
+		}
+		if a.ready {
+			a.layoutPanels()
 		}
 		return a, cmd
 	}
@@ -970,8 +1033,15 @@ func (a App) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.updateFocusState()
 		return a, nil
 	case tea.KeyUp, tea.KeyDown:
+		beforeIndex := a.input.HistoryIndex()
+		if a.input.AtHistoryDraft() {
+			a.input.SetHistoryDraftCitedCommandIDs(a.history.CitedCommandIDs())
+		}
 		var cmd tea.Cmd
 		a.input, cmd = a.input.Update(msg)
+		if a.input.HistoryIndex() != beforeIndex {
+			a.syncCitedCommandsFromInputHistory()
+		}
 		return a, cmd
 	}
 
@@ -980,77 +1050,79 @@ func (a App) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return a, cmd
 }
 
-func (a App) handleApprovalDecision(decision agent.ApprovalDecision) (tea.Model, tea.Cmd) {
+func (a App) handleApprovalResponse(response agent.HITLResponse) (tea.Model, tea.Cmd) {
 	promptID := a.pendingPromptID
 	promptSessionID := a.pendingPromptSessionID
 	if a.db != nil && promptID != "" {
-		payload, err := json.Marshal(decision)
+		payload, err := json.Marshal(response)
 		if err != nil {
 			if a.logger != nil {
-				a.logger.Warn("failed to encode approval decision", zap.Error(err))
+				a.logger.Warn("failed to encode hitl approval response", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to encode approval decision"
+			a.statusMsg = "Error: failed to encode approval response"
 			return a, nil
 		}
 		if err := a.db.ResolvePendingPromptWithResponse(promptID, string(payload)); err != nil {
 			if a.logger != nil {
-				a.logger.Warn("failed to resolve approval prompt", zap.Error(err))
+				a.logger.Warn("failed to resolve hitl approval prompt", zap.Error(err))
 			}
 			a.statusMsg = "Error: failed to resolve approval prompt"
 			return a, nil
 		}
 		_ = a.updatePendingPromptCount()
 	}
-	a.approvalDecision = &decision
-	a.approvalDecisionPromptID = promptID
 	a.pendingPromptID = ""
 	a.pendingPromptSessionID = ""
 	a.dequeuePendingPrompt(promptSessionID, promptID)
 	if a.approvalResponseCh != nil {
 		select {
-		case a.approvalResponseCh <- decision:
+		case a.approvalResponseCh <- response:
 		default:
 		}
 		a.approvalResponseCh = nil
 	}
-	a.approvalInput.Mode = ApprovalModeNone
-	a.approvalInput.editedValue = ""
-	a.approvalInput.editInput.SetValue("")
-	a.approvalInput.rephrase.SetValue("")
+	a.approvalInput.Request = agent.HITLRequest{}
+	a.approvalInput.active = false
 	a.activatePendingPrompt()
 	return a, nil
 }
 
-func (a App) handleAskAnswers(answers []agent.AskAnswer) (tea.Model, tea.Cmd) {
+func (a App) handleAskResponse(response agent.HITLResponse) (tea.Model, tea.Cmd) {
 	promptID := a.pendingPromptID
 	promptSessionID := a.pendingPromptSessionID
 	if a.db != nil && promptID != "" {
-		payload, err := json.Marshal(answers)
+		payload, err := json.Marshal(response)
 		if err != nil {
 			if a.logger != nil {
-				a.logger.Warn("failed to encode ask answers", zap.Error(err))
+				a.logger.Warn("failed to encode hitl input response", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to encode ask answers"
+			a.statusMsg = "Error: failed to encode input response"
 			return a, nil
 		}
 		if err := a.db.ResolvePendingPromptWithResponse(promptID, string(payload)); err != nil {
 			if a.logger != nil {
-				a.logger.Warn("failed to resolve ask prompt", zap.Error(err))
+				a.logger.Warn("failed to resolve input prompt", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to resolve ask prompt"
+			a.statusMsg = "Error: failed to resolve input prompt"
 			return a, nil
 		}
 		_ = a.updatePendingPromptCount()
 	}
-	a.askAnswers = answers
-	a.askAnswersPromptID = promptID
 	a.pendingPromptID = ""
 	a.pendingPromptSessionID = ""
 	a.dequeuePendingPrompt(promptSessionID, promptID)
+	if a.askResponseCh != nil {
+		select {
+		case a.askResponseCh <- response:
+		default:
+		}
+		a.askResponseCh = nil
+	}
 	a.askInput.Mode = AskModeNone
 	a.askInput.Questions = nil
 	a.askInput.Answers = nil
 	a.askInput.Selected = nil
+	a.askInput.CustomValues = nil
 	a.askInput.Index = 0
 	a.askInput.Cursor = 0
 	a.askInput.Custom.SetValue("")
@@ -1092,8 +1164,16 @@ func (a *App) activatePendingPrompt() {
 			}
 			a.pendingPromptID = prompt.PromptID
 			a.pendingPromptSessionID = prompt.SessionID
-			a.askInput.SetQuestions(askPayload.Questions)
+			a.askInput.SetRequest(agent.HITLRequest{
+				ID:        prompt.PromptID,
+				Kind:      agent.HITLKindInputForm,
+				Title:     "Input Required",
+				Questions: askPayload.Questions,
+			})
 			a.askInput.SetWidth(a.leftContentW)
+			if a.ready {
+				a.layoutPanels()
+			}
 			return
 		default:
 			command := strings.TrimSpace(payload.Command)
@@ -1102,8 +1182,17 @@ func (a *App) activatePendingPrompt() {
 			}
 			a.pendingPromptID = prompt.PromptID
 			a.pendingPromptSessionID = prompt.SessionID
-			a.approvalInput.SetPrompt(agent.ApprovalPrompt{Command: command})
+			a.approvalInput.SetRequest(agent.HITLRequest{
+				ID:      prompt.PromptID,
+				Kind:    agent.HITLKindConfirm,
+				Title:   "Confirmation Required",
+				Prompt:  "Approval required.",
+				Command: command,
+			})
 			a.approvalInput.SetWidth(a.leftContentW)
+			if a.ready {
+				a.layoutPanels()
+			}
 			return
 		}
 	}
@@ -1288,6 +1377,10 @@ func (a App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
+	if handled, cmd := a.handleHistoryMouse(msg, contentX, contentY); handled {
+		return a, cmd
+	}
+
 	if handled, cmd := a.handleInputSelection(msg, contentX, contentY); handled {
 		return a, cmd
 	}
@@ -1297,6 +1390,58 @@ func (a App) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return a.handleContentSelection(msg, contentX, contentY)
+}
+
+func (a *App) handleHistoryMouse(msg tea.MouseMsg, contentX, contentY int) (bool, tea.Cmd) {
+	panelXStart := a.leftXStart
+	panelXEnd := a.leftXEnd
+	panelWidth := a.leftContentW
+	if a.rightWidth > 0 {
+		panelXStart = a.rightXStart
+		panelXEnd = a.rightXEnd
+		panelWidth = a.rightContentW
+	}
+	if contentX < panelXStart || contentX > panelXEnd || contentY < a.historyYStart || contentY > a.historyYEnd {
+		return false, nil
+	}
+
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		a.history.MoveSelection(-3)
+		return true, nil
+	case tea.MouseButtonWheelDown:
+		a.history.MoveSelection(3)
+		return true, nil
+	}
+
+	if msg.Button != tea.MouseButtonLeft || msg.Action != tea.MouseActionPress {
+		return true, nil
+	}
+
+	innerX, innerY := panelInnerOrigin(historyPaneStyle, panelXStart, a.historyYStart)
+	innerH := a.historyHeight
+	if contentX < innerX || contentX >= innerX+panelWidth || contentY < innerY || contentY >= innerY+innerH {
+		return true, nil
+	}
+
+	index := a.history.ScrollOffset() + (contentY - innerY)
+	a.history.SelectIndex(index)
+	return true, nil
+}
+
+func (a *App) scrollActiveContent(delta int) {
+	if delta == 0 {
+		return
+	}
+	if a.detailOpen {
+		a.detail.Scroll(delta)
+		return
+	}
+	if a.middleMode == ModePreview {
+		a.preview.Scroll(delta)
+		return
+	}
+	a.agent.Scroll(delta)
 }
 
 func (a App) hasActiveDragSelection() bool {
@@ -1333,13 +1478,6 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Handle exit command (case-insensitive)
-	if strings.EqualFold(val, "exit") {
-		return a, tea.Quit
-	}
-
-	a.input.AddHistory(val)
-
 	// Check for slash command
 	if cmd := a.input.ParseSlashCommand(); cmd != nil {
 		a.input.Reset()
@@ -1348,32 +1486,56 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 
 	// Regular text input -> Send to Agent
 	a.middleMode = ModeAgent
-	a.agent.AddMessage("user", val)
-	a.agent.AddMessage("agent", "")
-	a.responseBuffer = nil
+	citedCommands := a.history.CitedCommands()
+	a.agent.AddTimelineMessage(AgentMessage{
+		Role:              "user",
+		Content:           val,
+		CitedCommandCount: len(citedCommands),
+	})
+	a.pendingTurnMessages = nil
 
 	if a.activeSessionID == "" {
-		newSession, err := createSession(a.db, a.cwd)
+		newSession, err := createSession(a.db, a.cwd, a.currentRuntimeMode(), a.activeTeamName)
 		if err != nil {
-			a.agent.AppendToLast(fmt.Sprintf("Error: %v", err))
+			a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
 			a.input.Reset()
 			return a, nil
 		}
 		a.setActiveSessionID(newSession.ID)
 		a.sessions = append([]db.AgentSession{newSession}, a.sessions...)
+		a.applySessionRuntime(newSession.ID)
 	}
 	a.setActiveSessionID(a.activeSessionID)
-
-	if err := a.db.CreateAgentMessage(&db.AgentMessage{
-		ID:        generateID(),
-		SessionID: a.activeSessionID,
-		Role:      "user",
-		Content:   val,
-		CreatedAt: time.Now().UnixNano(),
-	}); err != nil {
-		a.agent.AppendToLast(fmt.Sprintf("Error: %v", err))
+	a.updateActiveSessionRuntime()
+	selectedCommands := agentCommandsFromDBCommands(citedCommands)
+	messageMetadata := db.AgentMessageMetadata{
+		CitedCommands: db.AgentMessageCommandMetadataFromCommands(citedCommands),
+	}
+	metadataJSON, err := db.EncodeAgentMessageMetadata(messageMetadata)
+	if err != nil {
+		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
 		a.input.Reset()
 		return a, nil
+	}
+	citedCommandIDs := messageMetadata.CommandIDs()
+
+	if err := a.db.CreateAgentMessage(&db.AgentMessage{
+		ID:           generateID(),
+		SessionID:    a.activeSessionID,
+		Role:         "user",
+		Content:      val,
+		MetadataJSON: metadataJSON,
+		CreatedAt:    time.Now().UnixNano(),
+	}); err != nil {
+		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
+		a.input.Reset()
+		return a, nil
+	}
+	a.input.AddHistoryEntry(val, citedCommandIDs)
+	a.input.SetHistoryDraftCitedCommandIDs(nil)
+	a.history.ClearCited()
+	if a.ready {
+		a.layoutPanels()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1381,7 +1543,7 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 	a.agentRunning = true
 	a.agentLastEsc = time.Time{}
 	a.agentProgressStep = 0
-	startCmd := a.startAgentRunCmd(ctx, val)
+	startCmd := a.startAgentRunCmd(ctx, val, selectedCommands)
 
 	a.input.Reset()
 	return a, tea.Batch(startCmd, agentProgressTickCmd())
@@ -1478,84 +1640,81 @@ func copyToClipboardCmd(text string) tea.Cmd {
 	}
 }
 
-func (a *App) runTeamQuery(ctx context.Context, query string) (<-chan string, error) {
+func (a *App) conversationMessages(query string) []agent.Message {
 	if a.db == nil {
-		return nil, fmt.Errorf("database not initialized")
+		return nil
 	}
-	cfg := a.teamConfig()
-	if err := team.EnsureDefaultRoles(cfg.Agent); err != nil {
-		return nil, err
+	sessionID := strings.TrimSpace(a.activeSessionID)
+	if sessionID == "" {
+		return nil
 	}
-	agentCfg, err := agent.NewAgentConfigFromConfig(&a.cfg.LLM)
+	messages, err := a.db.ListAgentMessages(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("LLM not configured: %w", err)
+		return nil
 	}
-	_ = agentCfg
-
-	teamRunner, err := team.NewTeamRunner(ctx, cfg, a.db, a.logger)
-	if err != nil {
-		return nil, err
-	}
-
-	return teamRunner.Run(ctx, query, nil)
-}
-
-func (a *App) runAgentQuery(ctx context.Context, query string) (<-chan string, error) {
-	if a.db == nil {
-		return nil, fmt.Errorf("database not initialized")
-	}
-	agentCfg, err := agent.NewAgentConfigFromConfig(&a.cfg.LLM)
-	if err != nil {
-		return nil, fmt.Errorf("LLM not configured: %w", err)
-	}
-	model, err := agent.NewModel(agentCfg)
-	if err != nil {
-		return nil, fmt.Errorf("create model: %w", err)
-	}
-	tools := agent.CreateTools(a.db, a.cfg.Agent.RequireApproval, newTUIApprovalProvider(a.approvalRequests))
-	reactRunner, err := agent.NewReactRunner(ctx, model, tools, a.db, a.logger)
-	if err != nil {
-		return nil, fmt.Errorf("create react runner: %w", err)
-	}
-
-	return reactRunner.Run(ctx, query, nil)
-}
-
-func (a App) startAgentRunCmd(ctx context.Context, query string) tea.Cmd {
-	return func() tea.Msg {
-		var (
-			stream <-chan string
-			err    error
-		)
-		if a.agentMode == AgentModeAgent {
-			stream, err = a.runAgentQuery(ctx, query)
-		} else {
-			stream, err = a.runTeamQuery(ctx, query)
+	trimmedQuery := strings.TrimSpace(query)
+	if len(messages) > 0 {
+		last := messages[len(messages)-1]
+		if strings.EqualFold(strings.TrimSpace(last.Role), "user") && strings.TrimSpace(last.Content) == trimmedQuery {
+			messages = messages[:len(messages)-1]
 		}
+	}
+	output := make([]agent.Message, 0, len(messages))
+	for _, message := range messages {
+		role := normalizeConversationRole(message.Role)
+		if role == "tool" || role == "error" {
+			continue
+		}
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		output = append(output, agent.Message{
+			Role:     role,
+			Content:  content,
+			Commands: agentCommandsFromMessageMetadata(db.ParseAgentMessageMetadata(message)),
+		})
+	}
+	return output
+}
+
+func (a *App) selectedCommandsForAgent() []agent.Command {
+	return agentCommandsFromDBCommands(a.history.CitedCommands())
+}
+
+func (a *App) runAIQuery(ctx context.Context, query string, selectedCommands []agent.Command) (<-chan agent.RuntimeEvent, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+	runtime := agent.NewRuntime(a.cfg, a.db, newTUIResponder(a.approvalRequests, a.askRequests))
+	return runtime.Run(ctx, agent.RunRequest{
+		Mode:             a.currentRuntimeMode(),
+		TeamName:         strings.TrimSpace(a.activeTeamName),
+		SessionID:        strings.TrimSpace(a.activeSessionID),
+		Query:            query,
+		Cwd:              strings.TrimSpace(a.cwd),
+		SelectedCommands: selectedCommands,
+		Messages:         a.conversationMessages(query),
+	})
+}
+
+func (a App) startAgentRunCmd(ctx context.Context, query string, selectedCommands []agent.Command) tea.Cmd {
+	return func() tea.Msg {
+		stream, err := a.runAIQuery(ctx, query, selectedCommands)
 		return agentStartMsg{stream: stream, err: err}
 	}
 }
 
-func (a App) teamConfig() *config.Config {
-	if len(a.activeTeamRoles) == 0 {
-		return a.cfg
-	}
-	clone := *a.cfg
-	clone.Agent = a.cfg.Agent
-	clone.Agent.Roles = append([]string{}, a.activeTeamRoles...)
-	return &clone
-}
-
-func readAgentChunkCmd(stream <-chan string) tea.Cmd {
+func readAgentEventCmd(stream <-chan agent.RuntimeEvent) tea.Cmd {
 	if stream == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		chunk, ok := <-stream
+		event, ok := <-stream
 		if !ok {
 			return agentDoneMsg{}
 		}
-		return agentChunkMsg{chunk: chunk, stream: stream}
+		return agentEventMsg{event: event, stream: stream}
 	}
 }
 
@@ -1579,6 +1738,7 @@ func (a App) handleSlashResult(result SlashCommandResult) (tea.Model, tea.Cmd) {
 	}
 	if result.SwitchAgentMode != nil {
 		a.agentMode = *result.SwitchAgentMode
+		a.updateActiveSessionRuntime()
 	}
 	if result.OpenPalette != nil {
 		a.openPaletteStage(*result.OpenPalette)
@@ -1591,7 +1751,7 @@ func (a App) handleSlashResult(result SlashCommandResult) (tea.Model, tea.Cmd) {
 
 	a.updateFocusState()
 	if result.CreateSession {
-		return a, createSessionCmd(a.db, a.launchCwd)
+		return a, createSessionCmd(a.db, a.launchCwd, a.currentRuntimeMode(), a.activeTeamName)
 	}
 	return a, nil
 }
@@ -1699,7 +1859,7 @@ func (a App) View() string {
 		return loadingStyle.Render("  Starting Termia...")
 	}
 
-	// Container frame dimensions (border + padding)
+	// Container frame dimensions (padding only; the outer border is removed).
 	containerFW, containerFH := containerStyle.GetFrameSize()
 	innerW := a.width - containerFW
 	innerH := a.height - containerFH
@@ -1748,7 +1908,6 @@ func (a App) View() string {
 	}
 
 	// Container uses Height/Width to ensure minimum size (pads if body is shorter).
-	// Do NOT use MaxHeight/MaxWidth — they truncate AFTER borders, clipping the bottom border.
 	return containerStyle.
 		Width(innerW).
 		Height(innerH).
@@ -1847,9 +2006,30 @@ func contentSelectionLines(content string, width, height int) []string {
 	return lines
 }
 
+func contentSelectionRenderLines(content string, width, height int) []string {
+	clampStyle := lipgloss.NewStyle().Width(width).Height(height).MaxHeight(height)
+	inner := clampStyle.Render(content)
+	lines := strings.Split(inner, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	return lines
+}
+
 func panelInnerOrigin(style lipgloss.Style, xStart, yStart int) (int, int) {
 	return xStart + style.GetBorderLeftSize() + style.GetPaddingLeft(),
 		yStart + style.GetBorderTopSize() + style.GetPaddingTop()
+}
+
+func containerInnerOrigin(style lipgloss.Style) (int, int) {
+	return style.GetBorderLeftSize() + style.GetPaddingLeft(),
+		style.GetBorderTopSize() + style.GetPaddingTop()
 }
 
 // renderInput renders the input panel with border based on focus.
@@ -1867,23 +2047,27 @@ func (a App) renderInput(contentWidth int) string {
 	citedCount := a.history.CitedCount()
 	status := a.renderAgentStatusLine()
 	label := "commands"
-	if citedCount <= 1 {
+	if citedCount == 1 {
 		label = "command"
 	}
-	badge := citedBadgeStyle.Render(fmt.Sprintf("📎 %d %s referenced", citedCount, label))
+	icon := "○"
+	if citedCount > 0 {
+		icon = "✓"
+	}
+	badge := citedBadgeStyle.Render(fmt.Sprintf("%s %d %s selected", icon, citedCount, label))
 	statusLine := buildStatusLine(status, badge, contentWidth)
 
 	inputLines := strings.Split(inputView, "\n")
-	if !a.approvalInput.Active() && !a.askInput.Active() && a.inputSelection.HasSelection() {
-		inputLines = a.inputSelection.HighlightLines(contentWidth)
-	}
 	cwdLine := a.renderInputCwdLine(contentWidth)
 	if cwdLine != "" {
 		inputLines = append([]string{cwdLine}, inputLines...)
 	}
 	inputAreaLines := a.inputHeight - 1
 	blankLines := inputAreaLines - len(inputLines)
-	if blankLines < 1 {
+	if blankLines < 0 {
+		blankLines = 0
+	}
+	if blankLines == 0 && !a.approvalInput.Active() && !a.askInput.Active() {
 		blankLines = 1
 	}
 	for i := 0; i < blankLines; i++ {
@@ -1910,7 +2094,7 @@ func (a App) renderInput(contentWidth int) string {
 func (a App) renderAgentModeBadge() string {
 	switch a.agentMode {
 	case AgentModeAgent:
-		return agentModeStyle.Render("Agent")
+		return agentModeStyle.Render("Assistant")
 	default:
 		return teamModeStyle.Render("Team")
 	}
@@ -1972,7 +2156,7 @@ func (a App) handleAgentEsc() (tea.Model, tea.Cmd) {
 
 func (a App) renderAgentLabel() string {
 	if a.agentMode == AgentModeAgent {
-		return agentModeStyle.Render("Agent")
+		return agentModeStyle.Render("Assistant")
 	}
 	name := strings.TrimSpace(a.activeTeamName)
 	if name == "" {
@@ -2194,16 +2378,17 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		return a, nil
 	case paletteActionNewSession:
 		a.closePalette()
-		return a, createSessionCmd(a.db, a.launchCwd)
+		return a, createSessionCmd(a.db, a.launchCwd, a.currentRuntimeMode(), a.activeTeamName)
 	case paletteActionSelectModel:
 		a.cfg.LLM.DefaultProvider = item.Value
 		a.statusMsg = fmt.Sprintf("Model switched to %s.", item.Label)
 		a.closePalette()
 		return a, nil
 	case paletteActionSelectAgent:
-		if item.Value == "agent" {
+		if item.Value == "assistant" {
 			a.agentMode = AgentModeAgent
-			a.statusMsg = "Agent mode set to Agent."
+			a.statusMsg = "Mode set to Assistant."
+			a.updateActiveSessionRuntime()
 			a.closePalette()
 			return a, nil
 		}
@@ -2215,13 +2400,14 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		if ok {
 			a.agentMode = AgentModeTeam
 			a.activeTeamName = team.Name
-			a.activeTeamRoles = append([]string{}, team.Roles...)
-			a.statusMsg = fmt.Sprintf("Agent mode set to %s.", team.Name)
+			a.statusMsg = fmt.Sprintf("Mode set to %s.", team.Name)
+			a.updateActiveSessionRuntime()
 		}
 		a.closePalette()
 		return a, nil
 	case paletteActionSelectSession:
 		a.setActiveSessionID(item.Value)
+		a.applySessionRuntime(item.Value)
 		a.closePalette()
 		a.applySessionCwd(item.Value)
 		return a, loadSessionMessagesCmd(a.db, item.Value)
@@ -2244,6 +2430,15 @@ func (a App) handleDetailSelection(msg tea.MouseMsg, contentX, contentY int) (te
 		return a, nil
 	}
 
+	if msg.Button == tea.MouseButtonWheelUp {
+		a.detail.Scroll(-3)
+		return a, nil
+	}
+	if msg.Button == tea.MouseButtonWheelDown {
+		a.detail.Scroll(3)
+		return a, nil
+	}
+
 	innerX, innerY := panelInnerOrigin(contentPaneStyle, a.leftXStart, a.contentYStart)
 	innerW := a.leftContentW
 	innerH := a.middleHeight
@@ -2258,15 +2453,6 @@ func (a App) handleDetailSelection(msg tea.MouseMsg, contentX, contentY int) (te
 		if msg.Action == tea.MouseActionRelease {
 			a.detail.EndSelection()
 		}
-		return a, nil
-	}
-
-	if msg.Button == tea.MouseButtonWheelUp {
-		a.detail.Scroll(-3)
-		return a, nil
-	}
-	if msg.Button == tea.MouseButtonWheelDown {
-		a.detail.Scroll(3)
 		return a, nil
 	}
 
@@ -2314,6 +2500,15 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 		return a, nil
 	}
 
+	if msg.Button == tea.MouseButtonWheelUp {
+		a.scrollActiveContent(-3)
+		return a, nil
+	}
+	if msg.Button == tea.MouseButtonWheelDown {
+		a.scrollActiveContent(3)
+		return a, nil
+	}
+
 	innerX, innerY := panelInnerOrigin(contentPaneStyle, a.leftXStart, a.contentYStart)
 	innerW := a.leftContentW
 	innerH := a.middleHeight
@@ -2337,9 +2532,9 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 
 	line := contentY - innerY
 	col := contentX - innerX
-	var cmd tea.Cmd
 	if msg.Action == tea.MouseActionPress {
 		a.inputSelection.Clear()
+		a.contentSelection.Clear()
 		var content string
 		if a.middleMode == ModePreview {
 			content = a.preview.View()
@@ -2347,6 +2542,7 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 			content = a.agent.View()
 		}
 		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
+		a.contentSelection.SetRenderLines(contentSelectionRenderLines(content, a.leftContentW, a.middleHeight))
 		a.contentSelection.BeginSelection(line, col)
 		return a, nil
 	}
@@ -2358,6 +2554,7 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 			content = a.agent.View()
 		}
 		a.contentSelection.SetLines(contentSelectionLines(content, a.leftContentW, a.middleHeight))
+		a.contentSelection.SetRenderLines(contentSelectionRenderLines(content, a.leftContentW, a.middleHeight))
 	}
 	if msg.Action == tea.MouseActionMotion {
 		a.contentSelection.UpdateSelection(line, col)
@@ -2366,11 +2563,7 @@ func (a App) handleContentSelection(msg tea.MouseMsg, contentX, contentY int) (t
 	if msg.Action == tea.MouseActionRelease {
 		a.contentSelection.UpdateSelection(line, col)
 		a.contentSelection.EndSelection()
-		text := a.contentSelection.SelectedText()
-		if text != "" {
-			cmd = copyToClipboardCmd(text)
-		}
-		return a, cmd
+		return a, nil
 	}
 
 	return a, nil
@@ -2435,11 +2628,7 @@ func (a App) handleInputSelection(msg tea.MouseMsg, contentX, contentY int) (boo
 	if msg.Action == tea.MouseActionRelease {
 		a.inputSelection.UpdateSelection(line, col)
 		a.inputSelection.EndSelection()
-		text := a.inputSelection.SelectedText()
-		if text == "" {
-			return true, nil
-		}
-		return true, copyToClipboardCmd(text)
+		return true, nil
 	}
 
 	return true, nil
@@ -2507,8 +2696,7 @@ func (a App) renderCommandPalette(totalWidth int) string {
 	}
 	content := strings.Join(lines, "\n")
 	panel := commandPaletteStyle.Width(paletteWidth).Render(content)
-	padding := (totalWidth - paletteWidth) / 2
-	return padLeftLines(panel, padding)
+	return panel
 }
 
 func (a App) renderDirPrompt(totalWidth int) string {
@@ -2565,8 +2753,7 @@ func (a App) renderDirPrompt(totalWidth int) string {
 
 	content := strings.Join(lines, "\n")
 	panel := commandPaletteStyle.Width(promptWidth).Render(content)
-	padding := (totalWidth - promptWidth) / 2
-	return padLeftLines(panel, padding)
+	return panel
 }
 
 func (a App) renderDirPromptHeader(width int) string {
@@ -2716,7 +2903,7 @@ func (a App) modelPaletteItems() []paletteItem {
 }
 
 func (a App) agentPaletteItems() []paletteItem {
-	items := []paletteItem{{Label: "Agent", Action: paletteActionSelectAgent, Value: "agent"}}
+	items := []paletteItem{{Label: "Assistant", Action: paletteActionSelectAgent, Value: "assistant"}}
 	for _, team := range a.teams {
 		label := fmt.Sprintf("%s(Team)", team.Name)
 		items = append(items, paletteItem{Label: label, Action: paletteActionSelectAgent, Value: team.Name})
@@ -2758,13 +2945,13 @@ func (a App) sessionPaletteItems() []paletteItem {
 	return items
 }
 
-func (a App) teamByName(name string) (config.AgentTeamProfile, bool) {
+func (a App) teamByName(name string) (agent.TeamSummary, bool) {
 	for _, team := range a.teams {
 		if strings.EqualFold(team.Name, name) {
 			return team, true
 		}
 	}
-	return config.AgentTeamProfile{}, false
+	return agent.TeamSummary{}, false
 }
 
 func (a App) formatPaletteLine(label, desc string, width int) string {
@@ -2813,13 +3000,14 @@ func (a *App) layoutPanels() {
 		return
 	}
 
-	// Container frame: border adds to rendered size
+	// Container frame: no outer border, but keep the math generic for future padding.
 	containerFW, containerFH := containerStyle.GetFrameSize()
 	innerW := a.width - containerFW
 	if innerW < 20 {
 		innerW = 20
 	}
 	totalInner := a.height - containerFH // available lines inside container
+	containerXStart, containerYStart := containerInnerOrigin(containerStyle)
 
 	// Panel frame: border + padding
 	panelFW, panelFH := historyPaneStyle.GetFrameSize()
@@ -2866,13 +3054,27 @@ func (a *App) layoutPanels() {
 
 	// Status bar occupies one line outside input panel
 	a.statusHeight = 1
+	available := totalInner - a.statusHeight
+	minPanelRendered := panelFH + 1
+	if available < minPanelRendered {
+		available = minPanelRendered
+	}
+
+	twoColumn, leftW, rightW, leftContentW, rightContentW := computePanelWidths(innerW, panelFW, minContentW, minPanelW)
+	a.twoColumn = twoColumn
+	a.leftWidth = leftW
+	a.rightWidth = rightW
+	a.leftContentW = leftContentW
+	a.rightContentW = rightContentW
+	a.approvalInput.SetWidth(a.leftContentW)
+	a.askInput.SetWidth(a.leftContentW)
 
 	// Fixed input rendered height: content + frame
 	inputLines := InputLineCount(a.input)
 	if a.approvalInput.Active() {
-		inputLines = maxInt(inputLines, countLines(a.approvalInput.View(innerW)))
+		inputLines = maxInt(inputLines, countLines(a.approvalInput.View(a.leftContentW)))
 	} else if a.askInput.Active() {
-		inputLines = maxInt(inputLines, countLines(a.askInput.View(innerW)))
+		inputLines = maxInt(inputLines, countLines(a.askInput.View(a.leftContentW)))
 	}
 	extraLines := 1 + a.inputCwdLineCount()
 	inputAreaLines := inputLines + extraLines
@@ -2881,17 +3083,25 @@ func (a *App) layoutPanels() {
 		inputAreaLines = minInputArea
 	}
 	maxInputArea := maxInputLines + extraLines
+	if a.approvalInput.Active() || a.askInput.Active() {
+		maxInputRendered := available - minPanelRendered
+		if maxInputRendered < minPanelRendered {
+			maxInputRendered = minPanelRendered
+		}
+		maxInputHeight := maxInputRendered - panelFH
+		if maxInputHeight < 2 {
+			maxInputHeight = 2
+		}
+		maxInputArea = maxInputHeight - 1
+		if maxInputArea < minInputArea {
+			maxInputArea = minInputArea
+		}
+	}
 	if inputAreaLines > maxInputArea {
 		inputAreaLines = maxInputArea
 	}
 	a.inputHeight = inputAreaLines + 1
 	inputRendered := a.inputHeight + panelFH
-
-	available := totalInner - a.statusHeight
-	minPanelRendered := panelFH + 1
-	if available < minPanelRendered {
-		available = minPanelRendered
-	}
 	if inputRendered+minPanelRendered > available {
 		inputRendered = available - minPanelRendered
 		if inputRendered < minPanelRendered {
@@ -2908,30 +3118,6 @@ func (a *App) layoutPanels() {
 	}
 
 	if a.twoColumn {
-		leftW := innerW * 5 / 8
-		rightW := innerW - leftW
-		if leftW < minPanelW {
-			leftW = minPanelW
-			rightW = innerW - leftW
-		}
-		if rightW < minPanelW {
-			rightW = minPanelW
-			leftW = innerW - rightW
-		}
-		if leftW < minPanelW || rightW < minPanelW {
-			a.twoColumn = false
-		}
-		a.leftWidth = leftW
-		a.rightWidth = rightW
-		a.leftContentW = leftW - panelFW
-		a.rightContentW = rightW - panelFW
-		if a.leftContentW < minContentW {
-			a.leftContentW = minContentW
-		}
-		if a.rightContentW < minContentW {
-			a.rightContentW = minContentW
-		}
-
 		a.historyHeight = available - panelFH
 		a.middleHeight = outputRendered - panelFH
 		if a.historyHeight < 1 {
@@ -2956,15 +3142,15 @@ func (a *App) layoutPanels() {
 		}
 		a.input.SetHeight(inputWidgetHeight)
 
-		a.leftXStart = 1
+		a.leftXStart = containerXStart
 		a.leftXEnd = a.leftXStart + a.leftWidth - 1
 		a.rightXStart = a.leftXEnd + 1
 		a.rightXEnd = a.rightXStart + a.rightWidth - 1
-		a.contentYStart = 1
+		a.contentYStart = containerYStart
 		a.contentYEnd = a.contentYStart + outputRendered - 1
 		a.inputYStart = a.contentYEnd + 1
 		a.inputYEnd = a.inputYStart + inputRendered - 1
-		a.historyYStart = 1
+		a.historyYStart = containerYStart
 		a.historyYEnd = a.historyYStart + available - 1
 		a.updateInputPrompt()
 		return
@@ -2972,11 +3158,6 @@ func (a *App) layoutPanels() {
 
 	a.leftWidth = innerW
 	a.rightWidth = 0
-	a.leftContentW = innerW - panelFW
-	if a.leftContentW < minContentW {
-		a.leftContentW = minContentW
-	}
-	a.rightContentW = 0
 
 	availableVert := totalInner - inputRendered - a.statusHeight
 	if availableVert < panelFH*2+2 {
@@ -3014,11 +3195,11 @@ func (a *App) layoutPanels() {
 	}
 	a.input.SetHeight(inputWidgetHeight)
 
-	a.leftXStart = 1
-	a.leftXEnd = innerW
+	a.leftXStart = containerXStart
+	a.leftXEnd = a.leftXStart + a.leftWidth - 1
 	a.rightXStart = 0
 	a.rightXEnd = 0
-	y := 1
+	y := containerYStart
 	a.historyYStart = y
 	a.historyYEnd = y + historyRendered - 1
 	y += historyRendered
@@ -3030,6 +3211,47 @@ func (a *App) layoutPanels() {
 	a.inputYStart = y
 	a.inputYEnd = y + inputRendered - 1
 	a.updateInputPrompt()
+}
+
+func computePanelWidths(innerW, panelFW, minContentW, minPanelW int) (bool, int, int, int, int) {
+	twoColumn := innerW >= minPanelW*2
+	if !twoColumn {
+		leftW := innerW
+		leftContentW := leftW - panelFW
+		if leftContentW < minContentW {
+			leftContentW = minContentW
+		}
+		return false, leftW, 0, leftContentW, 0
+	}
+
+	leftW := innerW * 5 / 8
+	rightW := innerW - leftW
+	if leftW < minPanelW {
+		leftW = minPanelW
+		rightW = innerW - leftW
+	}
+	if rightW < minPanelW {
+		rightW = minPanelW
+		leftW = innerW - rightW
+	}
+	if leftW < minPanelW || rightW < minPanelW {
+		leftW = innerW
+		leftContentW := leftW - panelFW
+		if leftContentW < minContentW {
+			leftContentW = minContentW
+		}
+		return false, leftW, 0, leftContentW, 0
+	}
+
+	leftContentW := leftW - panelFW
+	rightContentW := rightW - panelFW
+	if leftContentW < minContentW {
+		leftContentW = minContentW
+	}
+	if rightContentW < minContentW {
+		rightContentW = minContentW
+	}
+	return true, leftW, rightW, leftContentW, rightContentW
 }
 
 func loadCommandsCmd(database *db.DB) tea.Cmd {
@@ -3082,9 +3304,9 @@ func loadSessionMessagesCmd(database *db.DB, sessionID string) tea.Cmd {
 	}
 }
 
-func createSessionCmd(database *db.DB, cwd string) tea.Cmd {
+func createSessionCmd(database *db.DB, cwd string, mode agent.Mode, teamName string) tea.Cmd {
 	return func() tea.Msg {
-		session, err := createSession(database, cwd)
+		session, err := createSession(database, cwd, mode, teamName)
 		if err != nil {
 			return sessionsErrorMsg{err: err}
 		}
@@ -3092,20 +3314,66 @@ func createSessionCmd(database *db.DB, cwd string) tea.Cmd {
 	}
 }
 
-func createMessageCmd(database *db.DB, sessionID, role, content string) tea.Cmd {
+func createTimelineMessagesCmd(database *db.DB, sessionID string, messages []AgentMessage) tea.Cmd {
 	return func() tea.Msg {
-		msg := &db.AgentMessage{
-			ID:        generateID(),
-			SessionID: sessionID,
-			Role:      role,
-			Content:   content,
-			CreatedAt: time.Now().UnixNano(),
-		}
-		if err := database.CreateAgentMessage(msg); err != nil {
-			return agentErrorMsg{err: err}
+		createdAt := time.Now().UnixNano()
+		persisted := normalizeTimelineMessagesForPersistence(messages)
+		for idx, message := range persisted {
+			metadataJSON, err := encodeTimelineMessageMetadata(message)
+			if err != nil {
+				return agentErrorMsg{err: err}
+			}
+			msg := &db.AgentMessage{
+				ID:           generateID(),
+				SessionID:    sessionID,
+				Role:         normalizeConversationRole(message.Role),
+				Content:      strings.TrimSpace(message.Content),
+				MetadataJSON: metadataJSON,
+				CreatedAt:    createdAt + int64(idx),
+			}
+			if err := database.CreateAgentMessage(msg); err != nil {
+				return agentErrorMsg{err: err}
+			}
 		}
 		return nil
 	}
+}
+
+func normalizeTimelineMessagesForPersistence(messages []AgentMessage) []AgentMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	result := make([]AgentMessage, 0, len(messages))
+	for _, message := range messages {
+		if !renderableTimelineMessage(message) {
+			continue
+		}
+		result = append(result, message)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func encodeTimelineMessageMetadata(message AgentMessage) (string, error) {
+	if message.ToolCall == nil {
+		return "", nil
+	}
+	toolCall := normalizeToolCall(*message.ToolCall)
+	metadata := db.AgentMessageMetadata{
+		ToolCalls: []db.AgentMessageToolCallMetadata{
+			{
+				CallID:    toolCall.CallID,
+				AgentName: toolCall.AgentName,
+				ToolName:  toolCall.ToolName,
+				Summary:   toolCall.Summary,
+				Result:    toolCall.Result,
+				State:     string(toolCall.State),
+			},
+		},
+	}
+	return db.EncodeAgentMessageMetadata(metadata)
 }
 
 func (a *App) enqueuePendingPrompt(content string, createdAt int64) error {
@@ -3171,17 +3439,105 @@ func (a *App) updatePendingPromptCount() error {
 	return a.db.WritePendingPromptsCount(config.PendingPromptsCountPath())
 }
 
-func createSession(database *db.DB, cwd string) (db.AgentSession, error) {
+func (a App) currentRuntimeMode() agent.Mode {
+	if a.agentMode == AgentModeTeam {
+		return agent.ModeTeam
+	}
+	return agent.ModeAssistant
+}
+
+func buildSessionSpecSnapshot(mode agent.Mode, teamName string) string {
+	if mode != agent.ModeTeam {
+		teamName = ""
+	}
+	payload := map[string]any{
+		"mode":      string(mode),
+		"team_name": strings.TrimSpace(teamName),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (a *App) updateActiveSessionRuntime() {
+	a.updateSessionRuntime(a.activeSessionID, a.currentRuntimeMode(), a.activeTeamName)
+}
+
+func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	if mode != agent.ModeTeam {
+		teamName = ""
+	}
+	teamName = strings.TrimSpace(teamName)
+	specSnapshot := buildSessionSpecSnapshot(mode, teamName)
+	for i := range a.sessions {
+		if a.sessions[i].ID != sessionID {
+			continue
+		}
+		a.sessions[i].Mode = string(mode)
+		a.sessions[i].TeamName = teamName
+		a.sessions[i].SpecSnapshotJSON = specSnapshot
+		break
+	}
+	if a.db == nil {
+		return
+	}
+	if err := a.db.UpdateAgentSessionRuntime(sessionID, string(mode), teamName, specSnapshot, time.Now().UnixNano()); err != nil {
+		if a.logger != nil {
+			a.logger.Warn("failed to update session runtime metadata", zap.Error(err))
+		}
+	}
+}
+
+func (a *App) applySessionRuntime(sessionID string) {
+	session, ok := a.sessionByID(sessionID)
+	if !ok {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(session.Mode), string(agent.ModeTeam)) {
+		a.agentMode = AgentModeTeam
+		a.activeTeamName = strings.TrimSpace(session.TeamName)
+		return
+	}
+	a.agentMode = AgentModeAgent
+}
+
+func (a App) sessionByID(sessionID string) (db.AgentSession, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return db.AgentSession{}, false
+	}
+	for _, session := range a.sessions {
+		if session.ID == sessionID {
+			return session, true
+		}
+	}
+	return db.AgentSession{}, false
+}
+
+func createSession(database *db.DB, cwd string, mode agent.Mode, teamName string) (db.AgentSession, error) {
 	if database == nil {
 		return db.AgentSession{}, fmt.Errorf("database is nil")
 	}
+	if mode != agent.ModeTeam {
+		teamName = ""
+	}
+	now := time.Now().UnixNano()
 	name := fmt.Sprintf("Session %s", time.Now().Format("2006-01-02 15:04"))
 	session := db.AgentSession{
-		ID:        generateID(),
-		Name:      name,
-		Cwd:       strings.TrimSpace(cwd),
-		CreatedAt: time.Now().UnixNano(),
-		UpdatedAt: time.Now().UnixNano(),
+		ID:               generateID(),
+		Name:             name,
+		Mode:             string(mode),
+		TeamName:         strings.TrimSpace(teamName),
+		SpecSnapshotJSON: buildSessionSpecSnapshot(mode, teamName),
+		Cwd:              strings.TrimSpace(cwd),
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 	if err := database.CreateAgentSession(&session); err != nil {
 		return db.AgentSession{}, err
@@ -3193,22 +3549,40 @@ func formatSessionMessages(messages []db.AgentMessage) []AgentMessage {
 	if len(messages) == 0 {
 		return nil
 	}
-	output := make([]AgentMessage, 0, len(messages))
+	output := make([]AgentMessage, 0, len(messages)*2)
 	for _, msg := range messages {
 		content := strings.TrimSpace(msg.Content)
+		metadata := db.ParseAgentMessageMetadata(msg)
+		role := normalizeConversationRole(msg.Role)
+		if role == "tool" {
+			if toolCall, ok := agentToolCallFromMessageMetadata(metadata); ok {
+				output = append(output, AgentMessage{Role: "tool", ToolCall: &toolCall})
+			}
+			continue
+		}
+		if len(metadata.ToolCalls) > 0 {
+			for _, toolCall := range agentToolCallsFromMessageMetadata(metadata) {
+				copyTool := toolCall
+				output = append(output, AgentMessage{Role: "tool", ToolCall: &copyTool})
+			}
+		}
 		if content == "" {
 			continue
 		}
-		output = append(output, AgentMessage{Role: msg.Role, Content: content})
+		output = append(output, AgentMessage{
+			Role:              role,
+			Content:           content,
+			CitedCommandCount: len(metadata.CitedCommands),
+		})
 	}
 	return output
 }
 
-func buildInputHistory(messages []db.AgentMessage) []string {
+func buildInputHistoryEntries(messages []db.AgentMessage) []InputHistoryEntry {
 	if len(messages) == 0 {
 		return nil
 	}
-	entries := make([]string, 0, len(messages))
+	entries := make([]InputHistoryEntry, 0, len(messages))
 	for _, msg := range messages {
 		if strings.TrimSpace(msg.Role) != "user" {
 			continue
@@ -3217,15 +3591,116 @@ func buildInputHistory(messages []db.AgentMessage) []string {
 		if value == "" {
 			continue
 		}
-		if len(entries) > 0 && entries[len(entries)-1] == value {
+		entry := InputHistoryEntry{
+			Value:           value,
+			CitedCommandIDs: db.ParseAgentMessageMetadata(msg).CommandIDs(),
+		}
+		if len(entries) > 0 && sameHistoryEntry(entries[len(entries)-1], entry) {
 			continue
 		}
-		entries = append(entries, value)
+		entries = append(entries, entry)
 	}
 	if len(entries) == 0 {
 		return nil
 	}
 	return entries
+}
+
+func agentCommandsFromMessageMetadata(metadata db.AgentMessageMetadata) []agent.Command {
+	if len(metadata.CitedCommands) == 0 {
+		return nil
+	}
+	commands := make([]agent.Command, 0, len(metadata.CitedCommands))
+	for _, cited := range metadata.CitedCommands {
+		if cited.ID == "" || strings.TrimSpace(cited.Command) == "" {
+			continue
+		}
+		commands = append(commands, agent.Command{
+			ID:                  cited.ID,
+			TsStart:             cited.TsStart,
+			TsEnd:               cited.TsEnd,
+			Command:             cited.Command,
+			Cwd:                 cited.Cwd,
+			ExitCode:            cited.ExitCode,
+			DurationMs:          cited.DurationMs,
+			OutputSize:          cited.OutputSize,
+			TranscriptAvailable: cited.TranscriptAvailable,
+		})
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	return commands
+}
+
+func agentToolCallsFromMessageMetadata(metadata db.AgentMessageMetadata) []AgentToolCall {
+	if len(metadata.ToolCalls) == 0 {
+		return nil
+	}
+	toolCalls := make([]AgentToolCall, 0, len(metadata.ToolCalls))
+	for _, toolCall := range metadata.ToolCalls {
+		if strings.TrimSpace(toolCall.ToolName) == "" {
+			continue
+		}
+		toolCalls = append(toolCalls, AgentToolCall{
+			CallID:    strings.TrimSpace(toolCall.CallID),
+			AgentName: strings.TrimSpace(toolCall.AgentName),
+			ToolName:  strings.TrimSpace(toolCall.ToolName),
+			Summary:   strings.TrimSpace(toolCall.Summary),
+			Result:    strings.TrimSpace(toolCall.Result),
+			State:     agent.ToolCallState(strings.TrimSpace(toolCall.State)),
+		})
+	}
+	if len(toolCalls) == 0 {
+		return nil
+	}
+	return toolCalls
+}
+
+func agentToolCallFromMessageMetadata(metadata db.AgentMessageMetadata) (AgentToolCall, bool) {
+	toolCalls := agentToolCallsFromMessageMetadata(metadata)
+	if len(toolCalls) == 0 {
+		return AgentToolCall{}, false
+	}
+	return toolCalls[0], true
+}
+
+func agentToolCallFromRuntime(toolCall agent.ToolCallEvent) AgentToolCall {
+	return AgentToolCall{
+		CallID:    strings.TrimSpace(toolCall.CallID),
+		AgentName: strings.TrimSpace(toolCall.AgentName),
+		ToolName:  strings.TrimSpace(toolCall.ToolName),
+		Summary:   strings.TrimSpace(toolCall.Summary),
+		Result:    strings.TrimSpace(toolCall.Result),
+		State:     toolCall.State,
+	}
+}
+
+func agentCommandsFromDBCommands(commands []db.Command) []agent.Command {
+	if len(commands) == 0 {
+		return nil
+	}
+	result := make([]agent.Command, 0, len(commands))
+	for _, cmd := range commands {
+		if strings.TrimSpace(cmd.ID) == "" || strings.TrimSpace(cmd.Command) == "" {
+			continue
+		}
+		result = append(result, agent.Command{
+			ID:                  cmd.ID,
+			TsStart:             cmd.TsStart,
+			TsEnd:               cmd.TsEnd,
+			Command:             cmd.Command,
+			Cwd:                 cmd.Cwd,
+			ExitCode:            cmd.ExitCode,
+			DurationMs:          cmd.DurationMs,
+			OutputSize:          cmd.OutputSize,
+			TranscriptAvailable: cmd.TranscriptPath != nil,
+		})
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (a *App) updateInputPrompt() {
@@ -3267,9 +3742,17 @@ func (a *App) setActiveSessionID(sessionID string) {
 	a.activeSessionID = sessionID
 	if sessionID == "" {
 		_ = os.Unsetenv("TERMIA_SESSION_ID")
+		a.history.ClearCited()
 		return
 	}
 	_ = os.Setenv("TERMIA_SESSION_ID", sessionID)
+}
+
+func (a *App) syncCitedCommandsFromInputHistory() {
+	a.history.SetCitedCommandIDs(a.input.CurrentHistoryCitedCommandIDs())
+	if a.ready {
+		a.layoutPanels()
+	}
 }
 
 func (a *App) setCwd(cwd string) {

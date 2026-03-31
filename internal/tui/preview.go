@@ -102,6 +102,17 @@ func (m PreviewModel) Update(msg tea.Msg) (PreviewModel, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *PreviewModel) Scroll(delta int) {
+	if !m.ready || delta == 0 {
+		return
+	}
+	if delta > 0 {
+		m.viewport.ScrollDown(delta)
+		return
+	}
+	m.viewport.ScrollUp(-delta)
+}
+
 // View renders the preview panel.
 func (m PreviewModel) View() string {
 	if !m.ready {

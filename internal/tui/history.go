@@ -77,6 +77,13 @@ func (m HistoryModel) SelectedIndex() int {
 	return m.selected
 }
 
+func (m HistoryModel) ScrollOffset() int {
+	if !m.ready {
+		return 0
+	}
+	return m.viewport.YOffset
+}
+
 // Commands returns the current command list.
 func (m HistoryModel) Commands() []db.Command {
 	return m.commands
@@ -117,6 +124,38 @@ func (m HistoryModel) IsCited(id string) bool {
 	return m.cited[id]
 }
 
+func (m HistoryModel) CitedCommandIDs() []string {
+	if len(m.cited) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(m.cited))
+	for _, cmd := range m.commands {
+		if m.cited[cmd.ID] {
+			ids = append(ids, cmd.ID)
+		}
+	}
+	return ids
+}
+
+func (m *HistoryModel) SetCitedCommandIDs(ids []string) {
+	m.cited = make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		m.cited[id] = true
+	}
+	m.refreshContent()
+}
+
+func (m *HistoryModel) ClearCited() {
+	if len(m.cited) == 0 {
+		return
+	}
+	m.cited = make(map[string]bool)
+	m.refreshContent()
+}
+
 // RemoveCommand removes a command by ID and adjusts selection.
 func (m *HistoryModel) RemoveCommand(id string) {
 	for i, cmd := range m.commands {
@@ -132,6 +171,43 @@ func (m *HistoryModel) RemoveCommand(id string) {
 		}
 	}
 	m.refreshContent()
+}
+
+func (m *HistoryModel) MoveSelection(delta int) {
+	if len(m.commands) == 0 || delta == 0 {
+		return
+	}
+	next := m.selected + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.commands) {
+		next = len(m.commands) - 1
+	}
+	if next == m.selected {
+		return
+	}
+	m.selected = next
+	m.refreshContent()
+	m.ensureVisible()
+}
+
+func (m *HistoryModel) SelectIndex(index int) {
+	if len(m.commands) == 0 {
+		return
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(m.commands) {
+		index = len(m.commands) - 1
+	}
+	if index == m.selected {
+		return
+	}
+	m.selected = index
+	m.refreshContent()
+	m.ensureVisible()
 }
 
 // UpdateCommand updates a command in the list (e.g., after toggling favorite).
@@ -250,7 +326,7 @@ func (m HistoryModel) renderRow(cmd db.Command, selected bool) string {
 	// Citation marker
 	citeMarker := ""
 	if m.cited[cmd.ID] {
-		citeMarker = citedMarkerStyle.Render("📎 ")
+		citeMarker = citedMarkerStyle.Render("✓ ")
 	}
 	citeWidth := lipgloss.Width(citeMarker)
 

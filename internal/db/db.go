@@ -70,7 +70,7 @@ func (d *DB) Conn() *sql.DB {
 
 // schemaVersion is bumped whenever schema.sql changes.
 // Migrate() skips execution if PRAGMA user_version already matches.
-const schemaVersion = 7
+const schemaVersion = 9
 
 // Migrate executes the embedded schema SQL to create or update database tables.
 // Uses PRAGMA user_version to skip re-execution on subsequent opens, which
@@ -97,6 +97,16 @@ func (d *DB) Migrate() error {
 	}
 	if currentVersion < 7 {
 		if err := d.ensurePendingPromptsColumns(); err != nil {
+			return err
+		}
+	}
+	if currentVersion < 8 {
+		if err := d.ensureAgentSessionRuntimeColumns(); err != nil {
+			return err
+		}
+	}
+	if currentVersion < 9 {
+		if err := d.ensureAgentMessageMetadataColumn(); err != nil {
 			return err
 		}
 	}
@@ -187,6 +197,83 @@ func (d *DB) ensurePendingPromptsColumns() error {
 		if _, err := d.conn.Exec("ALTER TABLE pending_prompts ADD COLUMN resolved_at INTEGER"); err != nil {
 			return fmt.Errorf("failed to add pending_prompts resolved_at: %w", err)
 		}
+	}
+	return nil
+}
+
+func (d *DB) ensureAgentSessionRuntimeColumns() error {
+	rows, err := d.conn.Query("PRAGMA table_info(agent_sessions)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect agent_sessions: %w", err)
+	}
+	defer rows.Close()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("failed to scan agent_sessions columns: %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read agent_sessions columns: %w", err)
+	}
+
+	if !existing["mode"] {
+		if _, err := d.conn.Exec("ALTER TABLE agent_sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'assistant'"); err != nil {
+			return fmt.Errorf("failed to add agent_sessions mode: %w", err)
+		}
+	}
+	if !existing["team_name"] {
+		if _, err := d.conn.Exec("ALTER TABLE agent_sessions ADD COLUMN team_name TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add agent_sessions team_name: %w", err)
+		}
+	}
+	if !existing["spec_snapshot_json"] {
+		if _, err := d.conn.Exec("ALTER TABLE agent_sessions ADD COLUMN spec_snapshot_json TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add agent_sessions spec_snapshot_json: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (d *DB) ensureAgentMessageMetadataColumn() error {
+	rows, err := d.conn.Query("PRAGMA table_info(agent_messages)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect agent_messages: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("failed to scan agent_messages columns: %w", err)
+		}
+		if name == "metadata_json" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read agent_messages columns: %w", err)
+	}
+	if _, err := d.conn.Exec("ALTER TABLE agent_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("failed to add agent_messages metadata_json: %w", err)
 	}
 	return nil
 }

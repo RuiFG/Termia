@@ -22,16 +22,17 @@ var (
 	colorSurface = lipgloss.AdaptiveColor{Light: "#F6F8FA", Dark: "#0D1117"}
 	// On surface (text on panels)
 	colorOnSurface = lipgloss.AdaptiveColor{Light: "#1F2328", Dark: "#E6EDF3"}
+	// Strong emphasis text
+	colorStrong = lipgloss.AdaptiveColor{Light: "#0F172A", Dark: "#F0F6FC"}
 	// Highlight (selected row bg)
 	colorHighlight = lipgloss.AdaptiveColor{Light: "#DDF4FF", Dark: "#161B22"}
 )
 
 // Layout styles.
 var (
-	// Main container — the outermost border.
-	containerStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorSubtle)
+	// Main container — intentionally borderless so the panes can sit flush
+	// against the terminal edges.
+	containerStyle = lipgloss.NewStyle()
 
 	// Panel styles (replacing tabs).
 	activePaneBorder = lipgloss.Border{
@@ -208,6 +209,107 @@ var (
 			Bold(true)
 	roleSeparatorStyle = lipgloss.NewStyle().
 				Foreground(colorSubtle)
+
+	conversationDividerStyle = lipgloss.NewStyle().
+					Foreground(colorSubtle)
+	userPromptPrefixStyle = lipgloss.NewStyle().
+				Foreground(colorSecondary).
+				Bold(true)
+	assistantBulletPrefixStyle = lipgloss.NewStyle().
+					Foreground(colorOnSurface).
+					Bold(true)
+	systemBulletPrefixStyle = lipgloss.NewStyle().
+				Foreground(colorWarning).
+				Bold(true)
+	errorBulletPrefixStyle = lipgloss.NewStyle().
+				Foreground(colorError).
+				Bold(true)
+	userBodyStyle = lipgloss.NewStyle().
+			Foreground(colorOnSurface)
+	assistantBodyStyle = lipgloss.NewStyle().
+				Foreground(colorOnSurface)
+	systemBodyStyle = lipgloss.NewStyle().
+			Foreground(colorWarning)
+	errorBodyStyle = lipgloss.NewStyle().
+			Foreground(colorError)
+	toolPendingStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+	toolSuccessStyle = lipgloss.NewStyle().
+				Foreground(colorSuccess)
+	toolErrorStyle = lipgloss.NewStyle().
+			Foreground(colorError)
+	strongTextStyle = lipgloss.NewStyle().
+			Foreground(colorStrong)
+	inlineCodeStyle = lipgloss.NewStyle().
+			Foreground(colorSecondary)
+	codeBlockStyle = lipgloss.NewStyle().
+			Foreground(colorSecondary)
+	quotePrefixStyle = lipgloss.NewStyle().
+				Foreground(colorWarning).
+				Bold(true)
+	quoteTextStyle = lipgloss.NewStyle().
+			Foreground(colorMuted).
+			Italic(true)
+	listBulletStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Bold(true)
+	listNumberStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Bold(true)
+	markdownHeading1Style = lipgloss.NewStyle().
+				Foreground(colorPrimary).
+				Bold(true)
+	markdownHeading2Style = lipgloss.NewStyle().
+				Foreground(colorSecondary).
+				Bold(true)
+	markdownHeading3Style = lipgloss.NewStyle().
+				Foreground(colorOnSurface).
+				Bold(true)
+	hitlTitleStyle = lipgloss.NewStyle().
+			Foreground(colorPrimary).
+			Bold(true)
+	hitlSubtitleStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+	hitlCommandStyle = lipgloss.NewStyle().
+				Foreground(colorSecondary)
+	hitlHintStyle = lipgloss.NewStyle().
+			Foreground(colorMuted)
+	hitlChoiceTitleStyle = lipgloss.NewStyle().
+				Foreground(colorOnSurface).
+				Bold(true)
+	hitlChoiceDescStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+	hitlChoiceFocusStyle = lipgloss.NewStyle().
+				Foreground(colorSecondary).
+				Bold(true)
+	hitlSelectedStyle = lipgloss.NewStyle().
+				Foreground(colorPrimary).
+				Bold(true)
+	hitlChoiceMarkerStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+	hitlChoiceFocusMarkerStyle = lipgloss.NewStyle().
+					Foreground(colorSecondary).
+					Bold(true)
+	hitlChoiceSelectedMarkerStyle = lipgloss.NewStyle().
+					Foreground(colorPrimary).
+					Bold(true)
+	hitlActionStyle = lipgloss.NewStyle().
+			Foreground(colorOnSurface).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorSubtle).
+			Padding(0, 1)
+	hitlActionFocusedStyle = hitlActionStyle.Copy().
+				Foreground(colorPrimary).
+				BorderForeground(colorPrimary).
+				Background(colorHighlight).
+				Bold(true)
+	hitlActionDangerStyle = hitlActionStyle.Copy().
+				Foreground(colorError)
+	hitlActionDangerFocusedStyle = hitlActionFocusedStyle.Copy().
+					Foreground(colorError)
+	hitlActionKeyStyle = lipgloss.NewStyle().
+				Foreground(colorMuted).
+				Bold(true)
 
 	dirPromptErrorStyle = lipgloss.NewStyle().
 				Foreground(colorError)

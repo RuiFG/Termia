@@ -1,13 +1,28 @@
 package tui
 
-import "github.com/termia/termia/internal/config"
+import (
+	"strings"
 
-func resolveTeams(agentCfg config.AgentTeamConfig) ([]config.AgentTeamProfile, string, []string) {
-	if len(agentCfg.Teams) > 0 {
-		first := agentCfg.Teams[0]
-		return agentCfg.Teams, first.Name, append([]string{}, first.Roles...)
+	"github.com/termia/termia/internal/agent"
+	"github.com/termia/termia/internal/config"
+)
+
+func resolveTeams(cfg *config.Config) ([]agent.TeamSummary, string) {
+	if cfg == nil {
+		return nil, ""
 	}
-	name := "default"
-	roles := append([]string{}, agentCfg.Roles...)
-	return []config.AgentTeamProfile{{Name: name, Roles: roles}}, name, roles
+	teams, err := agent.ListTeams(cfg)
+	if err != nil {
+		return nil, strings.TrimSpace(cfg.Agent.DefaultTeam)
+	}
+	active := strings.TrimSpace(cfg.Agent.DefaultTeam)
+	if active == "" {
+		return teams, ""
+	}
+	for _, team := range teams {
+		if strings.EqualFold(team.Name, active) {
+			return teams, team.Name
+		}
+	}
+	return teams, active
 }

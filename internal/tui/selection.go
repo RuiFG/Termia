@@ -4,6 +4,7 @@ import "strings"
 
 type textSelection struct {
 	lines       []string
+	renderLines []string
 	lineWidths  []int
 	selection   modalSelection
 	dragging    bool
@@ -16,10 +17,11 @@ type textSelection struct {
 }
 
 func (s *textSelection) SetLines(lines []string) {
-	if linesEqual(s.lines, lines) {
+	if linesEqual(s.lines, lines) && len(s.lineWidths) == len(lines) {
 		return
 	}
 	s.lines = lines
+	s.renderLines = nil
 	s.lineWidths = make([]int, len(lines))
 	for i := range lines {
 		s.lineWidths[i] = lineCellWidth(lines[i])
@@ -30,14 +32,33 @@ func (s *textSelection) SetLines(lines []string) {
 	s.cachedOk = false
 }
 
+func (s *textSelection) SetRenderLines(lines []string) {
+	if len(lines) != len(s.lines) {
+		s.renderLines = nil
+		s.cached = nil
+		s.cachedWidth = 0
+		s.cachedOk = false
+		return
+	}
+	if linesEqual(s.renderLines, lines) {
+		return
+	}
+	s.renderLines = append([]string(nil), lines...)
+	s.cached = nil
+	s.cachedWidth = 0
+	s.cachedOk = false
+}
+
 func (s *textSelection) Clear() {
+	s.lines = nil
+	s.renderLines = nil
+	s.lineWidths = nil
 	s.selection = modalSelection{}
 	s.dragging = false
 	s.lastDragPos = modalPos{}
 	s.cached = nil
 	s.cachedWidth = 0
 	s.cachedOk = false
-	s.lineWidths = nil
 }
 
 func (s *textSelection) BeginSelection(line, col int) {
@@ -106,7 +127,7 @@ func (s textSelection) HighlightLines(width int) []string {
 	if len(s.cached) != len(s.lines) || s.cachedWidth != width {
 		s.cached = make([]string, len(s.lines))
 		for i := range s.lines {
-			s.cached[i] = padToWidth(s.lines[i], width)
+			s.cached[i] = padToWidth(s.renderLine(i), width)
 		}
 		s.cachedWidth = width
 		s.cachedOk = false
@@ -114,7 +135,7 @@ func (s textSelection) HighlightLines(width int) []string {
 	if !s.HasSelection() {
 		if s.cachedOk {
 			for i := range s.lines {
-				s.cached[i] = padToWidth(s.lines[i], width)
+				s.cached[i] = padToWidth(s.renderLine(i), width)
 			}
 			s.cachedOk = false
 		}
@@ -137,13 +158,20 @@ func (s textSelection) HighlightLines(width int) []string {
 	toLine = clamp(toLine, 0, len(s.lines)-1)
 	for i := fromLine; i <= toLine; i++ {
 		startCol, endCol, has := s.selectionForLine(i)
-		s.cached[i] = highlightLineRangeWithWidth(s.lines[i], s.lineWidths[i], startCol, endCol, has)
+		s.cached[i] = highlightLineRangeWithWidth(s.renderLine(i), s.lineWidths[i], startCol, endCol, has)
 		s.cached[i] = padToWidth(s.cached[i], width)
 	}
 	s.cachedStart = start
 	s.cachedEnd = end
 	s.cachedOk = true
 	return s.cached
+}
+
+func (s textSelection) renderLine(i int) string {
+	if i >= 0 && i < len(s.renderLines) {
+		return s.renderLines[i]
+	}
+	return s.lines[i]
 }
 
 func (s textSelection) selectionRange() (modalPos, modalPos, bool) {

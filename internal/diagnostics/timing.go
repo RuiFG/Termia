@@ -24,7 +24,7 @@ func Track(step string, fields map[string]string) func() {
 	start := time.Now()
 	return func() {
 		elapsedMs := time.Since(start).Milliseconds()
-		logPath := filepath.Join(os.TempDir(), "termia-startup-timing.log")
+		logPath := timingLogPath()
 
 		timingMutex.Lock()
 		defer timingMutex.Unlock()
@@ -52,4 +52,17 @@ func Track(step string, fields map[string]string) func() {
 
 		fmt.Fprintln(file)
 	}
+}
+
+func timingLogPath() string {
+	return filepath.Join(timingTempDir(), "termia-startup-timing.log")
+}
+
+func timingTempDir() string {
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return os.TempDir()
 }

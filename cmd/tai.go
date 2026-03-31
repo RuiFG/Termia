@@ -58,7 +58,7 @@ func init() {
 		&taiHistoryMode,
 		"history-mode",
 		"H",
-		"all",
+		"cmd",
 		"history mode: cmd|ai|all",
 	)
 	taiCmd.Flags().StringVar(
@@ -221,14 +221,9 @@ func resolveTaiHistory(cmd *cobra.Command, database *db.DB) ([]db.Command, error
 		return nil, fmt.Errorf("failed to fetch commands: %w", err)
 	}
 
-	mode := strings.ToLower(strings.TrimSpace(taiHistoryMode))
-	if mode == "" {
-		mode = "all"
-	}
-	switch mode {
-	case "cmd", "ai", "all":
-	default:
-		return nil, fmt.Errorf("invalid history mode: %s", taiMode)
+	mode, err := normalizeTaiHistoryMode(taiHistoryMode)
+	if err != nil {
+		return nil, err
 	}
 
 	filtered := filterTaiHistory(commands, mode)
@@ -237,6 +232,19 @@ func resolveTaiHistory(cmd *cobra.Command, database *db.DB) ([]db.Command, error
 	}
 	reverseCommands(filtered)
 	return filtered, nil
+}
+
+func normalizeTaiHistoryMode(mode string) (string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return "cmd", nil
+	}
+	switch mode {
+	case "cmd", "ai", "all":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid history mode: %s", mode)
+	}
 }
 
 func filterTaiHistory(commands []db.Command, mode string) []db.Command {

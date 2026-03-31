@@ -2,7 +2,6 @@ package diagnostics
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -36,7 +35,7 @@ func TestTimingEnabled(t *testing.T) {
 	done := Track("test", nil)
 	done()
 
-	logPath := filepath.Join(os.TempDir(), "termia-startup-timing.log")
+	logPath := timingLogPath()
 	contents, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read log: %v", err)
@@ -76,7 +75,7 @@ func TestTimingDisabled(t *testing.T) {
 	done := Track("disabled", nil)
 	done()
 
-	logPath := filepath.Join(os.TempDir(), "termia-startup-timing.log")
+	logPath := timingLogPath()
 	if _, err := os.Stat(logPath); err == nil {
 		t.Fatalf("expected no log file, but it exists")
 	} else if !os.IsNotExist(err) {

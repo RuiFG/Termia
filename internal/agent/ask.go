@@ -3,15 +3,14 @@ package agent
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cloudwego/eino/components/tool"
+	toolutils "github.com/cloudwego/eino/components/tool/utils"
 	"golang.org/x/term"
-	adktool "google.golang.org/adk/tool"
-	"google.golang.org/adk/tool/functiontool"
 )
 
 type InputToolReq struct {
@@ -21,67 +20,49 @@ type InputToolReq struct {
 type InputToolRsp struct {
 	Answers   []AskAnswer `json:"answers,omitempty"`
 	Cancelled bool        `json:"cancelled,omitempty"`
-	Pending   bool        `json:"pending,omitempty"`
+	Reason    string      `json:"reason,omitempty"`
+	Message   string      `json:"message,omitempty"`
 }
 
-type inputFormPayload struct {
-	Questions []AskQuestion `json:"questions"`
-}
+func NewInputTool() (tool.BaseTool, error) {
+	return toolutils.InferTool("request_input", "Ask the user to confirm, choose, or provide structured input.", func(ctx context.Context, req InputToolReq) (*InputToolRsp, error) {
+		if len(req.Questions) == 0 {
+			return nil, fmt.Errorf("at least one question is required")
+		}
 
-func NewInputTool() (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:        "request_input",
-			Description: "Ask the user to confirm, choose, or provide structured input.",
-		},
-		func(tc adktool.Context, req *InputToolReq) (*InputToolRsp, error) {
-			if len(req.Questions) == 0 {
-				return nil, fmt.Errorf("at least one question is required")
-			}
-
-			normalized := make([]AskQuestion, 0, len(req.Questions))
-			for _, question := range req.Questions {
-				norm, err := NormalizeAskQuestion(question)
-				if err != nil {
-					return nil, err
-				}
-				normalized = append(normalized, norm)
-			}
-
-			if confirmation := tc.ToolConfirmation(); confirmation != nil {
-				if !confirmation.Confirmed {
-					return &InputToolRsp{Cancelled: true}, nil
-				}
-				answers, err := parseInputAnswersPayload(confirmation.Payload)
-				if err != nil {
-					return nil, err
-				}
-				return &InputToolRsp{Answers: answers}, nil
-			}
-
-			if err := tc.RequestConfirmation("User input required.", inputFormPayload{Questions: normalized}); err != nil {
+		normalized := make([]AskQuestion, 0, len(req.Questions))
+		for _, question := range req.Questions {
+			norm, err := NormalizeAskQuestion(question)
+			if err != nil {
 				return nil, err
 			}
-			return &InputToolRsp{Pending: true}, nil
-		},
-	)
-}
+			normalized = append(normalized, norm)
+		}
 
-func parseInputAnswersPayload(payload any) ([]AskAnswer, error) {
-	if payload == nil {
-		return nil, fmt.Errorf("input payload is empty")
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-	var body struct {
-		Answers []AskAnswer `json:"answers"`
-	}
-	if err := json.Unmarshal(data, &body); err != nil {
-		return nil, err
-	}
-	return body.Answers, nil
+		info := &hitlInterruptInfo{
+			Kind:         HITLKindInputForm,
+			Title:        "Input Required",
+			Prompt:       "User input required.",
+			OriginalTool: "request_input",
+			Questions:    normalized,
+		}
+
+		response, ok, err := resumeHITLResponse[hitlResumeData](ctx, info)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, tool.Interrupt(ctx, info)
+		}
+		if !response.Confirmed {
+			return &InputToolRsp{
+				Cancelled: true,
+				Reason:    "User declined to provide input.",
+				Message:   "Ask the user for an alternative if needed.",
+			}, nil
+		}
+		return &InputToolRsp{Answers: response.Answers}, nil
+	})
 }
 
 func NormalizeAskQuestion(question AskQuestion) (AskQuestion, error) {
@@ -581,21 +562,6 @@ func renderCLIInteractiveQuestion(state *cliAskState) string {
 		if state.question.Multiple {
 			hint = "↑/↓ move  Space toggle  Enter submit"
 		}
-		if state.currentIsCustom() {
-			if state.question.Multiple {
-				if state.hasCustom() {
-					hint = "↑/↓ move  Space toggle custom  Tab edit custom  Enter submit"
-				} else {
-					hint = "↑/↓ move  Tab edit custom  Enter submit"
-				}
-			} else {
-				if state.hasCustom() {
-					hint = "↑/↓ move  Tab edit custom  Enter confirm"
-				} else {
-					hint = "↑/↓ move  Tab edit custom"
-				}
-			}
-		}
 		lines = append(lines, cliSubtitleStyle.Render(hint))
 	}
 	return strings.Join(lines, "\n")
@@ -623,7 +589,14 @@ func renderCLIInteractiveOption(state *cliAskState, index int, option AskOption)
 		title += " " + cliDescStyle.Render("("+strings.Join(state.customTexts, ", ")+")")
 	}
 	parts = append(parts, title)
-	if desc := strings.TrimSpace(option.Description); desc != "" {
+	desc := strings.TrimSpace(option.Description)
+	if strings.EqualFold(option.Title, AskTypeYourAnswerTitle) {
+		desc = ""
+		if index == state.cursor && !state.customActive {
+			desc = "Tab edit custom"
+		}
+	}
+	if desc != "" {
 		parts = append(parts, " "+cliDescStyle.Render(desc))
 	}
 	return strings.Join(parts, "")
@@ -653,6 +626,9 @@ func renderCLIQuestion(question AskQuestion) {
 
 func renderCLIOption(index int, option AskOption) string {
 	title := fmt.Sprintf("  [%d] %s", index+1, option.Title)
+	if strings.EqualFold(option.Title, AskTypeYourAnswerTitle) {
+		return title
+	}
 	if desc := strings.TrimSpace(option.Description); desc != "" {
 		return title + " " + cliDescStyle.Render(desc)
 	}

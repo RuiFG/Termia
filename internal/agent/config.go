@@ -61,15 +61,12 @@ func DefaultModelSpecFromConfig(llmCfg *config.LLMConfig) (ModelSpec, error) {
 	switch provider {
 	case "openai":
 		return modelSpecFromProviderConfig("openai", llmCfg.OpenAI)
+	case "anthropic", "claude":
+		return modelSpecFromProviderConfig("anthropic", llmCfg.Anthropic)
 	case "deepseek":
 		return modelSpecFromProviderConfig("deepseek", llmCfg.DeepSeek)
 	case "ollama":
 		return modelSpecFromProviderConfig("ollama", llmCfg.Ollama)
-	case "gemini", "google":
-		return modelSpecFromProviderConfig("gemini", config.LLMProviderConfig{
-			APIKeyEnv: "GOOGLE_API_KEY",
-			Model:     "gemini-2.5-flash",
-		})
 	default:
 		return ModelSpec{}, fmt.Errorf("unsupported default provider %q", provider)
 	}

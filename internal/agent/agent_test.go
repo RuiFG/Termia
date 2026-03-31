@@ -3,59 +3,46 @@ package agent
 import (
 	"testing"
 
-	"google.golang.org/adk/session"
-	"google.golang.org/genai"
+	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/schema"
 )
 
-func TestBuildConfirmationResponseContentAddsRejectedPayload(t *testing.T) {
-	content := buildConfirmationResponseContent(HITLRequest{
-		FunctionCallID: "call-1",
-		OriginalTool:   "command",
-		Command:        "pwd",
-	}, HITLResponse{Confirmed: false})
-	if content == nil || len(content.Parts) != 1 || content.Parts[0] == nil || content.Parts[0].FunctionResponse == nil {
-		t.Fatalf("expected tool confirmation content, got %#v", content)
-	}
-	response := content.Parts[0].FunctionResponse.Response
-	payload, ok := response["payload"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected payload map, got %#v", response["payload"])
-	}
-	if payload["status"] != "rejected" {
-		t.Fatalf("expected rejected status, got %#v", payload)
-	}
-	if payload["command"] != "pwd" {
-		t.Fatalf("expected rejected payload to include command, got %#v", payload)
-	}
-	if payload["original_tool"] != "command" {
-		t.Fatalf("expected rejected payload to include original tool, got %#v", payload)
-	}
-	if response["confirmed"] != false {
-		t.Fatalf("expected confirmed=false, got %#v", response["confirmed"])
-	}
-}
-
-func TestExtractToolResultEventsCapturesCommandFailure(t *testing.T) {
-	event := &session.Event{
-		Author:      "assistant",
-		LLMResponse: session.Event{}.LLMResponse,
-	}
-	event.Content = &genai.Content{
-		Parts: []*genai.Part{
-			{
-				FunctionResponse: &genai.FunctionResponse{
-					Name: "command",
-					ID:   "call-1",
-					Response: map[string]any{
-						"command":   "pwd",
-						"exit_code": float64(1),
+func TestParseHITLRequestFromInterruptEvent(t *testing.T) {
+	event := &adk.AgentEvent{
+		Action: &adk.AgentAction{
+			Interrupted: &adk.InterruptInfo{
+				InterruptContexts: []*adk.InterruptCtx{{
+					ID:          "agent:assistant;tool:command",
+					IsRootCause: true,
+					Info: &hitlInterruptInfo{
+						Kind:         HITLKindConfirm,
+						Title:        "Confirmation Required",
+						Prompt:       "Approval required.",
+						OriginalTool: "command",
+						Command:      "pwd",
+						Cwd:          "/tmp/project",
 					},
-				},
+				}},
 			},
 		},
 	}
 
-	results := extractToolResultEvents(event)
+	request, ok := parseHITLRequest(event)
+	if !ok {
+		t.Fatal("expected HITL request to be extracted")
+	}
+	if request.ID != "agent:assistant;tool:command" {
+		t.Fatalf("unexpected request id %q", request.ID)
+	}
+	if request.OriginalTool != "command" || request.Command != "pwd" {
+		t.Fatalf("unexpected request payload %#v", request)
+	}
+}
+
+func TestExtractToolResultEventsCapturesCommandFailure(t *testing.T) {
+	msg := schema.ToolMessage(`{"command":"pwd","exit_code":1}`, "call-1", schema.WithToolName("command"))
+
+	results := extractToolResultEvents("assistant", msg)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 tool result, got %#v", results)
 	}

@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -12,10 +13,11 @@ import (
 	"strings"
 	"time"
 
+	einoadk "github.com/cloudwego/eino/adk"
+	einotool "github.com/cloudwego/eino/components/tool"
+	toolutils "github.com/cloudwego/eino/components/tool/utils"
 	"github.com/google/uuid"
 	"github.com/termia/termia/internal/db"
-	adktool "google.golang.org/adk/tool"
-	"google.golang.org/adk/tool/functiontool"
 )
 
 type CommandDB interface {
@@ -37,6 +39,11 @@ type CommandToolRsp struct {
 	Stdout     string `json:"stdout"`
 	Stderr     string `json:"stderr"`
 	ExitCode   int    `json:"exit_code"`
+	Decision   string `json:"decision,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Message    string `json:"message,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 const (
@@ -46,44 +53,65 @@ const (
 	commandCwdModeOverride = "override"
 )
 
-func NewCommandTool(database CommandDB) (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:                "command",
-			Description:         "Execute a shell command. By default it runs in the session's current working directory. Use cwd_mode=override with cwd only for an explicit one-off directory override.",
-			RequireConfirmation: true,
-		},
-		func(tc adktool.Context, req *CommandToolReq) (*CommandToolRsp, error) {
-			cmdLine := strings.TrimSpace(req.Command)
-			if cmdLine == "" {
-				return nil, fmt.Errorf("command is required")
-			}
-			cwd := strings.TrimSpace(req.Cwd)
-			cwdMode := normalizeCommandCwdMode(req.CwdMode)
-			stdout, stderr, exitCode, currentCwd, cwdChanged, err := executeCommand(tc, cmdLine, cwd, cwdMode, database)
+func NewCommandTool(database CommandDB, state *runtimeState, requireConfirmation bool) (einotool.BaseTool, error) {
+	return toolutils.InferTool("command", "Execute a shell command. By default it runs in the session's current working directory. Use cwd_mode=override with cwd only for an explicit one-off directory override.", func(ctx context.Context, req CommandToolReq) (*CommandToolRsp, error) {
+		cmdLine := strings.TrimSpace(req.Command)
+		if cmdLine == "" {
+			return nil, fmt.Errorf("command is required")
+		}
+
+		cwd := strings.TrimSpace(req.Cwd)
+		cwdMode := normalizeCommandCwdMode(req.CwdMode)
+		currentCwd := resolveCommandCwd(ctx, state, cwd, cwdMode)
+
+		info := &hitlInterruptInfo{
+			Kind:         HITLKindConfirm,
+			Title:        "Confirmation Required",
+			Prompt:       "Approval required.",
+			OriginalTool: "command",
+			Command:      cmdLine,
+			Cwd:          currentCwd,
+		}
+
+		if requireConfirmation {
+			response, ok, err := resumeHITLResponse[hitlResumeData](ctx, info)
 			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, einotool.Interrupt(ctx, info)
+			}
+			if !response.Confirmed {
 				return &CommandToolRsp{
-					Command:    cmdLine,
-					Cwd:        currentCwd,
-					CwdChanged: cwdChanged,
-					Stdout:     stdout,
-					Stderr:     stderr,
-					ExitCode:   exitCode,
+					Command:  cmdLine,
+					Cwd:      currentCwd,
+					ExitCode: 1,
+					Decision: "rejected",
+					Status:   "rejected",
+					Reason:   "User rejected this tool call.",
+					Message:  "Do not execute the tool. Ask the user for an alternative if needed.",
+					Error:    "user rejected this tool call",
 				}, nil
 			}
-			return &CommandToolRsp{
-				Command:    cmdLine,
-				Cwd:        currentCwd,
-				CwdChanged: cwdChanged,
-				Stdout:     stdout,
-				Stderr:     stderr,
-				ExitCode:   exitCode,
-			}, nil
-		},
-	)
+		}
+
+		stdout, stderr, exitCode, resolvedCwd, cwdChanged, err := executeCommand(ctx, state, cmdLine, cwd, cwdMode, database)
+		result := &CommandToolRsp{
+			Command:    cmdLine,
+			Cwd:        resolvedCwd,
+			CwdChanged: cwdChanged,
+			Stdout:     stdout,
+			Stderr:     stderr,
+			ExitCode:   exitCode,
+		}
+		if err != nil {
+			result.Error = err.Error()
+		}
+		return result, nil
+	})
 }
 
-func executeCommand(ctx adktool.Context, command, cwd, cwdMode string, database CommandDB) (string, string, int, string, bool, error) {
+func executeCommand(ctx context.Context, state *runtimeState, command, cwd, cwdMode string, database CommandDB) (string, string, int, string, bool, error) {
 	shellFlag := "-lc"
 	shellPath := strings.TrimSpace(os.Getenv("TERMIA_SHELL"))
 	if shellPath == "" {
@@ -95,7 +123,7 @@ func executeCommand(ctx adktool.Context, command, cwd, cwdMode string, database 
 
 	cmdID := uuid.New().String()
 	tsStart := time.Now().UnixNano()
-	resolvedCwd := resolveCommandCwd(ctx, cwd, cwdMode)
+	resolvedCwd := resolveCommandCwd(ctx, state, cwd, cwdMode)
 	var startOffset int64
 
 	if database != nil {
@@ -108,12 +136,12 @@ func executeCommand(ctx adktool.Context, command, cwd, cwdMode string, database 
 		})
 	}
 
-	if _, err := rememberCommandCwd(ctx, resolvedCwd, false); err != nil {
+	if _, err := rememberCommandCwd(ctx, state, resolvedCwd, false); err != nil {
 		return "", "", 1, resolvedCwd, false, err
 	}
 
 	if cdReq, ok := parseDirectoryChangeCommand(command); ok {
-		targetCwd, stdout, err := applyDirectoryChange(ctx, resolvedCwd, cdReq)
+		targetCwd, stdout, err := applyDirectoryChange(ctx, state, resolvedCwd, cdReq)
 		tsEnd := time.Now().UnixNano()
 		if database != nil {
 			_ = database.UpdateCommandEnd(cmdID, tsEnd, 0, 0, 0, nil)
@@ -228,12 +256,12 @@ func parseDirectoryChangeCommand(command string) (directoryChangeRequest, bool) 
 	return directoryChangeRequest{RawTarget: strings.TrimSpace(strings.TrimPrefix(trimmed, "cd"))}, true
 }
 
-func applyDirectoryChange(ctx adktool.Context, currentCwd string, req directoryChangeRequest) (string, string, error) {
-	target, err := resolveDirectoryChangeTarget(ctx, currentCwd, req.RawTarget)
+func applyDirectoryChange(ctx context.Context, state *runtimeState, currentCwd string, req directoryChangeRequest) (string, string, error) {
+	target, err := resolveDirectoryChangeTarget(ctx, state, currentCwd, req.RawTarget)
 	if err != nil {
 		return currentCwd, "", err
 	}
-	if _, err := rememberCommandCwd(ctx, target, true); err != nil {
+	if _, err := rememberCommandCwd(ctx, state, target, true); err != nil {
 		return currentCwd, "", err
 	}
 	stdout := ""
@@ -243,7 +271,7 @@ func applyDirectoryChange(ctx adktool.Context, currentCwd string, req directoryC
 	return target, stdout, nil
 }
 
-func resolveDirectoryChangeTarget(ctx adktool.Context, currentCwd, target string) (string, error) {
+func resolveDirectoryChangeTarget(ctx context.Context, state *runtimeState, currentCwd, target string) (string, error) {
 	target = strings.TrimSpace(target)
 	target = strings.Trim(target, `"'`)
 	if target == "" || target == "~" {
@@ -254,7 +282,7 @@ func resolveDirectoryChangeTarget(ctx adktool.Context, currentCwd, target string
 		return ensureDirectory(home)
 	}
 	if target == "-" {
-		previous := strings.TrimSpace(readCommandStateString(ctx, commandStatePrevCwdKey))
+		previous := strings.TrimSpace(readCommandStateString(ctx, state, commandStatePrevCwdKey))
 		if previous == "" {
 			if envPrev := strings.TrimSpace(os.Getenv("OLDPWD")); envPrev != "" {
 				return ensureDirectory(envPrev)
@@ -296,8 +324,8 @@ func ensureDirectory(path string) (string, error) {
 	return path, nil
 }
 
-func resolveCommandCwd(ctx adktool.Context, fallback, mode string) string {
-	if cwd := effectiveCommandCwd(readCommandStateString(ctx, commandStateCwdKey), fallback, mode); cwd != "" {
+func resolveCommandCwd(ctx context.Context, state *runtimeState, fallback, mode string) string {
+	if cwd := effectiveCommandCwd(readCommandStateString(ctx, state, commandStateCwdKey), fallback, mode); cwd != "" {
 		return cwd
 	}
 	if wd, err := os.Getwd(); err == nil {
@@ -328,36 +356,38 @@ func normalizeCommandCwdMode(mode string) string {
 	}
 }
 
-func rememberCommandCwd(ctx adktool.Context, cwd string, changed bool) (string, error) {
+func rememberCommandCwd(ctx context.Context, state *runtimeState, cwd string, changed bool) (string, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
 		return "", nil
 	}
 	if !changed {
-		if existing := strings.TrimSpace(readCommandStateString(ctx, commandStateCwdKey)); existing != "" {
+		if existing := strings.TrimSpace(readCommandStateString(ctx, state, commandStateCwdKey)); existing != "" {
 			return existing, nil
 		}
 	}
 	if changed {
-		previous := strings.TrimSpace(readCommandStateString(ctx, commandStateCwdKey))
+		previous := strings.TrimSpace(readCommandStateString(ctx, state, commandStateCwdKey))
 		if previous != "" && previous != cwd {
-			if err := ctx.State().Set(commandStatePrevCwdKey, previous); err != nil {
-				return "", err
+			einoadk.AddSessionValue(ctx, commandStatePrevCwdKey, previous)
+			if state != nil {
+				state.set(commandStatePrevCwdKey, previous)
 			}
 		}
 	}
-	if err := ctx.State().Set(commandStateCwdKey, cwd); err != nil {
-		return "", err
+	einoadk.AddSessionValue(ctx, commandStateCwdKey, cwd)
+	if state != nil {
+		state.set(commandStateCwdKey, cwd)
 	}
 	return cwd, nil
 }
 
-func readCommandStateString(ctx adktool.Context, key string) string {
-	if ctx == nil {
-		return ""
+func readCommandStateString(ctx context.Context, state *runtimeState, key string) string {
+	value, ok := einoadk.GetSessionValue(ctx, key)
+	if (!ok || value == nil) && state != nil {
+		value, ok = state.get(key)
 	}
-	value, err := ctx.State().Get(key)
-	if err != nil || value == nil {
+	if !ok {
 		return ""
 	}
 	text, ok := value.(string)

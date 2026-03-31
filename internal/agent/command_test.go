@@ -3,8 +3,7 @@ package agent
 import (
 	"testing"
 
-	"google.golang.org/adk/session"
-	"google.golang.org/genai"
+	"github.com/cloudwego/eino/schema"
 )
 
 func TestParseDirectoryChangeCommand(t *testing.T) {
@@ -22,22 +21,9 @@ func TestParseDirectoryChangeCommand(t *testing.T) {
 }
 
 func TestExtractCommandCwdEvent(t *testing.T) {
-	event := &session.Event{
-		LLMResponse: session.Event{}.LLMResponse,
-	}
-	event.Content = &genai.Content{
-		Parts: []*genai.Part{{
-			FunctionResponse: &genai.FunctionResponse{
-				Name: "command",
-				Response: map[string]any{
-					"cwd":         "/tmp/project",
-					"cwd_changed": true,
-				},
-			},
-		}},
-	}
+	msg := schema.ToolMessage(`{"cwd":"/tmp/project","cwd_changed":true}`, "call-1", schema.WithToolName("command"))
 
-	cwd, ok := extractCommandCwdEvent(event)
+	cwd, ok := extractCommandCwdEvent(msg)
 	if !ok {
 		t.Fatal("expected cwd event to be extracted")
 	}

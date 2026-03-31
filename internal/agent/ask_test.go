@@ -135,8 +135,14 @@ func TestRenderCLIInteractiveQuestionHidesSubmitHintOnCustomMultiSelect(t *testi
 	if !strings.Contains(rendered, "Enter submit") {
 		t.Fatalf("expected custom-focused multi-select hint to keep submit on enter, got %q", rendered)
 	}
-	if !strings.Contains(rendered, "Tab edit custom") {
-		t.Fatalf("expected custom-focused multi-select hint to show tab edit action, got %q", rendered)
+	if !strings.Contains(rendered, "Space toggle  Enter submit") {
+		t.Fatalf("expected custom-focused multi-select hint to stay generic, got %q", rendered)
+	}
+	if strings.Contains(rendered, "Space toggle custom") {
+		t.Fatalf("expected custom-focused multi-select hint to avoid custom-only submit copy, got %q", rendered)
+	}
+	if strings.Contains(rendered, "\nTab edit custom\n") {
+		t.Fatalf("expected tab edit hint to move into the custom option row, got %q", rendered)
 	}
 }
 
@@ -216,8 +222,54 @@ func TestRenderCLIInteractiveQuestionShowsSubmitHintForSelectedCustomMultiSelect
 	if !strings.Contains(rendered, "Enter submit") {
 		t.Fatalf("expected selected custom option to allow submit, got %q", rendered)
 	}
+	if !strings.Contains(rendered, "Space toggle  Enter submit") {
+		t.Fatalf("expected selected custom option to keep the generic multi-select hint, got %q", rendered)
+	}
+	if strings.Contains(rendered, "Space toggle custom") {
+		t.Fatalf("expected selected custom option to avoid custom-only submit copy, got %q", rendered)
+	}
+	if strings.Contains(rendered, "\nTab edit custom\n") {
+		t.Fatalf("expected tab edit hint to stay on the custom option row, got %q", rendered)
+	}
+}
+
+func TestRenderCLIInteractiveOptionShowsTabEditHintOnFocusedCustomOption(t *testing.T) {
+	state := newCLIAskState(AskQuestion{
+		Header:   "Question",
+		Question: "Choose one",
+		Options: []AskOption{
+			{Title: "Alpha"},
+			{Title: AskTypeYourAnswerTitle, Description: AskTypeYourAnswerDesc},
+		},
+	})
+	state.cursor = 1
+
+	rendered := renderCLIInteractiveOption(state, 1, state.question.Options[1])
 	if !strings.Contains(rendered, "Tab edit custom") {
-		t.Fatalf("expected selected custom option to keep edit hint on tab, got %q", rendered)
+		t.Fatalf("expected focused custom option to show tab edit hint inline, got %q", rendered)
+	}
+	if strings.Contains(rendered, AskTypeYourAnswerDesc) {
+		t.Fatalf("expected focused custom option to hide default description, got %q", rendered)
+	}
+}
+
+func TestRenderCLIInteractiveQuestionKeepsGenericHintOnFocusedSingleCustom(t *testing.T) {
+	state := newCLIAskState(AskQuestion{
+		Header:   "Question",
+		Question: "Choose one",
+		Options: []AskOption{
+			{Title: "Alpha"},
+			{Title: AskTypeYourAnswerTitle, Description: AskTypeYourAnswerDesc},
+		},
+	})
+	state.cursor = 1
+
+	rendered := renderCLIInteractiveQuestion(state)
+	if !strings.Contains(rendered, "↑/↓ move  Enter confirm") {
+		t.Fatalf("expected focused single custom option to keep generic confirm hint, got %q", rendered)
+	}
+	if strings.Contains(rendered, "\nTab edit custom\n") {
+		t.Fatalf("expected tab edit hint to stay on the custom option row, got %q", rendered)
 	}
 }
 

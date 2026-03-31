@@ -1,13 +1,14 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
 
-	adktool "google.golang.org/adk/tool"
-	"google.golang.org/adk/tool/functiontool"
+	"github.com/cloudwego/eino/components/tool"
+	toolutils "github.com/cloudwego/eino/components/tool/utils"
 )
 
 type InspectCommandOutputReq struct {
@@ -39,16 +40,10 @@ type InspectCommandOutputRsp struct {
 	Excerpt             string `json:"excerpt,omitempty"`
 }
 
-func newInspectCommandOutputTool(database CommandDB) (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:        "inspect_command_output",
-			Description: "Inspect a recorded command output by command_id. Supports chunked reads and grep-like search.",
-		},
-		func(tc adktool.Context, req *InspectCommandOutputReq) (*InspectCommandOutputRsp, error) {
-			return inspectCommandOutput(database, req)
-		},
-	)
+func newInspectCommandOutputTool(database CommandDB) (tool.BaseTool, error) {
+	return toolutils.InferTool("inspect_command_output", "Inspect a recorded command output by command_id. Supports chunked reads and grep-like search.", func(_ context.Context, req InspectCommandOutputReq) (*InspectCommandOutputRsp, error) {
+		return inspectCommandOutput(database, &req)
+	})
 }
 
 func inspectCommandOutput(database CommandDB, req *InspectCommandOutputReq) (*InspectCommandOutputRsp, error) {

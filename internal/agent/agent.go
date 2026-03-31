@@ -10,12 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	adkagent "google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/llmagent"
-	"google.golang.org/adk/runner"
-	"google.golang.org/adk/session"
-	"google.golang.org/adk/tool/toolconfirmation"
-	"google.golang.org/genai"
+	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/adk/prebuilt/deep"
+	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
 
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
@@ -36,35 +35,39 @@ func NewRuntime(cfg *config.Config, database *db.DB, responder HITLResponder) *R
 }
 
 func (r *Runtime) Run(ctx context.Context, req RunRequest) (<-chan RuntimeEvent, error) {
-	root, err := r.buildRootAgent(ctx, req)
+	if strings.TrimSpace(req.SessionID) == "" {
+		req.SessionID = newSessionID()
+	}
+
+	state := newRuntimeState()
+	if cwd := strings.TrimSpace(req.Cwd); cwd != "" {
+		state.set(commandStateCwdKey, cwd)
+	}
+
+	root, err := r.buildRootAgent(ctx, req, state)
 	if err != nil {
 		return nil, err
 	}
-	runr, err := runner.New(runner.Config{
-		AppName:           defaultAppName,
-		Agent:             root,
-		SessionService:    session.InMemoryService(),
-		AutoCreateSession: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create runner: %w", err)
-	}
 
-	if req.SessionID == "" {
-		req.SessionID = newSessionID()
-	}
+	runr := adk.NewRunner(ctx, adk.RunnerConfig{
+		Agent:           root,
+		EnableStreaming: true,
+		CheckPointStore: newMemoryCheckPointStore(),
+	})
 
 	output := make(chan RuntimeEvent, 32)
 	go func() {
 		defer close(output)
-		_ = r.runConversation(ctx, runr, req, output)
+		_ = r.runConversation(ctx, runr, req, state, output)
 	}()
 	return output, nil
 }
 
-func (r *Runtime) runConversation(ctx context.Context, runr *runner.Runner, req RunRequest, output chan<- RuntimeEvent) error {
+func (r *Runtime) runConversation(ctx context.Context, runr *adk.Runner, req RunRequest, state *runtimeState, output chan<- RuntimeEvent) error {
+	history := make([]adk.Message, 0, 16)
 	next := buildPromptContent(req)
 	maxLines, wait := streamDefaults(req)
+
 	if req.StreamReader != nil {
 		chunk, err := req.StreamReader.NextChunk(ctx, maxLines, wait)
 		if err != nil && err != io.EOF {
@@ -76,21 +79,24 @@ func (r *Runtime) runConversation(ctx context.Context, runr *runner.Runner, req 
 		}
 	}
 
+	turnIndex := 0
 	for next != nil {
-		followUp, err := r.runTurn(ctx, runr, req.SessionID, next, output)
+		checkPointID := fmt.Sprintf("%s-turn-%d", req.SessionID, turnIndex)
+		turnMessages, err := r.runTurn(ctx, runr, checkPointID, state.snapshot(), history, next, output)
 		if err != nil {
 			output <- RuntimeEvent{Kind: RuntimeEventError, Text: fmt.Sprintf("Error: %v", err)}
 			return err
 		}
-		if followUp != nil {
-			next = followUp
-			continue
-		}
+
+		history = append(history, next)
+		history = append(history, turnMessages...)
+		turnIndex++
 
 		if req.StreamReader == nil {
 			next = nil
 			continue
 		}
+
 		chunk, err := req.StreamReader.NextChunk(ctx, maxLines, wait)
 		if err != nil {
 			if err == io.EOF {
@@ -98,7 +104,7 @@ func (r *Runtime) runConversation(ctx context.Context, runr *runner.Runner, req 
 					next = nil
 					continue
 				}
-				next = genai.NewContentFromText("The stream source has reached EOF. Provide a concise final assessment if needed.", genai.RoleUser)
+				next = schema.UserMessage("The stream source has reached EOF. Provide a concise final assessment if needed.")
 				req.StreamReader = nil
 				continue
 			}
@@ -111,89 +117,175 @@ func (r *Runtime) runConversation(ctx context.Context, runr *runner.Runner, req 
 		}
 		next = buildStreamPromptContent(req, chunk, false)
 	}
+
 	return nil
 }
 
-func (r *Runtime) runTurn(ctx context.Context, runr *runner.Runner, sessionID string, content *genai.Content, output chan<- RuntimeEvent) (*genai.Content, error) {
-	sawPartial := false
-	var followUp *genai.Content
+func (r *Runtime) runTurn(
+	ctx context.Context,
+	runr *adk.Runner,
+	checkPointID string,
+	sessionValues map[string]any,
+	history []adk.Message,
+	input *schema.Message,
+	output chan<- RuntimeEvent,
+) ([]adk.Message, error) {
 	seenToolCalls := make(map[string]bool)
 	seenToolResults := make(map[string]bool)
+	turnMessages := make([]adk.Message, 0, 16)
 
-	for event, err := range runr.Run(ctx, defaultUserID, sessionID, content, adkagent.RunConfig{
-		StreamingMode: adkagent.StreamingModeSSE,
-	}) {
+	messages := make([]adk.Message, 0, len(history)+1)
+	messages = append(messages, history...)
+	messages = append(messages, input)
+
+	iter := runr.Run(
+		ctx,
+		messages,
+		adk.WithCheckPointID(checkPointID),
+		adk.WithSessionValues(sessionValues),
+	)
+
+	for {
+		request, err := consumeRuntimeIterator(iter, output, seenToolCalls, seenToolResults, &turnMessages)
 		if err != nil {
 			return nil, err
 		}
-		if event == nil || event.Content == nil {
+		if request == nil {
+			return turnMessages, nil
+		}
+		if r.responder == nil {
+			return nil, fmt.Errorf("hitl required for tool %s but no responder is configured", request.OriginalTool)
+		}
+		if strings.TrimSpace(request.ID) == "" {
+			return nil, fmt.Errorf("hitl request is missing resume target id")
+		}
+
+		response, err := r.responder.Handle(ctx, *request)
+		if err != nil {
+			return nil, err
+		}
+
+		iter, err = runr.ResumeWithParams(ctx, checkPointID, &adk.ResumeParams{
+			Targets: map[string]any{
+				request.ID: hitlResumeData{
+					Confirmed: response.Confirmed,
+					Answers:   response.Answers,
+				},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("resume interrupted run: %w", err)
+		}
+	}
+}
+
+func consumeRuntimeIterator(
+	iter *adk.AsyncIterator[*adk.AgentEvent],
+	output chan<- RuntimeEvent,
+	seenToolCalls map[string]bool,
+	seenToolResults map[string]bool,
+	turnMessages *[]adk.Message,
+) (*HITLRequest, error) {
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			return nil, nil
+		}
+		if event == nil {
 			continue
+		}
+		if event.Err != nil {
+			return nil, event.Err
+		}
+
+		msg, err := collectEventMessage(event, output, seenToolCalls, seenToolResults)
+		if err != nil {
+			return nil, err
+		}
+		if msg != nil {
+			*turnMessages = append(*turnMessages, msg)
 		}
 
 		if request, ok := parseHITLRequest(event); ok {
-			if r.responder == nil {
-				return nil, fmt.Errorf("hitl required for tool %s but no responder is configured", request.OriginalTool)
-			}
-			response, err := r.responder.Handle(ctx, request)
-			if err != nil {
-				return nil, err
-			}
-			followUp = buildConfirmationResponseContent(request, response)
-			continue
+			return &request, nil
 		}
+	}
+}
 
-		for _, toolCall := range extractToolCallEvents(event) {
-			callID := toolCall.CallID
-			if callID == "" {
-				callID = toolCall.AgentName + ":" + toolCall.ToolName + ":" + toolCall.Summary
-			}
-			if seenToolCalls[callID] {
-				continue
-			}
-			seenToolCalls[callID] = true
-			output <- RuntimeEvent{
-				Kind:     RuntimeEventToolCall,
-				ToolCall: &toolCall,
-			}
-		}
-		for _, toolCall := range extractToolResultEvents(event) {
-			callID := toolCall.CallID
-			if callID == "" {
-				callID = toolCall.AgentName + ":" + toolCall.ToolName + ":" + toolCall.Summary + ":" + string(toolCall.State)
-			}
-			if seenToolResults[callID] {
-				continue
-			}
-			seenToolResults[callID] = true
-			output <- RuntimeEvent{
-				Kind:     RuntimeEventToolResult,
-				ToolCall: &toolCall,
-			}
-		}
-		if cwd, ok := extractCommandCwdEvent(event); ok {
-			output <- RuntimeEvent{
-				Kind: RuntimeEventCwd,
-				Cwd:  cwd,
-			}
-		}
+func collectEventMessage(
+	event *adk.AgentEvent,
+	output chan<- RuntimeEvent,
+	seenToolCalls map[string]bool,
+	seenToolResults map[string]bool,
+) (adk.Message, error) {
+	if event == nil || event.Output == nil || event.Output.MessageOutput == nil {
+		return nil, nil
+	}
 
-		text := contentText(event.Content)
-		if event.Partial {
-			sawPartial = sawPartial || strings.TrimSpace(text) != ""
-			if text != "" {
-				output <- RuntimeEvent{Kind: RuntimeEventText, Text: text}
-			}
-			continue
-		}
-		if !sawPartial && text != "" && event.IsFinalResponse() {
+	msg, emittedText, err := materializeMessage(event.Output.MessageOutput, output)
+	if err != nil {
+		return nil, err
+	}
+	if msg == nil {
+		return nil, nil
+	}
+
+	emitMessageEvents(event.AgentName, msg, output, seenToolCalls, seenToolResults)
+	if !emittedText {
+		if text := assistantMessageText(msg); text != "" {
 			output <- RuntimeEvent{Kind: RuntimeEventText, Text: text}
 		}
 	}
-	return followUp, nil
+
+	return msg, nil
 }
 
-func (r *Runtime) buildRootAgent(ctx context.Context, req RunRequest) (adkagent.Agent, error) {
-	registry, err := NewToolRegistry(r.db)
+func materializeMessage(mv *adk.MessageVariant, output chan<- RuntimeEvent) (adk.Message, bool, error) {
+	if mv == nil {
+		return nil, false, nil
+	}
+	if !mv.IsStreaming {
+		return mv.Message, false, nil
+	}
+
+	defer mv.MessageStream.Close()
+
+	var (
+		chunks      []*schema.Message
+		emittedText bool
+	)
+	for {
+		chunk, err := mv.MessageStream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, emittedText, err
+		}
+		if chunk == nil {
+			continue
+		}
+
+		chunks = append(chunks, chunk)
+		if text := assistantMessageText(chunk); text != "" {
+			output <- RuntimeEvent{Kind: RuntimeEventText, Text: text}
+			emittedText = true
+		}
+	}
+
+	if len(chunks) == 0 {
+		return nil, emittedText, nil
+	}
+
+	msg, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		return nil, emittedText, err
+	}
+	return msg, emittedText, nil
+}
+
+func (r *Runtime) buildRootAgent(ctx context.Context, req RunRequest, state *runtimeState) (adk.Agent, error) {
+	registry, err := NewToolRegistry(r.db, state, r.requireCommandConfirmation())
 	if err != nil {
 		return nil, err
 	}
@@ -214,29 +306,24 @@ func (r *Runtime) buildRootAgent(ctx context.Context, req RunRequest) (adkagent.
 	}
 }
 
-func (r *Runtime) buildAssistantAgent(ctx context.Context, registry *ToolRegistry) (adkagent.Agent, error) {
+func (r *Runtime) requireCommandConfirmation() bool {
+	if r.cfg == nil {
+		return true
+	}
+	return r.cfg.Agent.RequireCommandConfirmation
+}
+
+func (r *Runtime) buildAssistantAgent(ctx context.Context, registry *ToolRegistry) (adk.Agent, error) {
 	spec, err := AssistantSpecFromConfig(r.cfg)
 	if err != nil {
 		return nil, err
 	}
-	model, err := NewModel(ctx, spec.Model)
-	if err != nil {
-		return nil, err
-	}
-	return llmagent.New(llmagent.Config{
-		Name:        spec.Name,
-		Description: spec.Description,
-		Instruction: spec.Instruction,
-		Model:       model,
-		Tools:       registry.Filter(spec.Tools),
-	})
+	return r.buildChatModelAgent(ctx, spec, registry)
 }
 
-func (r *Runtime) buildTeamAgent(ctx context.Context, teamName string, registry *ToolRegistry) (adkagent.Agent, error) {
-	if strings.TrimSpace(teamName) == "" {
-		if r.cfg != nil {
-			teamName = r.cfg.Agent.DefaultTeam
-		}
+func (r *Runtime) buildTeamAgent(ctx context.Context, teamName string, registry *ToolRegistry) (adk.Agent, error) {
+	if strings.TrimSpace(teamName) == "" && r.cfg != nil {
+		teamName = r.cfg.Agent.DefaultTeam
 	}
 	if strings.TrimSpace(teamName) == "" {
 		return nil, fmt.Errorf("team mode requires --team or agent.default_team")
@@ -247,22 +334,11 @@ func (r *Runtime) buildTeamAgent(ctx context.Context, teamName string, registry 
 		return nil, err
 	}
 
-	subAgents := make([]adkagent.Agent, 0, len(spec.Agents))
+	subAgents := make([]adk.Agent, 0, len(spec.Agents))
 	for _, member := range spec.Agents {
-		model, err := NewModel(ctx, member.Model)
+		subAgent, err := r.buildChatModelAgent(ctx, member, registry)
 		if err != nil {
 			return nil, fmt.Errorf("member %s: %w", member.Name, err)
-		}
-		agentTools := registry.Filter(member.Tools)
-		subAgent, err := llmagent.New(llmagent.Config{
-			Name:        member.Name,
-			Description: member.Description,
-			Instruction: member.Instruction,
-			Model:       model,
-			Tools:       agentTools,
-		})
-		if err != nil {
-			return nil, err
 		}
 		subAgents = append(subAgents, subAgent)
 	}
@@ -271,18 +347,54 @@ func (r *Runtime) buildTeamAgent(ctx context.Context, teamName string, registry 
 	if err != nil {
 		return nil, fmt.Errorf("coordinator: %w", err)
 	}
-	instruction := spec.Coordinator.Instruction
-	if strings.TrimSpace(instruction) == "" {
+
+	instruction := strings.TrimSpace(spec.Coordinator.Instruction)
+	if instruction == "" {
 		instruction = DefaultCoordinatorInstruction
 	}
-	return llmagent.New(llmagent.Config{
-		Name:        spec.Coordinator.Name,
-		Description: spec.Coordinator.Description,
-		Instruction: instruction,
-		Model:       model,
-		Tools:       registry.Filter(spec.Coordinator.Tools),
-		SubAgents:   subAgents,
+	description := strings.TrimSpace(spec.Coordinator.Description)
+	if description == "" {
+		description = spec.Coordinator.Name
+	}
+
+	return deep.New(ctx, &deep.Config{
+		Name:                   spec.Coordinator.Name,
+		Description:            description,
+		ChatModel:              model,
+		Instruction:            instruction,
+		SubAgents:              subAgents,
+		ToolsConfig:            buildToolsConfig(registry.Filter(spec.Coordinator.Tools)),
+		WithoutGeneralSubAgent: len(subAgents) > 0,
 	})
+}
+
+func (r *Runtime) buildChatModelAgent(ctx context.Context, spec AgentSpec, registry *ToolRegistry) (adk.Agent, error) {
+	model, err := NewModel(ctx, spec.Model)
+	if err != nil {
+		return nil, err
+	}
+	description := strings.TrimSpace(spec.Description)
+	if description == "" {
+		description = spec.Name
+	}
+
+	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        spec.Name,
+		Description: description,
+		Instruction: spec.Instruction,
+		Model:       model,
+		ToolsConfig: buildToolsConfig(registry.Filter(spec.Tools)),
+	})
+}
+
+func buildToolsConfig(tools []tool.BaseTool) adk.ToolsConfig {
+	return adk.ToolsConfig{
+		ToolsNodeConfig: compose.ToolsNodeConfig{
+			Tools:               tools,
+			ExecuteSequentially: true,
+		},
+		EmitInternalEvents: true,
+	}
 }
 
 func streamDefaults(req RunRequest) (int, time.Duration) {
@@ -297,17 +409,17 @@ func streamDefaults(req RunRequest) (int, time.Duration) {
 	return maxLines, wait
 }
 
-func buildPromptContent(req RunRequest) *genai.Content {
-	return genai.NewContentFromText(buildPromptText(req, ""), genai.RoleUser)
+func buildPromptContent(req RunRequest) *schema.Message {
+	return schema.UserMessage(buildPromptText(req, ""))
 }
 
-func buildStreamPromptContent(req RunRequest, chunk StreamChunk, first bool) *genai.Content {
+func buildStreamPromptContent(req RunRequest, chunk StreamChunk, first bool) *schema.Message {
 	title := "New stream chunk"
 	if first {
 		title = "Initial stream chunk"
 	}
 	body := fmt.Sprintf("%s:\n%s", title, strings.TrimSpace(chunk.Text))
-	return genai.NewContentFromText(buildPromptText(req, body), genai.RoleUser)
+	return schema.UserMessage(buildPromptText(req, body))
 }
 
 func buildPromptText(req RunRequest, streamChunk string) string {
@@ -448,160 +560,84 @@ func expandFileMentions(query string) (string, string) {
 	return query, strings.Join(attachments, "\n\n")
 }
 
-func parseHITLRequest(event *session.Event) (HITLRequest, bool) {
-	if event == nil || event.Content == nil {
-		return HITLRequest{}, false
-	}
-	for _, part := range event.Content.Parts {
-		if part == nil || part.FunctionCall == nil {
+func emitMessageEvents(
+	agentName string,
+	msg *schema.Message,
+	output chan<- RuntimeEvent,
+	seenToolCalls map[string]bool,
+	seenToolResults map[string]bool,
+) {
+	for _, toolCall := range extractToolCallEvents(agentName, msg) {
+		callID := toolCall.CallID
+		if callID == "" {
+			callID = toolCall.AgentName + ":" + toolCall.ToolName + ":" + toolCall.Summary
+		}
+		if seenToolCalls[callID] {
 			continue
 		}
-		call := part.FunctionCall
-		if call.Name != toolconfirmation.FunctionCallName {
+		seenToolCalls[callID] = true
+		output <- RuntimeEvent{Kind: RuntimeEventToolCall, ToolCall: &toolCall}
+	}
+
+	for _, toolCall := range extractToolResultEvents(agentName, msg) {
+		callID := toolCall.CallID
+		if callID == "" {
+			callID = toolCall.AgentName + ":" + toolCall.ToolName + ":" + toolCall.Summary + ":" + string(toolCall.State)
+		}
+		if seenToolResults[callID] {
 			continue
 		}
-		original, err := toolconfirmation.OriginalCallFrom(call)
-		if err != nil {
-			return HITLRequest{}, false
-		}
-		request := HITLRequest{
-			ID:             call.ID,
-			FunctionCallID: call.ID,
-			OriginalTool:   original.Name,
-			Kind:           HITLKindConfirm,
-			Title:          "Confirmation Required",
-			Prompt:         "Approval required.",
-		}
-		if toolConfirmation, ok := call.Args["toolConfirmation"]; ok {
-			data, _ := json.Marshal(toolConfirmation)
-			var payload struct {
-				Hint    string          `json:"hint"`
-				Payload json.RawMessage `json:"payload"`
-			}
-			_ = json.Unmarshal(data, &payload)
-			if strings.TrimSpace(payload.Hint) != "" {
-				request.Prompt = payload.Hint
-			}
-			if original.Name == "request_input" && len(payload.Payload) > 0 {
-				var form inputFormPayload
-				if json.Unmarshal(payload.Payload, &form) == nil {
-					request.Kind = HITLKindInputForm
-					request.Title = "Input Required"
-					request.Questions = form.Questions
-				}
-			}
-		}
-		if original.Name == "command" {
-			if command, ok := original.Args["command"].(string); ok {
-				request.Command = command
-			}
-			if cwd, ok := original.Args["cwd"].(string); ok {
-				request.Cwd = cwd
-			}
-		}
-		return request, true
+		seenToolResults[callID] = true
+		output <- RuntimeEvent{Kind: RuntimeEventToolResult, ToolCall: &toolCall}
 	}
-	return HITLRequest{}, false
-}
 
-func buildConfirmationResponseContent(request HITLRequest, response HITLResponse) *genai.Content {
-	payload := confirmationPayload(request, response)
-	return &genai.Content{
-		Role: "user",
-		Parts: []*genai.Part{{
-			FunctionResponse: &genai.FunctionResponse{
-				Name: toolconfirmation.FunctionCallName,
-				ID:   request.FunctionCallID,
-				Response: map[string]any{
-					"confirmed": response.Confirmed,
-					"payload":   payload,
-				},
-			},
-		}},
+	if cwd, ok := extractCommandCwdEvent(msg); ok {
+		output <- RuntimeEvent{Kind: RuntimeEventCwd, Cwd: cwd}
 	}
 }
 
-func confirmationPayload(request HITLRequest, response HITLResponse) any {
-	if len(response.Answers) > 0 {
-		return map[string]any{
-			"decision":      "provided",
-			"original_tool": strings.TrimSpace(request.OriginalTool),
-			"answers":       response.Answers,
-		}
-	}
-	if response.Payload != nil {
-		if payloadMap, ok := response.Payload.(map[string]any); ok {
-			merged := make(map[string]any, len(payloadMap)+4)
-			for key, value := range payloadMap {
-				merged[key] = value
-			}
-			if _, ok := merged["decision"]; !ok {
-				if response.Confirmed {
-					merged["decision"] = "approved"
-				} else {
-					merged["decision"] = "rejected"
-				}
-			}
-			if _, ok := merged["original_tool"]; !ok && strings.TrimSpace(request.OriginalTool) != "" {
-				merged["original_tool"] = strings.TrimSpace(request.OriginalTool)
-			}
-			if _, ok := merged["command"]; !ok && strings.TrimSpace(request.Command) != "" {
-				merged["command"] = strings.TrimSpace(request.Command)
-			}
-			return merged
-		}
-		return response.Payload
-	}
-	payload := map[string]any{
-		"original_tool": strings.TrimSpace(request.OriginalTool),
-	}
-	if strings.TrimSpace(request.Command) != "" {
-		payload["command"] = strings.TrimSpace(request.Command)
-	}
-	if response.Confirmed {
-		payload["decision"] = "approved"
-		payload["reason"] = "User approved this tool call."
-		return payload
-	}
-	payload["decision"] = "rejected"
-	payload["status"] = "rejected"
-	payload["reason"] = "User rejected this tool call."
-	payload["message"] = "Do not execute the tool. Ask the user for an alternative if needed."
-	return payload
-}
-
-func contentText(c *genai.Content) string {
-	if c == nil {
+func assistantMessageText(msg *schema.Message) string {
+	if msg == nil || msg.Role != schema.Assistant {
 		return ""
 	}
+	if msg.Content != "" {
+		return msg.Content
+	}
+	if len(msg.AssistantGenMultiContent) == 0 {
+		return ""
+	}
+
 	var sb strings.Builder
-	for _, p := range c.Parts {
-		if p != nil && p.Text != "" && !p.Thought {
-			sb.WriteString(p.Text)
+	for _, part := range msg.AssistantGenMultiContent {
+		if part.Text != "" {
+			sb.WriteString(part.Text)
 		}
 	}
 	return sb.String()
 }
 
-func extractToolCallEvents(event *session.Event) []ToolCallEvent {
-	if event == nil || event.Content == nil {
+func extractToolCallEvents(agentName string, msg *schema.Message) []ToolCallEvent {
+	if msg == nil || msg.Role != schema.Assistant || len(msg.ToolCalls) == 0 {
 		return nil
 	}
-	author := strings.TrimSpace(event.Author)
-	calls := make([]ToolCallEvent, 0, len(event.Content.Parts))
-	for _, part := range event.Content.Parts {
-		if part == nil || part.FunctionCall == nil {
+
+	agentName = strings.TrimSpace(agentName)
+	calls := make([]ToolCallEvent, 0, len(msg.ToolCalls))
+	for _, call := range msg.ToolCalls {
+		name := strings.TrimSpace(call.Function.Name)
+		if name == "" {
 			continue
 		}
-		call := part.FunctionCall
-		if call == nil || strings.TrimSpace(call.Name) == "" || call.Name == toolconfirmation.FunctionCallName {
-			continue
+		args, rawArgs := decodeJSONObject(call.Function.Arguments)
+		summary := summarizeToolCall(name, args)
+		if summary == "" {
+			summary = rawArgs
 		}
 		calls = append(calls, ToolCallEvent{
 			CallID:    strings.TrimSpace(call.ID),
-			AgentName: author,
-			ToolName:  strings.TrimSpace(call.Name),
-			Summary:   summarizeToolCall(call.Name, call.Args),
+			AgentName: agentName,
+			ToolName:  name,
+			Summary:   summary,
 			State:     ToolCallStatePending,
 		})
 	}
@@ -611,66 +647,60 @@ func extractToolCallEvents(event *session.Event) []ToolCallEvent {
 	return calls
 }
 
-func extractToolResultEvents(event *session.Event) []ToolCallEvent {
-	if event == nil || event.Content == nil {
+func extractToolResultEvents(agentName string, msg *schema.Message) []ToolCallEvent {
+	if msg == nil || msg.Role != schema.Tool || strings.TrimSpace(msg.ToolName) == "" {
 		return nil
 	}
-	author := strings.TrimSpace(event.Author)
-	results := make([]ToolCallEvent, 0, len(event.Content.Parts))
-	for _, part := range event.Content.Parts {
-		if part == nil || part.FunctionResponse == nil {
-			continue
-		}
-		response := part.FunctionResponse
-		if response == nil {
-			continue
-		}
-		name := strings.TrimSpace(response.Name)
-		if name == "" || name == toolconfirmation.FunctionCallName {
-			continue
-		}
-		results = append(results, ToolCallEvent{
-			CallID:    strings.TrimSpace(response.ID),
-			AgentName: author,
-			ToolName:  name,
-			Summary:   summarizeToolResultTarget(name, response.Response),
-			Result:    summarizeToolResult(name, response.Response),
-			State:     summarizeToolResultState(name, response.Response),
-		})
+
+	name := strings.TrimSpace(msg.ToolName)
+	response, raw := decodeJSONObject(msg.Content)
+	result := summarizeToolResult(name, response)
+	if result == "" {
+		result = raw
 	}
-	if len(results) == 0 {
-		return nil
-	}
-	return results
+
+	return []ToolCallEvent{{
+		CallID:    strings.TrimSpace(msg.ToolCallID),
+		AgentName: strings.TrimSpace(agentName),
+		ToolName:  name,
+		Summary:   summarizeToolResultTarget(name, response),
+		Result:    result,
+		State:     summarizeToolResultState(name, response),
+	}}
 }
 
-func extractCommandCwdEvent(event *session.Event) (string, bool) {
-	if event == nil || event.Content == nil {
+func extractCommandCwdEvent(msg *schema.Message) (string, bool) {
+	if msg == nil || msg.Role != schema.Tool || strings.TrimSpace(msg.ToolName) != "command" {
 		return "", false
 	}
-	for _, part := range event.Content.Parts {
-		if part == nil || part.FunctionResponse == nil {
-			continue
-		}
-		response := part.FunctionResponse
-		if response == nil || strings.TrimSpace(response.Name) != "command" {
-			continue
-		}
-		rawChanged, ok := response.Response["cwd_changed"]
-		if !ok || !toolBoolArg(rawChanged) {
-			continue
-		}
-		rawCwd, ok := response.Response["cwd"]
-		if !ok {
-			continue
-		}
-		cwd, ok := rawCwd.(string)
-		if !ok || strings.TrimSpace(cwd) == "" {
-			continue
-		}
-		return strings.TrimSpace(cwd), true
+
+	response, _ := decodeJSONObject(msg.Content)
+	rawChanged, ok := response["cwd_changed"]
+	if !ok || !toolBoolArg(rawChanged) {
+		return "", false
 	}
-	return "", false
+	rawCwd, ok := response["cwd"]
+	if !ok {
+		return "", false
+	}
+	cwd, ok := rawCwd.(string)
+	if !ok || strings.TrimSpace(cwd) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(cwd), true
+}
+
+func decodeJSONObject(raw string) (map[string]any, string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, ""
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+		return decoded, trimmed
+	}
+	return nil, trimmed
 }
 
 func summarizeToolCall(name string, args map[string]any) string {

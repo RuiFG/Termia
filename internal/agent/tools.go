@@ -1,24 +1,25 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	adktool "google.golang.org/adk/tool"
-	"google.golang.org/adk/tool/functiontool"
+	"github.com/cloudwego/eino/components/tool"
+	toolutils "github.com/cloudwego/eino/components/tool/utils"
 )
 
 type ToolRegistry struct {
-	tools map[string]adktool.Tool
+	tools map[string]tool.BaseTool
 }
 
-func NewToolRegistry(database CommandDB) (*ToolRegistry, error) {
-	registry := &ToolRegistry{tools: make(map[string]adktool.Tool)}
+func NewToolRegistry(database CommandDB, state *runtimeState, requireCommandConfirmation bool) (*ToolRegistry, error) {
+	registry := &ToolRegistry{tools: make(map[string]tool.BaseTool)}
 
-	commandTool, err := NewCommandTool(database)
+	commandTool, err := NewCommandTool(database, state, requireCommandConfirmation)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +48,7 @@ func NewToolRegistry(database CommandDB) (*ToolRegistry, error) {
 		return nil, err
 	}
 
-	for _, tool := range []adktool.Tool{
+	for _, tool := range []tool.BaseTool{
 		commandTool,
 		inputTool,
 		commandOutputTool,
@@ -62,17 +63,20 @@ func NewToolRegistry(database CommandDB) (*ToolRegistry, error) {
 	return registry, nil
 }
 
-func (r *ToolRegistry) Register(tool adktool.Tool) {
+func (r *ToolRegistry) Register(tool tool.BaseTool) {
 	if tool != nil {
-		r.tools[tool.Name()] = tool
+		info, err := tool.Info(context.Background())
+		if err == nil && info != nil && strings.TrimSpace(info.Name) != "" {
+			r.tools[info.Name] = tool
+		}
 	}
 }
 
-func (r *ToolRegistry) Filter(names []string) []adktool.Tool {
+func (r *ToolRegistry) Filter(names []string) []tool.BaseTool {
 	if len(names) == 0 {
 		return r.All()
 	}
-	result := make([]adktool.Tool, 0, len(names))
+	result := make([]tool.BaseTool, 0, len(names))
 	for _, name := range names {
 		if tool, ok := r.tools[name]; ok {
 			result = append(result, tool)
@@ -81,8 +85,8 @@ func (r *ToolRegistry) Filter(names []string) []adktool.Tool {
 	return result
 }
 
-func (r *ToolRegistry) All() []adktool.Tool {
-	result := make([]adktool.Tool, 0, len(r.tools))
+func (r *ToolRegistry) All() []tool.BaseTool {
+	result := make([]tool.BaseTool, 0, len(r.tools))
 	for _, tool := range r.tools {
 		result = append(result, tool)
 	}
@@ -105,16 +109,10 @@ type ReadFileRsp struct {
 	Truncated bool   `json:"truncated"`
 }
 
-func newReadFileTool() (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:        "read_file",
-			Description: "Read a local text file with line and byte limits.",
-		},
-		func(tc adktool.Context, req *ReadFileReq) (*ReadFileRsp, error) {
-			return readFile(req)
-		},
-	)
+func newReadFileTool() (tool.BaseTool, error) {
+	return toolutils.InferTool("read_file", "Read a local text file with line and byte limits.", func(_ context.Context, req ReadFileReq) (*ReadFileRsp, error) {
+		return readFile(&req)
+	})
 }
 
 func readFile(req *ReadFileReq) (*ReadFileRsp, error) {
@@ -152,32 +150,26 @@ type ReadFilesRsp struct {
 	Files []ReadFileRsp `json:"files"`
 }
 
-func newReadFilesTool() (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:        "read_files",
-			Description: "Read multiple local text files with limits.",
-		},
-		func(tc adktool.Context, req *ReadFilesReq) (*ReadFilesRsp, error) {
-			files := make([]ReadFileRsp, 0, len(req.Paths))
-			for _, path := range req.Paths {
-				file, err := readFile(&ReadFileReq{
-					Path:     path,
-					MaxLines: req.MaxLines,
-					MaxBytes: req.MaxBytes,
+func newReadFilesTool() (tool.BaseTool, error) {
+	return toolutils.InferTool("read_files", "Read multiple local text files with limits.", func(_ context.Context, req ReadFilesReq) (*ReadFilesRsp, error) {
+		files := make([]ReadFileRsp, 0, len(req.Paths))
+		for _, path := range req.Paths {
+			file, err := readFile(&ReadFileReq{
+				Path:     path,
+				MaxLines: req.MaxLines,
+				MaxBytes: req.MaxBytes,
+			})
+			if err != nil {
+				files = append(files, ReadFileRsp{
+					Path:    path,
+					Content: fmt.Sprintf("error: %v", err),
 				})
-				if err != nil {
-					files = append(files, ReadFileRsp{
-						Path:    path,
-						Content: fmt.Sprintf("error: %v", err),
-					})
-					continue
-				}
-				files = append(files, *file)
+				continue
 			}
-			return &ReadFilesRsp{Files: files}, nil
-		},
-	)
+			files = append(files, *file)
+		}
+		return &ReadFilesRsp{Files: files}, nil
+	})
 }
 
 type ListDirReq struct {
@@ -199,46 +191,40 @@ type ListDirRsp struct {
 	Entries []DirEntry `json:"entries"`
 }
 
-func newListDirTool() (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:        "list_dir",
-			Description: "List directory entries with metadata.",
-		},
-		func(tc adktool.Context, req *ListDirReq) (*ListDirRsp, error) {
-			path, err := resolvePath(req.Path)
-			if err != nil {
-				return nil, err
+func newListDirTool() (tool.BaseTool, error) {
+	return toolutils.InferTool("list_dir", "List directory entries with metadata.", func(_ context.Context, req ListDirReq) (*ListDirRsp, error) {
+		path, err := resolvePath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		maxEntries := req.MaxEntries
+		if maxEntries <= 0 {
+			maxEntries = 200
+		}
+		if len(entries) > maxEntries {
+			entries = entries[:maxEntries]
+		}
+		result := make([]DirEntry, 0, len(entries))
+		for _, entry := range entries {
+			info, _ := entry.Info()
+			dirEntry := DirEntry{
+				Name:  entry.Name(),
+				Path:  filepath.Join(path, entry.Name()),
+				IsDir: entry.IsDir(),
 			}
-			entries, err := os.ReadDir(path)
-			if err != nil {
-				return nil, err
+			if info != nil {
+				dirEntry.Size = info.Size()
+				dirEntry.Mode = info.Mode().String()
+				dirEntry.ModTime = info.ModTime().Format(time.RFC3339)
 			}
-			maxEntries := req.MaxEntries
-			if maxEntries <= 0 {
-				maxEntries = 200
-			}
-			if len(entries) > maxEntries {
-				entries = entries[:maxEntries]
-			}
-			result := make([]DirEntry, 0, len(entries))
-			for _, entry := range entries {
-				info, _ := entry.Info()
-				dirEntry := DirEntry{
-					Name:  entry.Name(),
-					Path:  filepath.Join(path, entry.Name()),
-					IsDir: entry.IsDir(),
-				}
-				if info != nil {
-					dirEntry.Size = info.Size()
-					dirEntry.Mode = info.Mode().String()
-					dirEntry.ModTime = info.ModTime().Format(time.RFC3339)
-				}
-				result = append(result, dirEntry)
-			}
-			return &ListDirRsp{Path: path, Entries: result}, nil
-		},
-	)
+			result = append(result, dirEntry)
+		}
+		return &ListDirRsp{Path: path, Entries: result}, nil
+	})
 }
 
 type StreamReadReq struct {
@@ -260,20 +246,14 @@ type StreamReadRsp struct {
 	TimedOut  bool   `json:"timed_out"`
 }
 
-func newStreamReadTool() (adktool.Tool, error) {
-	return functiontool.New(
-		functiontool.Config{
-			Name:        "stream_read",
-			Description: "Read a log file chunk with offset, follow, line, and timeout limits.",
-		},
-		func(tc adktool.Context, req *StreamReadReq) (*StreamReadRsp, error) {
-			path, err := resolvePath(req.Path)
-			if err != nil {
-				return nil, err
-			}
-			return streamReadFile(path, req)
-		},
-	)
+func newStreamReadTool() (tool.BaseTool, error) {
+	return toolutils.InferTool("stream_read", "Read a log file chunk with offset, follow, line, and timeout limits.", func(_ context.Context, req StreamReadReq) (*StreamReadRsp, error) {
+		path, err := resolvePath(req.Path)
+		if err != nil {
+			return nil, err
+		}
+		return streamReadFile(path, &req)
+	})
 }
 
 func streamReadFile(path string, req *StreamReadReq) (*StreamReadRsp, error) {

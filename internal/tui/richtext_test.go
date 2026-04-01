@@ -53,3 +53,14 @@ func TestRenderMarkdownUsesLightParagraphGapForReadableLayout(t *testing.T) {
 		t.Fatalf("expected no oversized paragraph gap, got %q", rendered)
 	}
 }
+
+func TestRenderMarkdownNormalizesCarriageReturns(t *testing.T) {
+	rendered := renderMarkdown("first\rsecond\r\nthird", 80, assistantBodyStyle)
+	if strings.Contains(rendered, "\r") {
+		t.Fatalf("expected carriage returns to be removed, got %q", rendered)
+	}
+	normalized := strings.Join(strings.Fields(rendered), " ")
+	if normalized != "first second third" {
+		t.Fatalf("expected normalized line endings, got %q", rendered)
+	}
+}

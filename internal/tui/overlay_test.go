@@ -38,3 +38,31 @@ func TestOverlayContentCenteredPreservesBaseOutsideOverlay(t *testing.T) {
 		t.Fatalf("expected ANSI color to be preserved around overlay, got %q", lines[2])
 	}
 }
+
+func TestOverlayContentCenteredPadsShortOverlayLines(t *testing.T) {
+	base := strings.Join([]string{
+		"AAAAAAAAAAAAAAAAAAAA",
+		"BBBBBBBBBBBBBBBBBBBB",
+		"CCCCCCCCCCCCCCCCCCCC",
+		"DDDDDDDDDDDDDDDDDDDD",
+		"EEEEEEEEEEEEEEEEEEEE",
+	}, "\n")
+	overlay := strings.Join([]string{
+		"######",
+		"#x#",
+		"######",
+	}, "\n")
+
+	rendered := overlayContentCentered(base, overlay, 20, 5)
+	lines := strings.Split(rendered, "\n")
+	if len(lines) != 5 {
+		t.Fatalf("expected 5 lines, got %d", len(lines))
+	}
+	center := stripANSICodes(lines[2])
+	if strings.Contains(center, "CCC#x#CCC") {
+		t.Fatalf("expected short overlay line to be padded instead of leaking base content, got %q", center)
+	}
+	if !strings.Contains(center, "#x#") {
+		t.Fatalf("expected centered overlay content, got %q", center)
+	}
+}

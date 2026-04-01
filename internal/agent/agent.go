@@ -326,7 +326,7 @@ func (r *Runtime) buildTeamAgent(ctx context.Context, teamName string, registry 
 		teamName = r.cfg.Agent.DefaultTeam
 	}
 	if strings.TrimSpace(teamName) == "" {
-		return nil, fmt.Errorf("team mode requires --team or agent.default_team")
+		return nil, fmt.Errorf("team mode requires a team name or agent.default_team")
 	}
 
 	spec, err := LoadTeamByName(r.cfg, teamName)

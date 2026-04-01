@@ -21,6 +21,8 @@ import (
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"github.com/termia/termia/internal/diagnostics"
+	"github.com/termia/termia/internal/sessionstate"
+	"github.com/termia/termia/internal/textutil"
 	"go.uber.org/zap"
 )
 
@@ -373,9 +375,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(a.sessions) == 0 {
 				return a, createSessionCmd(a.db, a.launchCwd, a.currentRuntimeMode(), a.activeTeamName)
 			}
-			a.setActiveSessionID(a.sessions[0].ID)
+			selectedID := selectInitialSessionID(a.sessions, sessionstate.CurrentID())
+			a.setActiveSessionID(selectedID)
 			a.applySessionRuntime(a.activeSessionID)
-			a.ensureSessionCwd(a.activeSessionID)
+			if strings.TrimSpace(a.launchCwd) != "" {
+				a.recordSessionCwd(a.activeSessionID, a.launchCwd)
+			} else {
+				a.ensureSessionCwd(a.activeSessionID)
+			}
 			a.applySessionCwd(a.activeSessionID)
 			return a, loadSessionMessagesCmd(a.db, a.activeSessionID)
 		}
@@ -516,7 +523,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentStartMsg:
 		if msg.err != nil {
-			_ = os.Unsetenv("TERMIA_SESSION_ID")
 			a.agent.AddMessage("error", fmt.Sprintf("Error: %v", msg.err))
 			a.agentRunning = false
 			a.agentCancel = nil
@@ -526,7 +532,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		if msg.stream == nil {
-			_ = os.Unsetenv("TERMIA_SESSION_ID")
 			a.agent.AddMessage("error", "Error: agent stream unavailable")
 			a.agentRunning = false
 			a.agentCancel = nil
@@ -538,7 +543,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, readAgentEventCmd(msg.stream)
 
 	case agentDoneMsg:
-		_ = os.Unsetenv("TERMIA_SESSION_ID")
 		a.agentRunning = false
 		a.agentCancel = nil
 		a.agentLastEsc = time.Time{}
@@ -558,7 +562,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, createTimelineMessagesCmd(a.db, a.activeSessionID, messages)
 
 	case agentErrorMsg:
-		_ = os.Unsetenv("TERMIA_SESSION_ID")
 		errText := fmt.Sprintf("Error: %v", msg.err)
 		a.agent.MarkLatestPendingToolFailed(errText)
 		a.agent.AddMessage("error", errText)
@@ -2668,19 +2671,14 @@ func (a App) renderCommandPalette(totalWidth int) string {
 	var lines []string
 	lines = append(lines, a.renderPaletteHeader(contentWidth))
 	lines = append(lines, metaStyle.Render("Search: "+a.paletteQuery))
-	lines = append(lines, "")
 	selectedIndex := a.paletteIndex
 	if selectedIndex < 0 || selectedIndex >= len(items) || items[selectedIndex].Header {
 		selectedIndex = firstSelectableIndex(items)
 	}
 	for i, item := range items {
 		if item.Header {
-			if len(lines) > 0 {
-				last := strings.TrimSpace(stripANSICodes(lines[len(lines)-1]))
-				if last != "" {
-					lines = append(lines, "")
-				}
-			}
+			// Spacer rows inside the overlay make the palette taller and cause it
+			// to collide visually with the surrounding panes.
 			lines = append(lines, paletteSectionStyle.Render(item.Label))
 			continue
 		}
@@ -3327,7 +3325,7 @@ func createTimelineMessagesCmd(database *db.DB, sessionID string, messages []Age
 				ID:           generateID(),
 				SessionID:    sessionID,
 				Role:         normalizeConversationRole(message.Role),
-				Content:      strings.TrimSpace(message.Content),
+				Content:      textutil.NormalizeTrimmedText(message.Content),
 				MetadataJSON: metadataJSON,
 				CreatedAt:    createdAt + int64(idx),
 			}
@@ -3551,7 +3549,7 @@ func formatSessionMessages(messages []db.AgentMessage) []AgentMessage {
 	}
 	output := make([]AgentMessage, 0, len(messages)*2)
 	for _, msg := range messages {
-		content := strings.TrimSpace(msg.Content)
+		content := textutil.NormalizeTrimmedText(msg.Content)
 		metadata := db.ParseAgentMessageMetadata(msg)
 		role := normalizeConversationRole(msg.Role)
 		if role == "tool" {
@@ -3587,7 +3585,7 @@ func buildInputHistoryEntries(messages []db.AgentMessage) []InputHistoryEntry {
 		if strings.TrimSpace(msg.Role) != "user" {
 			continue
 		}
-		value := strings.TrimSpace(msg.Content)
+		value := textutil.NormalizeTrimmedText(msg.Content)
 		if value == "" {
 			continue
 		}
@@ -3644,10 +3642,10 @@ func agentToolCallsFromMessageMetadata(metadata db.AgentMessageMetadata) []Agent
 		}
 		toolCalls = append(toolCalls, AgentToolCall{
 			CallID:    strings.TrimSpace(toolCall.CallID),
-			AgentName: strings.TrimSpace(toolCall.AgentName),
-			ToolName:  strings.TrimSpace(toolCall.ToolName),
-			Summary:   strings.TrimSpace(toolCall.Summary),
-			Result:    strings.TrimSpace(toolCall.Result),
+			AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
+			ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
+			Summary:   textutil.NormalizeInlineText(toolCall.Summary),
+			Result:    textutil.NormalizeInlineText(toolCall.Result),
 			State:     agent.ToolCallState(strings.TrimSpace(toolCall.State)),
 		})
 	}
@@ -3668,10 +3666,10 @@ func agentToolCallFromMessageMetadata(metadata db.AgentMessageMetadata) (AgentTo
 func agentToolCallFromRuntime(toolCall agent.ToolCallEvent) AgentToolCall {
 	return AgentToolCall{
 		CallID:    strings.TrimSpace(toolCall.CallID),
-		AgentName: strings.TrimSpace(toolCall.AgentName),
-		ToolName:  strings.TrimSpace(toolCall.ToolName),
-		Summary:   strings.TrimSpace(toolCall.Summary),
-		Result:    strings.TrimSpace(toolCall.Result),
+		AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
+		ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
+		Summary:   textutil.NormalizeInlineText(toolCall.Summary),
+		Result:    textutil.NormalizeInlineText(toolCall.Result),
 		State:     toolCall.State,
 	}
 }
@@ -3740,12 +3738,12 @@ func (a App) renderInputCwdLine(contentWidth int) string {
 func (a *App) setActiveSessionID(sessionID string) {
 	sessionID = strings.TrimSpace(sessionID)
 	a.activeSessionID = sessionID
-	if sessionID == "" {
-		_ = os.Unsetenv("TERMIA_SESSION_ID")
-		a.history.ClearCited()
-		return
+	if err := sessionstate.SetCurrentID(sessionID); err != nil && a.logger != nil {
+		a.logger.Warn("failed to persist current session", zap.Error(err))
 	}
-	_ = os.Setenv("TERMIA_SESSION_ID", sessionID)
+	if sessionID == "" {
+		a.history.ClearCited()
+	}
 }
 
 func (a *App) syncCitedCommandsFromInputHistory() {
@@ -3842,6 +3840,21 @@ func (a *App) cacheSessionCwds(sessions []db.AgentSession) {
 	for _, session := range sessions {
 		a.cacheSessionCwd(session)
 	}
+}
+
+func selectInitialSessionID(sessions []db.AgentSession, preferred string) string {
+	preferred = strings.TrimSpace(preferred)
+	if preferred != "" {
+		for _, session := range sessions {
+			if strings.TrimSpace(session.ID) == preferred {
+				return preferred
+			}
+		}
+	}
+	if len(sessions) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(sessions[0].ID)
 }
 
 func (a *App) cacheSessionCwd(session db.AgentSession) {

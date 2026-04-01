@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/termia/termia/internal/textutil"
 )
 
 // AgentMessage represents a single message in a session.
@@ -47,6 +49,7 @@ func (d *DB) CreateAgentMessage(msg *AgentMessage) error {
 	if msg == nil {
 		return fmt.Errorf("message is nil")
 	}
+	msg.Content = textutil.NormalizeTrimmedText(msg.Content)
 	query := `
 		INSERT INTO agent_messages (id, session_id, role, content, metadata_json, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)

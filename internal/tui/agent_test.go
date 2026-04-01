@@ -62,3 +62,32 @@ func TestRenderConversationTimelineUsesLineDividerBetweenTurns(t *testing.T) {
 		t.Fatalf("expected full-width divider in timeline, got %q", view)
 	}
 }
+
+func TestAgentModelNormalizesCarriageReturnsInTimelineAndToolCalls(t *testing.T) {
+	model := NewAgentModel(DefaultKeyMap())
+	model.SetSize(60, 12)
+	model.AddMessage("user", "inspect\rports")
+	model.AppendToLast("working\ron it")
+	model.AppendToolCall(AgentToolCall{
+		CallID:   "call-1",
+		ToolName: "command\r",
+		Summary:  "netstat\r-tuln",
+		Result:   "open\rports",
+		State:    agent.ToolCallStateSuccess,
+	})
+
+	view := model.viewport.View()
+	if strings.Contains(view, "\r") {
+		t.Fatalf("expected viewport to be free of carriage returns, got %q", view)
+	}
+	normalized := strings.Join(strings.Fields(view), " ")
+	if !strings.Contains(normalized, "> inspect ports") {
+		t.Fatalf("expected normalized user content, got %q", view)
+	}
+	if !strings.Contains(normalized, "• working on it") {
+		t.Fatalf("expected normalized assistant content, got %q", view)
+	}
+	if !strings.Contains(normalized, "• command netstat -tuln · open ports") {
+		t.Fatalf("expected normalized tool call content, got %q", view)
+	}
+}

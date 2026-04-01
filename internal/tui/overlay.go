@@ -49,6 +49,7 @@ func overlayContentCentered(base, over string, width, height int) string {
 	baseLines := strings.Split(base, "\n")
 	overLines := strings.Split(over, "\n")
 	overW := maxVisibleWidth(overLines)
+	overLines = padLinesToWidth(overLines, overW)
 	overH := len(overLines)
 	startY := (height - overH) / 2
 	if startY < 0 {
@@ -136,6 +137,17 @@ func maxVisibleWidth(lines []string) int {
 		}
 	}
 	return maxWidth
+}
+
+func padLinesToWidth(lines []string, width int) []string {
+	if width <= 0 || len(lines) == 0 {
+		return lines
+	}
+	padded := make([]string, len(lines))
+	for i, line := range lines {
+		padded[i] = padToWidth(line, width)
+	}
+	return padded
 }
 
 func sliceStyledVisible(s string, start, end int) string {

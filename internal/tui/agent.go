@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	runtimeagent "github.com/termia/termia/internal/agent"
+	"github.com/termia/termia/internal/textutil"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -172,6 +173,7 @@ func (m *AgentModel) refreshContent() {
 }
 
 func appendTimelineText(messages []AgentMessage, role, content string, appendToLast bool) []AgentMessage {
+	content = textutil.NormalizeLineEndings(content)
 	if content == "" {
 		return messages
 	}
@@ -228,6 +230,7 @@ func upsertTimelineToolCall(messages []AgentMessage, toolCall AgentToolCall) []A
 }
 
 func markLatestPendingToolFailed(messages []AgentMessage, reason string) []AgentMessage {
+	reason = textutil.NormalizeInlineText(reason)
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].ToolCall == nil {
 			continue
@@ -249,10 +252,10 @@ func markLatestPendingToolFailed(messages []AgentMessage, reason string) []Agent
 func normalizeToolCall(toolCall AgentToolCall) AgentToolCall {
 	return AgentToolCall{
 		CallID:    strings.TrimSpace(toolCall.CallID),
-		AgentName: strings.TrimSpace(toolCall.AgentName),
-		ToolName:  strings.TrimSpace(toolCall.ToolName),
-		Summary:   strings.TrimSpace(toolCall.Summary),
-		Result:    strings.TrimSpace(toolCall.Result),
+		AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
+		ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
+		Summary:   textutil.NormalizeInlineText(toolCall.Summary),
+		Result:    textutil.NormalizeInlineText(toolCall.Result),
 		State:     toolCall.State,
 	}
 }
@@ -304,7 +307,7 @@ func renderableTimelineMessage(message AgentMessage) bool {
 	if message.ToolCall != nil {
 		return strings.TrimSpace(message.ToolCall.ToolName) != ""
 	}
-	return strings.TrimSpace(message.Content) != ""
+	return textutil.NormalizeTrimmedText(message.Content) != ""
 }
 
 func normalizeConversationRole(role string) string {
@@ -337,16 +340,16 @@ func renderTimelineMessage(message AgentMessage, width int) string {
 	case "user":
 		return strings.Join(renderUserMessage(message, width), "\n")
 	case "system":
-		return strings.Join(renderPrefixedMarkdown(strings.TrimSpace(message.Content), width, systemBulletPrefixStyle.Render("• "), "  ", systemBodyStyle), "\n")
+		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, systemBulletPrefixStyle.Render("• "), "  ", systemBodyStyle), "\n")
 	case "error":
-		return strings.Join(renderPrefixedMarkdown(strings.TrimSpace(message.Content), width, errorBulletPrefixStyle.Render("• "), "  ", errorBodyStyle), "\n")
+		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, errorBulletPrefixStyle.Render("• "), "  ", errorBodyStyle), "\n")
 	default:
-		return strings.Join(renderPrefixedMarkdown(strings.TrimSpace(message.Content), width, assistantBulletPrefixStyle.Render("• "), "  ", assistantBodyStyle), "\n")
+		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, assistantBulletPrefixStyle.Render("• "), "  ", assistantBodyStyle), "\n")
 	}
 }
 
 func renderUserMessage(message AgentMessage, width int) []string {
-	lines := renderPrefixedMarkdown(strings.TrimSpace(message.Content), width, userPromptPrefixStyle.Render("> "), "  ", userBodyStyle)
+	lines := renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, userPromptPrefixStyle.Render("> "), "  ", userBodyStyle)
 	if message.CitedCommandCount <= 0 {
 		return lines
 	}
@@ -375,7 +378,7 @@ func formatUserCommandSummary(count int) string {
 }
 
 func renderPrefixedMarkdown(content string, width int, prefix, continuation string, bodyStyle lipgloss.Style) []string {
-	content = strings.TrimSpace(content)
+	content = textutil.NormalizeTrimmedText(content)
 	if content == "" {
 		return nil
 	}

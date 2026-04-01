@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 )
 
@@ -79,6 +80,62 @@ func (d *DB) ListAgentSessions(limit int) ([]AgentSession, error) {
 		return nil, fmt.Errorf("failed to iterate agent sessions: %w", err)
 	}
 	return sessions, nil
+}
+
+func (d *DB) GetAgentSession(sessionID string) (AgentSession, bool, error) {
+	if sessionID == "" {
+		return AgentSession{}, false, fmt.Errorf("session id is empty")
+	}
+	query := `
+		SELECT id, name, mode, team_name, spec_snapshot_json, cwd, created_at, updated_at
+		FROM agent_sessions
+		WHERE id = ?
+	`
+	var session AgentSession
+	err := d.conn.QueryRow(query, sessionID).Scan(
+		&session.ID,
+		&session.Name,
+		&session.Mode,
+		&session.TeamName,
+		&session.SpecSnapshotJSON,
+		&session.Cwd,
+		&session.CreatedAt,
+		&session.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return AgentSession{}, false, nil
+	}
+	if err != nil {
+		return AgentSession{}, false, fmt.Errorf("failed to get agent session: %w", err)
+	}
+	return session, true, nil
+}
+
+func (d *DB) LatestAgentSession() (AgentSession, bool, error) {
+	query := `
+		SELECT id, name, mode, team_name, spec_snapshot_json, cwd, created_at, updated_at
+		FROM agent_sessions
+		ORDER BY updated_at DESC
+		LIMIT 1
+	`
+	var session AgentSession
+	err := d.conn.QueryRow(query).Scan(
+		&session.ID,
+		&session.Name,
+		&session.Mode,
+		&session.TeamName,
+		&session.SpecSnapshotJSON,
+		&session.Cwd,
+		&session.CreatedAt,
+		&session.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return AgentSession{}, false, nil
+	}
+	if err != nil {
+		return AgentSession{}, false, fmt.Errorf("failed to get latest agent session: %w", err)
+	}
+	return session, true, nil
 }
 
 // UpdateAgentSessionUpdatedAt updates the session's updated_at.

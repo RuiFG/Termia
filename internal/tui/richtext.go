@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/termia/termia/internal/textutil"
 )
 
 type styledSpan struct {
@@ -13,7 +14,7 @@ type styledSpan struct {
 
 func renderMarkdown(text string, width int, baseStyle lipgloss.Style) string {
 	width = maxInt(1, width)
-	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = textutil.NormalizeLineEndings(text)
 	lines := strings.Split(text, "\n")
 	var rendered []string
 	inCodeBlock := false

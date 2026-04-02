@@ -3583,31 +3583,31 @@ func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName s
 	}
 
 	state := agentapp.SessionState{Mode: mode, TeamName: strings.TrimSpace(teamName)}
-	foundSession := false
-	for i := range a.sessions {
-		if a.sessions[i].ID != sessionID {
-			continue
-		}
-		existingState, err := agentapp.DecodeSessionState(a.sessions[i].SpecSnapshotJSON)
-		if err != nil {
-			return err
-		}
-		state.SessionMiddleware = append([]agentapp.MiddlewareActivation(nil), existingState.SessionMiddleware...)
-		foundSession = true
-		break
-	}
-	if !foundSession && a.db != nil {
+	var snapshotSource string
+	if a.db != nil {
 		session, ok, err := a.db.GetAgentSession(sessionID)
 		if err != nil {
 			return err
 		}
 		if ok {
-			existingState, err := agentapp.DecodeSessionState(session.SpecSnapshotJSON)
-			if err != nil {
-				return err
-			}
-			state.SessionMiddleware = append([]agentapp.MiddlewareActivation(nil), existingState.SessionMiddleware...)
+			snapshotSource = session.SpecSnapshotJSON
 		}
+	}
+	if strings.TrimSpace(snapshotSource) == "" {
+		for i := range a.sessions {
+			if a.sessions[i].ID != sessionID {
+				continue
+			}
+			snapshotSource = a.sessions[i].SpecSnapshotJSON
+			break
+		}
+	}
+	if strings.TrimSpace(snapshotSource) != "" {
+		existingState, err := agentapp.DecodeSessionState(snapshotSource)
+		if err != nil {
+			return err
+		}
+		state.SessionMiddleware = append([]agentapp.MiddlewareActivation(nil), existingState.SessionMiddleware...)
 	}
 
 	specSnapshot, err := agentapp.EncodeSessionState(state)

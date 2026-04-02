@@ -57,16 +57,16 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 		return nil, fmt.Errorf("service is not initialized")
 	}
 
-	query, runMiddleware, err := s.resolveRunMiddleware(req.Query)
-	if err != nil {
-		return nil, err
-	}
-	s.lastRunMiddleware = append([]MiddlewareActivation(nil), runMiddleware...)
-
 	session, state, err := s.sessions.Resolve(req.SessionID, req.Cwd, DefaultSessionState(), nil)
 	if err != nil {
 		return nil, err
 	}
+
+	query, state, runMiddleware, err := s.applySharedSlashCommand(session.ID, state, req.Query)
+	if err != nil {
+		return nil, err
+	}
+	s.lastRunMiddleware = append([]MiddlewareActivation(nil), runMiddleware...)
 
 	history, err := s.loadMessages(session.ID)
 	if err != nil {
@@ -99,21 +99,29 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 	return out, nil
 }
 
-func (s *Service) resolveRunMiddleware(query string) (string, []MiddlewareActivation, error) {
+func (s *Service) applySharedSlashCommand(sessionID string, state SessionState, query string) (string, SessionState, []MiddlewareActivation, error) {
 	query = strings.TrimSpace(query)
 	command, ok := ResolveSharedSlashCommand(query, s.sharedCommands)
 	if !ok {
-		return query, nil, nil
+		return query, state, nil, nil
 	}
 	args := strings.TrimSpace(strings.TrimPrefix(query, "/"+command.Name))
 	if command.BuildActivation == nil {
-		return "", nil, fmt.Errorf("shared slash command %q has no activation builder", command.Name)
+		return "", SessionState{}, nil, fmt.Errorf("shared slash command %q has no activation builder", command.Name)
 	}
 	activation, err := command.BuildActivation(args)
 	if err != nil {
-		return "", nil, err
+		return "", SessionState{}, nil, err
 	}
-	return args, []MiddlewareActivation{activation}, nil
+	if activation.Scope == MiddlewareScopeSession {
+		state = appendSessionMiddlewareActivation(state, activation)
+		updatedState, err := s.sessions.Update(sessionID, state, nil)
+		if err != nil {
+			return "", SessionState{}, nil, err
+		}
+		return args, updatedState, nil, nil
+	}
+	return args, state, []MiddlewareActivation{activation}, nil
 }
 
 func (s *Service) buildMiddleware(sessionMiddleware, runMiddleware []MiddlewareActivation) ([]Middleware, error) {
@@ -149,6 +157,22 @@ func (s *Service) runLoop(
 	messages := append([]runtimeagent.Message(nil), history...)
 
 	for {
+		if !hasRuntimeInput(query, runCtx.SelectedCommands, streamReader) {
+			timeline := make([]TimelineEntry, 0, 1)
+			directive, ok := s.runAfterRunMiddleware(ctx, out, runCtx, middleware, RunSummary{}, &timeline)
+			if err := s.persistTimelineMessages(runCtx.SessionID, timeline); err != nil {
+				emitRuntimeEvent(ctx, out, runtimeagent.RuntimeEvent{Kind: runtimeagent.RuntimeEventError, Text: err.Error()})
+				return
+			}
+			if !ok || !directive.Continue || strings.TrimSpace(directive.NextQuery) == "" {
+				return
+			}
+			query = strings.TrimSpace(directive.NextQuery)
+			runCtx.Query = query
+			runCtx.Cwd = cwd
+			continue
+		}
+
 		stream, err := s.startRuntime(ctx, runCtx, messages, query, cwd, streamReader, responder)
 		if err != nil {
 			emitRuntimeEvent(ctx, out, runtimeagent.RuntimeEvent{Kind: runtimeagent.RuntimeEventError, Text: err.Error()})
@@ -201,6 +225,10 @@ func (s *Service) runLoop(
 		runCtx.Query = query
 		runCtx.Cwd = cwd
 	}
+}
+
+func hasRuntimeInput(query string, commands []runtimeagent.Command, streamReader *runtimeagent.StreamReader) bool {
+	return strings.TrimSpace(query) != "" || len(commands) > 0 || streamReader != nil
 }
 
 func (s *Service) startRuntime(
@@ -473,4 +501,26 @@ func emitRuntimeEvent(ctx context.Context, out chan<- runtimeagent.RuntimeEvent,
 	case out <- event:
 		return true
 	}
+}
+
+func appendSessionMiddlewareActivation(state SessionState, activation MiddlewareActivation) SessionState {
+	for _, current := range state.SessionMiddleware {
+		if middlewareActivationEqual(current, activation) {
+			return state
+		}
+	}
+	state.SessionMiddleware = append(state.SessionMiddleware, activation)
+	return state
+}
+
+func middlewareActivationEqual(left, right MiddlewareActivation) bool {
+	if left.Name != right.Name || left.Scope != right.Scope || len(left.Args) != len(right.Args) {
+		return false
+	}
+	for key, value := range left.Args {
+		if right.Args[key] != value {
+			return false
+		}
+	}
+	return true
 }

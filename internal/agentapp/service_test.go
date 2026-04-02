@@ -17,6 +17,16 @@ type fakeRuntime struct {
 	eventsPerRun [][]runtimeagent.RuntimeEvent
 }
 
+type fakeMiddleware struct{}
+
+func (fakeMiddleware) BeforeRun(context.Context, *RunContext) error {
+	return nil
+}
+
+func (fakeMiddleware) AfterRun(context.Context, *RunContext, RunSummary) (RunDirective, error) {
+	return RunDirective{}, nil
+}
+
 func (f *fakeRuntime) Run(ctx context.Context, req runtimeagent.RunRequest) (<-chan runtimeagent.RuntimeEvent, error) {
 	runIndex := len(f.requests)
 	f.requests = append(f.requests, req)
@@ -202,6 +212,57 @@ func TestServiceRunPersistsUserAndAssistantMessagesAndLoadsHistory(t *testing.T)
 	}
 	if gotSession.Cwd != "/tmp/next" {
 		t.Fatalf("expected session cwd to be updated from runtime event, got %+v", gotSession)
+	}
+}
+
+func TestServiceRunPersistsSessionScopedSlashMiddleware(t *testing.T) {
+	t.Setenv("TERMIA_SESSION_ID", "missing")
+	runtime := &fakeRuntime{eventsPerRun: [][]runtimeagent.RuntimeEvent{{}}}
+	svc, database := newTestService(t, runtime)
+	svc.registry = NewRegistry(MiddlewareSpec{
+		Name:        "sticky",
+		Description: "sticky session middleware",
+		Scope:       MiddlewareScopeSession,
+		Factory: func(MiddlewareActivation) (Middleware, error) {
+			return fakeMiddleware{}, nil
+		},
+	})
+	svc.sharedCommands = []SharedSlashCommand{{
+		Name:        "sticky",
+		Description: "install sticky",
+		Scope:       MiddlewareScopeSession,
+		BuildActivation: func(string) (MiddlewareActivation, error) {
+			return MiddlewareActivation{Name: "sticky", Scope: MiddlewareScopeSession}, nil
+		},
+	}}
+
+	session := createServiceTestSession(t, database, DefaultSessionState(), "/tmp/project")
+	stream, err := svc.Run(context.Background(), RunRequest{SessionID: session.ID, Query: "/sticky", Cwd: "/tmp/project"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for event := range stream {
+		if event.Kind == runtimeagent.RuntimeEventError {
+			t.Fatalf("unexpected service error: %s", event.Text)
+		}
+	}
+
+	gotSession, ok, err := database.GetAgentSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetAgentSession returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected session to exist")
+	}
+	state, err := DecodeSessionState(gotSession.SpecSnapshotJSON)
+	if err != nil {
+		t.Fatalf("DecodeSessionState returned error: %v", err)
+	}
+	if len(state.SessionMiddleware) != 1 || state.SessionMiddleware[0].Name != "sticky" || state.SessionMiddleware[0].Scope != MiddlewareScopeSession {
+		t.Fatalf("expected session middleware to persist, got %+v", state.SessionMiddleware)
+	}
+	if len(runtime.requests) != 0 {
+		t.Fatalf("expected pure session middleware installation to skip runtime execution, got %+v", runtime.requests)
 	}
 }
 

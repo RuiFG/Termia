@@ -14,6 +14,7 @@ type SessionDB interface {
 	GetAgentSession(id string) (db.AgentSession, bool, error)
 	LatestAgentSession() (db.AgentSession, bool, error)
 	CreateAgentSession(session *db.AgentSession) error
+	UpdateAgentSessionRuntime(sessionID, mode, teamName, specSnapshotJSON string, updatedAt int64) error
 }
 
 type SessionService struct {
@@ -57,6 +58,30 @@ func (s *SessionService) Resolve(preferredID, cwd string, defaultState SessionSt
 	}
 
 	return s.createSession(cwd, defaultState, now())
+}
+
+func (s *SessionService) Update(sessionID string, state SessionState, now func() time.Time) (SessionState, error) {
+	if s == nil || s.database == nil {
+		return SessionState{}, fmt.Errorf("session database is nil")
+	}
+	if now == nil {
+		now = time.Now
+	}
+
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return SessionState{}, fmt.Errorf("session id is empty")
+	}
+
+	state = normalizeResolvedSessionState(state)
+	specSnapshotJSON, err := EncodeSessionState(state)
+	if err != nil {
+		return SessionState{}, err
+	}
+	if err := s.database.UpdateAgentSessionRuntime(sessionID, string(state.Mode), state.TeamName, specSnapshotJSON, now().UnixNano()); err != nil {
+		return SessionState{}, err
+	}
+	return state, nil
 }
 
 func (s *SessionService) resolveByID(id string) (db.AgentSession, SessionState, bool, error) {

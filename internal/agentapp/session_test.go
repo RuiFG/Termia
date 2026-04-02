@@ -243,6 +243,51 @@ func TestSessionServiceResolveUsesLatestWhenPreferredAndCurrentMissing(t *testin
 	}
 }
 
+func TestSessionServiceUpdatePersistsSessionState(t *testing.T) {
+	database := &fakeSessionDB{
+		sessions: map[string]db.AgentSession{
+			"session-1": {
+				ID:   "session-1",
+				Name: "Session 1",
+			},
+		},
+	}
+	service := NewSessionService(database)
+
+	state := SessionState{
+		Mode:     runtimeagent.ModeTeam,
+		TeamName: "  ops  ",
+		SessionMiddleware: []MiddlewareActivation{{
+			Name:  "sticky",
+			Scope: MiddlewareScopeSession,
+		}},
+	}
+	got, err := service.Update(" session-1 ", state, func() time.Time {
+		return time.Unix(99, 0)
+	})
+	if err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+
+	if got.Mode != runtimeagent.ModeTeam || got.TeamName != "ops" {
+		t.Fatalf("expected normalized state, got %+v", got)
+	}
+	session := database.sessions["session-1"]
+	if session.Mode != string(runtimeagent.ModeTeam) || session.TeamName != "ops" {
+		t.Fatalf("expected runtime metadata to persist, got %+v", session)
+	}
+	if session.UpdatedAt != time.Unix(99, 0).UnixNano() {
+		t.Fatalf("expected updated timestamp to persist, got %+v", session)
+	}
+	decoded, err := DecodeSessionState(session.SpecSnapshotJSON)
+	if err != nil {
+		t.Fatalf("DecodeSessionState returned error: %v", err)
+	}
+	if len(decoded.SessionMiddleware) != 1 || decoded.SessionMiddleware[0].Name != "sticky" {
+		t.Fatalf("expected session middleware to persist, got %+v", decoded)
+	}
+}
+
 type fakeSessionDB struct {
 	sessions map[string]db.AgentSession
 	latestID string
@@ -275,5 +320,21 @@ func (f *fakeSessionDB) CreateAgentSession(session *db.AgentSession) error {
 	}
 	f.sessions[session.ID] = *session
 	f.latestID = session.ID
+	return nil
+}
+
+func (f *fakeSessionDB) UpdateAgentSessionRuntime(sessionID, mode, teamName, specSnapshotJSON string, updatedAt int64) error {
+	if f.sessions == nil {
+		return nil
+	}
+	session, ok := f.sessions[strings.TrimSpace(sessionID)]
+	if !ok {
+		return nil
+	}
+	session.Mode = mode
+	session.TeamName = teamName
+	session.SpecSnapshotJSON = specSnapshotJSON
+	session.UpdatedAt = updatedAt
+	f.sessions[strings.TrimSpace(sessionID)] = session
 	return nil
 }

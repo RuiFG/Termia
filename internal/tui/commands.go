@@ -61,32 +61,23 @@ func renderModelsText(cfg *config.LLMConfig) string {
 	var b strings.Builder
 	b.WriteString("LLM Model Configuration:\n")
 	b.WriteString("─────────────────────────────\n")
-	b.WriteString(fmt.Sprintf("  Default Provider: %s\n\n", cfg.DefaultProvider))
+	b.WriteString(fmt.Sprintf("  Default Provider: %s\n\n", cfg.ProviderDisplayName(cfg.DefaultProvider)))
 
-	providers := []struct {
-		name string
-		cfg  config.LLMProviderConfig
-	}{
-		{"OpenAI", cfg.OpenAI},
-		{"Anthropic", cfg.Anthropic},
-		{"DeepSeek", cfg.DeepSeek},
-		{"Ollama", cfg.Ollama},
-	}
-
-	for _, p := range providers {
-		model := p.cfg.Model
+	for _, provider := range cfg.ModelProviders() {
+		providerCfg := provider.Config
+		model := providerCfg.Model
 		if model == "" {
 			model = "(not set)"
 		}
-		keyEnv := p.cfg.APIKeyEnv
-		if keyEnv == "" {
-			keyEnv = "(not set)"
+		keyState := "(not set)"
+		if providerCfg.ResolvedAPIKey() != "" {
+			keyState = "configured"
 		}
-		b.WriteString(fmt.Sprintf("  %s:\n", p.name))
+		b.WriteString(fmt.Sprintf("  %s:\n", provider.DisplayName))
 		b.WriteString(fmt.Sprintf("    Model:   %s\n", model))
-		b.WriteString(fmt.Sprintf("    API Key: %s\n", keyEnv))
-		if p.cfg.BaseURL != "" {
-			b.WriteString(fmt.Sprintf("    URL:     %s\n", p.cfg.BaseURL))
+		b.WriteString(fmt.Sprintf("    API Key: %s\n", keyState))
+		if providerCfg.BaseURL != "" {
+			b.WriteString(fmt.Sprintf("    URL:     %s\n", providerCfg.BaseURL))
 		}
 		b.WriteString("\n")
 	}

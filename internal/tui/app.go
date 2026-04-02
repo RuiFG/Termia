@@ -21,6 +21,7 @@ import (
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"github.com/termia/termia/internal/diagnostics"
+	"github.com/termia/termia/internal/llm"
 	"github.com/termia/termia/internal/sessionstate"
 	"github.com/termia/termia/internal/textutil"
 	"go.uber.org/zap"
@@ -66,7 +67,9 @@ type paletteStage int
 
 const (
 	paletteStageSuggested paletteStage = iota
+	paletteStageProviders
 	paletteStageModels
+	paletteStageProviderDetail
 	paletteStageSessions
 	paletteStageTeams
 )
@@ -74,26 +77,44 @@ const (
 type paletteAction int
 
 const (
-	paletteActionOpenModels paletteAction = iota
+	paletteActionNoop paletteAction = iota
+	paletteActionOpenProviders
+	paletteActionOpenModels
 	paletteActionOpenSessions
 	paletteActionNewSession
+	paletteActionOpenProvider
+	paletteActionCreateProvider
+	paletteActionEditProviderField
+	paletteActionClearProviderField
+	paletteActionDeleteProvider
 	paletteActionSelectModel
 	paletteActionSelectAgent
 	paletteActionSelectSession
+	paletteActionBackToProviders
 )
 
 type paletteItem struct {
-	Label  string
-	Desc   string
-	Action paletteAction
-	Value  string
-	Header bool
+	Label    string
+	Desc     string
+	Action   paletteAction
+	Value    string
+	Provider string
+	Field    llm.ProviderConfigField
+	Header   bool
 }
 
 type paletteSection struct {
 	Label string
 	Items []paletteItem
 }
+
+type customProviderField int
+
+const (
+	customProviderFieldName customProviderField = iota
+	customProviderFieldAPIKey
+	customProviderFieldBaseURL
+)
 
 // App is the main TUI model that orchestrates the 3-panel layout.
 type App struct {
@@ -179,10 +200,30 @@ type App struct {
 	pendingPrompts         map[string][]db.PendingPrompt
 
 	// Command palette
-	paletteOpen  bool
-	paletteStage paletteStage
-	paletteIndex int
-	paletteQuery string
+	paletteOpen           bool
+	paletteStage          paletteStage
+	paletteIndex          int
+	paletteScroll         int
+	paletteQuery          string
+	activePaletteProvider string
+
+	providerConfigOpen     bool
+	providerConfigInput    textinput.Model
+	providerConfigProvider string
+	providerConfigField    llm.ProviderConfigField
+	providerConfigError    string
+	providerModels         map[string][]llm.ModelDescriptor
+	providerModelErrors    map[string]string
+	providerModelLoading   map[string]bool
+	saveConfigFn           func(*config.Config) error
+	listModelsFn           func(context.Context, config.ProviderMeta) ([]llm.ModelDescriptor, error)
+
+	customProviderOpen         bool
+	customProviderFocus        customProviderField
+	customProviderNameInput    textinput.Model
+	customProviderAPIKeyInput  textinput.Model
+	customProviderBaseURLInput textinput.Model
+	customProviderError        string
 
 	dirPromptOpen    bool
 	dirPromptInput   textinput.Model
@@ -265,6 +306,16 @@ type favoriteToggledMsg struct {
 	id string
 }
 
+type providerModelsLoadedMsg struct {
+	provider string
+	models   []llm.ModelDescriptor
+}
+
+type providerModelsErrorMsg struct {
+	provider string
+	err      error
+}
+
 func newDirPromptInput() textinput.Model {
 	input := textinput.New()
 	input.Placeholder = ""
@@ -274,6 +325,21 @@ func newDirPromptInput() textinput.Model {
 	input.Cursor.Style = inputCursorStyle
 	input.Cursor.Blink = false
 	return input
+}
+
+func newProviderConfigInput() textinput.Model {
+	input := textinput.New()
+	input.Placeholder = ""
+	input.Prompt = "> "
+	input.PromptStyle = inputPromptStyle
+	input.CharLimit = 2048
+	input.Cursor.Style = inputCursorStyle
+	input.Cursor.Blink = false
+	return input
+}
+
+func newCustomProviderInput() textinput.Model {
+	return newProviderConfigInput()
 }
 
 // New creates a new App model.
@@ -292,33 +358,44 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		mode = AgentModeTeam
 	}
 	app := App{
-		db:               database,
-		cfg:              cfg,
-		logger:           logger,
-		focus:            FocusInput, // Start with input focused (standard TUI pattern)
-		middleMode:       ModeAgent,  // Default to Agent view
-		agentMode:        mode,
-		thinkLevel:       ThinkMedium,
-		firstUpdate:      &firstUpdate,
-		firstView:        &firstView,
-		history:          NewHistoryModel(keys),
-		preview:          NewPreviewModel(keys),
-		detail:           NewHistoryDetailModel(keys),
-		agent:            NewAgentModel(keys),
-		modal:            NewModalModel(),
-		input:            input,
-		approvalInput:    NewApprovalInput(),
-		approvalRequests: make(chan approvalRequest),
-		askInput:         NewAskInput(),
-		askRequests:      make(chan askRequest),
-		keys:             keys,
-		teams:            teams,
-		activeTeamName:   activeName,
-		launchCwd:        cwd,
-		cwd:              cwd,
-		sessionCwds:      make(map[string]string),
-		pendingPrompts:   make(map[string][]db.PendingPrompt),
-		dirPromptInput:   newDirPromptInput(),
+		db:                         database,
+		cfg:                        cfg,
+		logger:                     logger,
+		focus:                      FocusInput, // Start with input focused (standard TUI pattern)
+		middleMode:                 ModeAgent,  // Default to Agent view
+		agentMode:                  mode,
+		thinkLevel:                 ThinkMedium,
+		firstUpdate:                &firstUpdate,
+		firstView:                  &firstView,
+		history:                    NewHistoryModel(keys),
+		preview:                    NewPreviewModel(keys),
+		detail:                     NewHistoryDetailModel(keys),
+		agent:                      NewAgentModel(keys),
+		modal:                      NewModalModel(),
+		input:                      input,
+		approvalInput:              NewApprovalInput(),
+		approvalRequests:           make(chan approvalRequest),
+		askInput:                   NewAskInput(),
+		askRequests:                make(chan askRequest),
+		keys:                       keys,
+		teams:                      teams,
+		activeTeamName:             activeName,
+		launchCwd:                  cwd,
+		cwd:                        cwd,
+		sessionCwds:                make(map[string]string),
+		pendingPrompts:             make(map[string][]db.PendingPrompt),
+		dirPromptInput:             newDirPromptInput(),
+		providerConfigInput:        newProviderConfigInput(),
+		customProviderNameInput:    newCustomProviderInput(),
+		customProviderAPIKeyInput:  newCustomProviderInput(),
+		customProviderBaseURLInput: newCustomProviderInput(),
+		providerModels:             make(map[string][]llm.ModelDescriptor),
+		providerModelErrors:        make(map[string]string),
+		providerModelLoading:       make(map[string]bool),
+		saveConfigFn: func(cfg *config.Config) error {
+			return config.Save(cfg, config.ConfigPath())
+		},
+		listModelsFn: llm.ListModels,
 	}
 	app.updateInputPrompt()
 	return app
@@ -485,6 +562,18 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Reload commands to reflect the toggle
 		return a, loadCommandsCmd(a.db)
 
+	case providerModelsLoadedMsg:
+		a.providerModels[msg.provider] = append([]llm.ModelDescriptor(nil), msg.models...)
+		delete(a.providerModelErrors, msg.provider)
+		a.providerModelLoading[msg.provider] = false
+		a.syncThinkLevelForCurrentModel()
+		return a, nil
+
+	case providerModelsErrorMsg:
+		a.providerModelLoading[msg.provider] = false
+		a.providerModelErrors[msg.provider] = msg.err.Error()
+		return a, nil
+
 	case SlashCommandResult:
 		return a.handleSlashResult(msg)
 
@@ -594,6 +683,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if a.modal.IsOpen() {
 			return a.handleModalKey(msg)
+		}
+		if a.customProviderOpen {
+			return a.handleCustomProviderKey(msg)
+		}
+		if a.providerConfigOpen {
+			return a.handleProviderConfigKey(msg)
 		}
 		if a.dirPromptOpen {
 			return a.handleDirPromptKey(msg)
@@ -1902,8 +1997,16 @@ func (a App) View() string {
 	}
 
 	if a.paletteOpen {
-		palette := a.renderCommandPalette(innerW)
+		palette := a.renderCommandPalette(innerW, innerH)
 		body = overlayContentCentered(body, palette, innerW, innerH)
+	}
+	if a.providerConfigOpen {
+		prompt := a.renderProviderConfigPrompt(innerW)
+		body = overlayContentCentered(body, prompt, innerW, innerH)
+	}
+	if a.customProviderOpen {
+		prompt := a.renderCustomProviderPrompt(innerW)
+		body = overlayContentCentered(body, prompt, innerW, innerH)
 	}
 	if a.dirPromptOpen {
 		prompt := a.renderDirPrompt(innerW)
@@ -2169,22 +2272,17 @@ func (a App) renderAgentLabel() string {
 }
 
 func (a App) currentModelLabel() string {
-	provider := strings.ToLower(strings.TrimSpace(a.cfg.LLM.DefaultProvider))
-	switch provider {
-	case "openai":
-		return a.cfg.LLM.OpenAI.Model
-	case "anthropic":
-		return a.cfg.LLM.Anthropic.Model
-	case "deepseek":
-		return a.cfg.LLM.DeepSeek.Model
-	case "ollama":
-		return a.cfg.LLM.Ollama.Model
-	default:
+	providerCfg, ok := a.cfg.LLM.ProviderConfig(a.cfg.LLM.DefaultProvider)
+	if !ok {
 		return ""
 	}
+	return strings.TrimSpace(providerCfg.Model)
 }
 
 func (a App) thinkLevelLabel() string {
+	if len(a.currentThinkingLevels()) == 0 {
+		return ""
+	}
 	switch a.thinkLevel {
 	case ThinkLow:
 		return "Low"
@@ -2240,7 +2338,7 @@ func (a App) renderStatusBar(contentWidth int) string {
 func (a App) renderStatusHints() string {
 	hints := fmt.Sprintf("Ctrl+P %s | Ctrl+T %s | Tab %s",
 		metaStyle.Render("command"),
-		metaStyle.Render("variants"),
+		metaStyle.Render("thinking"),
 		metaStyle.Render("windows"),
 	)
 	badge := a.pendingPromptBadge()
@@ -2330,6 +2428,7 @@ func overlayStatusLine(left, right string, width int) string {
 func (a *App) openPalette() {
 	a.paletteOpen = true
 	a.paletteStage = paletteStageSuggested
+	a.activePaletteProvider = ""
 	a.paletteQuery = ""
 	a.resetPaletteIndex()
 }
@@ -2337,6 +2436,17 @@ func (a *App) openPalette() {
 func (a *App) openPaletteStage(stage paletteStage) {
 	a.paletteOpen = true
 	a.paletteStage = stage
+	if stage != paletteStageProviderDetail {
+		a.activePaletteProvider = ""
+	}
+	a.paletteQuery = ""
+	a.resetPaletteIndex()
+}
+
+func (a *App) openProviderPalette(provider string) {
+	a.paletteOpen = true
+	a.paletteStage = paletteStageProviderDetail
+	a.activePaletteProvider = config.NormalizeProviderName(provider)
 	a.paletteQuery = ""
 	a.resetPaletteIndex()
 }
@@ -2344,7 +2454,9 @@ func (a *App) openPaletteStage(stage paletteStage) {
 func (a *App) closePalette() {
 	a.paletteOpen = false
 	a.paletteStage = paletteStageSuggested
+	a.activePaletteProvider = ""
 	a.paletteIndex = 0
+	a.paletteScroll = 0
 	a.paletteQuery = ""
 }
 
@@ -2352,9 +2464,11 @@ func (a *App) movePaletteSelection(delta int) {
 	items := a.paletteVisibleItems()
 	if len(items) == 0 {
 		a.paletteIndex = 0
+		a.paletteScroll = 0
 		return
 	}
 	a.paletteIndex = nextSelectableIndex(items, a.paletteIndex, delta)
+	a.ensurePaletteVisible()
 }
 
 func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
@@ -2371,22 +2485,39 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	switch item.Action {
-	case paletteActionOpenModels:
-		a.paletteStage = paletteStageModels
-		a.paletteIndex = 0
+	case paletteActionOpenProviders:
+		a.openPaletteStage(paletteStageProviders)
 		return a, nil
+	case paletteActionOpenModels:
+		a.openPaletteStage(paletteStageModels)
+		return a, a.beginModelsPaletteLoad()
 	case paletteActionOpenSessions:
-		a.paletteStage = paletteStageSessions
-		a.paletteIndex = 0
+		a.openPaletteStage(paletteStageSessions)
 		return a, nil
 	case paletteActionNewSession:
 		a.closePalette()
 		return a, createSessionCmd(a.db, a.launchCwd, a.currentRuntimeMode(), a.activeTeamName)
-	case paletteActionSelectModel:
-		a.cfg.LLM.DefaultProvider = item.Value
-		a.statusMsg = fmt.Sprintf("Model switched to %s.", item.Label)
-		a.closePalette()
+	case paletteActionOpenProvider:
+		a.openProviderPalette(item.Value)
 		return a, nil
+	case paletteActionCreateProvider:
+		a.closePalette()
+		a.openCustomProviderPrompt()
+		return a, nil
+	case paletteActionBackToProviders:
+		a.openPaletteStage(paletteStageProviders)
+		return a, nil
+	case paletteActionEditProviderField:
+		provider := a.activePaletteProvider
+		a.closePalette()
+		a.openProviderConfigPrompt(provider, item.Field)
+		return a, nil
+	case paletteActionClearProviderField:
+		return a.clearProviderField(item.Provider, item.Field)
+	case paletteActionDeleteProvider:
+		return a.deleteCustomProvider(item.Provider)
+	case paletteActionSelectModel:
+		return a.selectProviderModel(item.Provider, item.Value)
 	case paletteActionSelectAgent:
 		if item.Value == "assistant" {
 			a.agentMode = AgentModeAgent
@@ -2638,17 +2769,27 @@ func (a App) handleInputSelection(msg tea.MouseMsg, contentX, contentY int) (boo
 }
 
 func (a *App) cycleThinkLevel() {
-	switch a.thinkLevel {
-	case ThinkLow:
-		a.thinkLevel = ThinkMedium
-	case ThinkMedium:
-		a.thinkLevel = ThinkHigh
-	default:
-		a.thinkLevel = ThinkLow
+	levels := a.currentThinkingLevels()
+	if len(levels) == 0 {
+		a.statusMsg = "Current model does not advertise thinking levels."
+		return
 	}
+
+	currentIndex := 0
+	for i, level := range levels {
+		if level == a.thinkLevel {
+			currentIndex = i
+			break
+		}
+	}
+	a.thinkLevel = levels[(currentIndex+1)%len(levels)]
+	if !a.persistCurrentThinkLevel() {
+		return
+	}
+	a.statusMsg = fmt.Sprintf("Thinking level set to %s.", a.thinkLevelLabel())
 }
 
-func (a App) renderCommandPalette(totalWidth int) string {
+func (a App) renderCommandPalette(totalWidth int, totalHeight int) string {
 	items := a.paletteVisibleItems()
 	if totalWidth <= 0 {
 		return ""
@@ -2675,7 +2816,9 @@ func (a App) renderCommandPalette(totalWidth int) string {
 	if selectedIndex < 0 || selectedIndex >= len(items) || items[selectedIndex].Header {
 		selectedIndex = firstSelectableIndex(items)
 	}
-	for i, item := range items {
+	start, end := a.paletteWindow(totalHeight, items)
+	for i, item := range items[start:end] {
+		itemIndex := start + i
 		if item.Header {
 			// Spacer rows inside the overlay make the palette taller and cause it
 			// to collide visually with the surrounding panes.
@@ -2684,7 +2827,7 @@ func (a App) renderCommandPalette(totalWidth int) string {
 		}
 		line := a.formatPaletteLine(item.Label, item.Desc, contentWidth)
 		style := normalRowStyle
-		if i == selectedIndex {
+		if itemIndex == selectedIndex {
 			style = selectedSlashRowStyle
 		}
 		lines = append(lines, style.Width(contentWidth).Inline(true).Render(line))
@@ -2768,8 +2911,12 @@ func (a App) renderPaletteHeader(width int) string {
 
 func (a App) paletteTitle() string {
 	switch a.paletteStage {
+	case paletteStageProviders:
+		return "Providers"
 	case paletteStageModels:
 		return "Models"
+	case paletteStageProviderDetail:
+		return a.providerDetailTitle()
 	case paletteStageSessions:
 		return "Sessions"
 	case paletteStageTeams:
@@ -2781,8 +2928,12 @@ func (a App) paletteTitle() string {
 
 func (a App) paletteItems() []paletteItem {
 	switch a.paletteStage {
+	case paletteStageProviders:
+		return a.providerPaletteItems()
 	case paletteStageModels:
 		return a.modelPaletteItems()
+	case paletteStageProviderDetail:
+		return a.providerDetailPaletteItems()
 	case paletteStageSessions:
 		return a.sessionPaletteItems()
 	case paletteStageTeams:
@@ -2794,14 +2945,19 @@ func (a App) paletteItems() []paletteItem {
 
 func (a App) paletteSections() []paletteSection {
 	switch a.paletteStage {
+	case paletteStageProviders:
+		return a.providerPaletteSections()
 	case paletteStageModels:
-		return []paletteSection{{Label: "Models", Items: a.modelPaletteItems()}}
+		return a.modelPaletteSections()
+	case paletteStageProviderDetail:
+		return a.providerDetailSections()
 	case paletteStageSessions:
 		return []paletteSection{{Label: "Sessions", Items: a.sessionPaletteItems()}}
 	case paletteStageTeams:
 		return []paletteSection{{Label: "Teams", Items: a.teamPaletteItems()}}
 	default:
 		suggested := []paletteItem{
+			{Label: "Providers", Action: paletteActionOpenProviders},
 			{Label: "Models", Action: paletteActionOpenModels},
 			{Label: "Sessions", Action: paletteActionOpenSessions},
 			{Label: "New Session", Action: paletteActionNewSession},
@@ -2831,6 +2987,109 @@ func (a App) paletteVisibleItems() []paletteItem {
 func (a *App) resetPaletteIndex() {
 	items := a.paletteVisibleItems()
 	a.paletteIndex = firstSelectableIndex(items)
+	a.paletteScroll = 0
+	a.ensurePaletteVisible()
+}
+
+func (a *App) ensurePaletteVisible() {
+	items := a.paletteVisibleItems()
+	if len(items) == 0 {
+		a.paletteScroll = 0
+		return
+	}
+	maxItems := a.paletteMaxVisibleItems()
+	if maxItems <= 0 {
+		a.paletteScroll = 0
+		return
+	}
+	if a.paletteIndex < a.paletteScroll {
+		a.paletteScroll = a.paletteIndex
+	}
+	if a.paletteIndex >= a.paletteScroll+maxItems {
+		a.paletteScroll = a.paletteIndex - maxItems + 1
+	}
+	maxScroll := len(items) - maxItems
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if a.paletteScroll > maxScroll {
+		a.paletteScroll = maxScroll
+	}
+	if a.paletteScroll < 0 {
+		a.paletteScroll = 0
+	}
+}
+
+func (a App) paletteMaxVisibleItems() int {
+	_, containerFH := containerStyle.GetFrameSize()
+	innerHeight := a.height - containerFH
+	if innerHeight <= 0 {
+		innerHeight = a.height
+	}
+	if innerHeight <= 0 {
+		return 8
+	}
+	maxPanelHeight := innerHeight - 4
+	if maxPanelHeight < 6 {
+		maxPanelHeight = innerHeight
+	}
+	_, frameH := commandPaletteStyle.GetFrameSize()
+	contentHeight := maxPanelHeight - frameH
+	visible := contentHeight - 2
+	if visible < 1 {
+		visible = 1
+	}
+	return visible
+}
+
+func (a App) paletteWindow(totalHeight int, items []paletteItem) (int, int) {
+	if len(items) == 0 {
+		return 0, 0
+	}
+	maxItems := a.paletteMaxVisibleItems()
+	if totalHeight > 0 {
+		_, frameH := commandPaletteStyle.GetFrameSize()
+		maxPanelHeight := totalHeight - 4
+		if maxPanelHeight < 6 {
+			maxPanelHeight = totalHeight
+		}
+		contentHeight := maxPanelHeight - frameH
+		visible := contentHeight - 2
+		if visible > 0 {
+			maxItems = visible
+		}
+	}
+	if maxItems <= 0 || len(items) <= maxItems {
+		return 0, len(items)
+	}
+	start := a.paletteScroll
+	if start < 0 {
+		start = 0
+	}
+	selectedIndex := a.paletteIndex
+	if selectedIndex < 0 || selectedIndex >= len(items) || items[selectedIndex].Header {
+		selectedIndex = firstSelectableIndex(items)
+	}
+	if selectedIndex >= 0 {
+		if selectedIndex < start {
+			start = selectedIndex
+		}
+		if selectedIndex >= start+maxItems {
+			start = selectedIndex - maxItems + 1
+		}
+	}
+	maxStart := len(items) - maxItems
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	if start > maxStart {
+		start = maxStart
+	}
+	end := start + maxItems
+	if end > len(items) {
+		end = len(items)
+	}
+	return start, end
 }
 
 func filterPaletteItems(items []paletteItem, query string) []paletteItem {
@@ -2876,28 +3135,6 @@ func nextSelectableIndex(items []paletteItem, start, delta int) int {
 		}
 	}
 	return start
-}
-
-func (a App) modelPaletteItems() []paletteItem {
-	providers := []struct {
-		label string
-		key   string
-		model string
-	}{
-		{"OpenAI", "openai", a.cfg.LLM.OpenAI.Model},
-		{"Anthropic", "anthropic", a.cfg.LLM.Anthropic.Model},
-		{"DeepSeek", "deepseek", a.cfg.LLM.DeepSeek.Model},
-		{"Ollama", "ollama", a.cfg.LLM.Ollama.Model},
-	}
-	items := make([]paletteItem, 0, len(providers))
-	for _, p := range providers {
-		model := p.model
-		if strings.TrimSpace(model) == "" {
-			model = "(not set)"
-		}
-		items = append(items, paletteItem{Label: p.label, Desc: model, Action: paletteActionSelectModel, Value: p.key})
-	}
-	return items
 }
 
 func (a App) agentPaletteItems() []paletteItem {

@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/termia/termia/internal/config"
 )
 
 var tuiCmd *cobra.Command
@@ -51,10 +50,6 @@ func sendWrapperRPC(command string) error {
 	if cwd, err := os.Getwd(); err == nil {
 		payload.Cwd = cwd
 	}
-	env := collectLLMEnv(cfg)
-	if len(env) > 0 {
-		payload.Env = env
-	}
 	encoder := json.NewEncoder(conn)
 	if err := encoder.Encode(payload); err != nil {
 		return fmt.Errorf("failed to send wrapper command: %w", err)
@@ -68,34 +63,4 @@ type wrapperRPCPayload struct {
 	CdFile string            `json:"cd_file,omitempty"`
 	Cwd    string            `json:"cwd,omitempty"`
 	Env    map[string]string `json:"env,omitempty"`
-}
-
-func collectLLMEnv(cfg *config.Config) map[string]string {
-	if cfg == nil {
-		return nil
-	}
-	env := make(map[string]string)
-	addEnvValue(env, cfg.LLM.OpenAI.APIKeyEnv)
-	addEnvValue(env, cfg.LLM.Anthropic.APIKeyEnv)
-	addEnvValue(env, cfg.LLM.Ollama.APIKeyEnv)
-	addEnvValue(env, cfg.LLM.DeepSeek.APIKeyEnv)
-	if len(env) == 0 {
-		return nil
-	}
-	return env
-}
-
-func addEnvValue(values map[string]string, key string) {
-	if values == nil {
-		return
-	}
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return
-	}
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return
-	}
-	values[key] = value
 }

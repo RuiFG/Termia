@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/termia/termia/internal/config"
+	"github.com/termia/termia/internal/llm"
 )
 
 const (
@@ -58,18 +59,11 @@ func DefaultModelSpecFromConfig(llmCfg *config.LLMConfig) (ModelSpec, error) {
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(llmCfg.DefaultProvider))
-	switch provider {
-	case "openai":
-		return modelSpecFromProviderConfig("openai", llmCfg.OpenAI)
-	case "anthropic", "claude":
-		return modelSpecFromProviderConfig("anthropic", llmCfg.Anthropic)
-	case "deepseek":
-		return modelSpecFromProviderConfig("deepseek", llmCfg.DeepSeek)
-	case "ollama":
-		return modelSpecFromProviderConfig("ollama", llmCfg.Ollama)
-	default:
+	meta, ok := llmCfg.ProviderMeta(provider)
+	if !ok {
 		return ModelSpec{}, fmt.Errorf("unsupported default provider %q", provider)
 	}
+	return modelSpecFromProviderConfig(meta.Kind, meta.Config)
 }
 
 func modelSpecFromProviderConfig(provider string, cfg config.LLMProviderConfig) (ModelSpec, error) {
@@ -81,12 +75,21 @@ func modelSpecFromProviderConfig(provider string, cfg config.LLMProviderConfig) 
 		return ModelSpec{}, fmt.Errorf("model is required for provider %s", provider)
 	}
 
+	thinkingLevel := llm.NormalizeThinkingLevel(cfg.ThinkingLevel)
+	if thinkingLevel != "" && !llm.SupportsThinkingLevel(provider, cfg.Model, thinkingLevel) {
+		thinkingLevel = ""
+	}
+	if thinkingLevel == "" {
+		thinkingLevel = llm.DefaultThinkingLevel(provider, cfg.Model)
+	}
+
 	return ModelSpec{
-		Provider:  provider,
-		Model:     strings.TrimSpace(cfg.Model),
-		APIKeyEnv: strings.TrimSpace(cfg.APIKeyEnv),
-		BaseURL:   strings.TrimSpace(cfg.BaseURL),
-		MaxTokens: cfg.MaxTokens,
+		Provider:      provider,
+		Model:         strings.TrimSpace(cfg.Model),
+		APIKey:        strings.TrimSpace(cfg.APIKey),
+		BaseURL:       strings.TrimSpace(llm.EffectiveBaseURL(provider, cfg)),
+		ThinkingLevel: thinkingLevel,
+		MaxTokens:     cfg.MaxTokens,
 	}, nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/llm"
 	"github.com/termia/termia/internal/shell"
 )
 
@@ -119,27 +120,14 @@ func runDoctor() error {
 	// Check 7: LLM API key configured
 	total++
 	provider := cfg.LLM.DefaultProvider
-	var apiKeyEnv string
-
-	switch provider {
-	case "openai":
-		apiKeyEnv = cfg.LLM.OpenAI.APIKeyEnv
-	case "anthropic":
-		apiKeyEnv = cfg.LLM.Anthropic.APIKeyEnv
-	case "ollama":
-		apiKeyEnv = cfg.LLM.Ollama.APIKeyEnv
-	case "deepseek":
-		apiKeyEnv = cfg.LLM.DeepSeek.APIKeyEnv
-	}
-
-	if apiKeyEnv != "" && os.Getenv(apiKeyEnv) != "" {
-		fmt.Printf("[OK] LLM API key configured (%s provider)\n", provider)
-		passed++
-	} else if provider == "ollama" {
-		fmt.Println("[OK] LLM provider is Ollama (no API key required)")
+	providerCfg, ok := cfg.LLM.ProviderConfig(provider)
+	if !ok {
+		fmt.Printf("[FAIL] Unsupported LLM provider configured: %s\n", provider)
+	} else if err := llm.ValidateProviderConfig(cfg.LLM.ProviderKind(provider), providerCfg); err == nil {
+		fmt.Printf("[OK] LLM provider configured (%s)\n", cfg.LLM.ProviderDisplayName(provider))
 		passed++
 	} else {
-		fmt.Printf("[FAIL] LLM API key not configured (provider: %s, env var: %s)\n", provider, apiKeyEnv)
+		fmt.Printf("[FAIL] LLM provider configuration invalid (%s): %v\n", cfg.LLM.ProviderDisplayName(provider), err)
 	}
 
 	// Check 8: Transcripts directory exists

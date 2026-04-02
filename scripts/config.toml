@@ -17,32 +17,44 @@ ignore_patterns = [
 
 [llm]
 # Default provider
-default_provider = "openai"     # "openai" | "anthropic" | "ollama" | "deepseek"
+default_provider = "openai"     # "openai" | "anthropic" | "ollama" | "deepseek" | "openai_compatible"
 
 # OpenAI
 [llm.openai]
-api_key_env = "OPENAI_API_KEY"  # Read from env var
+api_key = ""                    # Saved directly in config.toml
 model = "gpt-4o"
+thinking_level = ""             # Optional: low | medium | high when supported
 max_tokens = 2000
 base_url = ""                   # Optional: override default endpoint
 
-# Anthropic (native support via trpc-agent-go)
+# Anthropic
 [llm.anthropic]
-api_key_env = "ANTHROPIC_API_KEY"
+api_key = ""
 model = "claude-3-7-sonnet-20250219"
+thinking_level = ""             # Optional: low | medium | high when supported
 max_tokens = 2000
 
 # Ollama (local)
 [llm.ollama]
-api_key_env = ""                # Ollama doesn't require API key
+api_key = ""                    # Ollama doesn't require API key
 model = "llama3.2:latest"
-base_url = "http://localhost:11434/v1"
+thinking_level = ""
+base_url = "http://localhost:11434"
 
 # DeepSeek
 [llm.deepseek]
-api_key_env = "DEEPSEEK_API_KEY"
+api_key = ""
 model = "deepseek-chat"
+thinking_level = ""
 base_url = "https://api.deepseek.com"
+
+# OpenAI-compatible custom provider
+[llm.openai_compatible]
+api_key = ""
+model = ""
+thinking_level = ""             # Optional: low | medium | high for compatible reasoning models
+max_tokens = 2000
+base_url = ""
 
 [tui]
 # Theme

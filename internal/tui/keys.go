@@ -92,7 +92,7 @@ func DefaultKeyMap() KeyMap {
 		),
 		Variants: key.NewBinding(
 			key.WithKeys("ctrl+t"),
-			key.WithHelp("ctrl+t", "variants"),
+			key.WithHelp("ctrl+t", "thinking"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("q"),

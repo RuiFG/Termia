@@ -46,3 +46,99 @@ func TestUpsertTimelineToolCallMergesPendingAndSuccess(t *testing.T) {
 		t.Fatalf("expected merged result, got %+v", timeline[0].ToolCall)
 	}
 }
+
+func TestUpsertTimelineToolCallFallsBackToToolNameAndSummaryWithoutCallID(t *testing.T) {
+	pending := runtimeagent.ToolCallEvent{
+		ToolName: "command",
+		Summary:  "pwd",
+		State:    runtimeagent.ToolCallStatePending,
+	}
+	success := runtimeagent.ToolCallEvent{
+		ToolName: "command",
+		Summary:  "pwd",
+		Result:   "ok",
+		State:    runtimeagent.ToolCallStateSuccess,
+	}
+
+	timeline := UpsertTimelineToolCall(nil, pending)
+	timeline = UpsertTimelineToolCall(timeline, success)
+
+	if len(timeline) != 1 {
+		t.Fatalf("expected one timeline entry, got %d", len(timeline))
+	}
+	if timeline[0].ToolCall == nil || timeline[0].ToolCall.State != runtimeagent.ToolCallStateSuccess {
+		t.Fatalf("unexpected tool timeline entry: %+v", timeline[0])
+	}
+	if timeline[0].ToolCall.Result != "ok" {
+		t.Fatalf("expected merged result, got %+v", timeline[0].ToolCall)
+	}
+}
+
+func TestUpsertTimelineToolCallOverwritesSummaryAndResult(t *testing.T) {
+	pending := runtimeagent.ToolCallEvent{
+		CallID:   "call-1",
+		ToolName: "command",
+		Summary:  "old summary",
+		Result:   "old result",
+		State:    runtimeagent.ToolCallStatePending,
+	}
+	success := runtimeagent.ToolCallEvent{
+		CallID:   "call-1",
+		ToolName: "command",
+		Summary:  "new summary",
+		Result:   "new result",
+		State:    runtimeagent.ToolCallStateSuccess,
+	}
+
+	timeline := UpsertTimelineToolCall(nil, pending)
+	timeline = UpsertTimelineToolCall(timeline, success)
+
+	if len(timeline) != 1 {
+		t.Fatalf("expected one timeline entry, got %d", len(timeline))
+	}
+	if timeline[0].ToolCall == nil {
+		t.Fatalf("expected tool call entry, got %+v", timeline[0])
+	}
+	if timeline[0].ToolCall.Summary != "new summary" {
+		t.Fatalf("expected updated summary, got %+v", timeline[0].ToolCall)
+	}
+	if timeline[0].ToolCall.Result != "new result" {
+		t.Fatalf("expected updated result, got %+v", timeline[0].ToolCall)
+	}
+}
+
+func TestMarkLatestPendingToolFailed(t *testing.T) {
+	timeline := []TimelineEntry{
+		{
+			Role: "tool",
+			ToolCall: &runtimeagent.ToolCallEvent{
+				ToolName: "command",
+				Summary:  "first",
+				State:    runtimeagent.ToolCallStatePending,
+			},
+		},
+		{
+			Role: "tool",
+			ToolCall: &runtimeagent.ToolCallEvent{
+				ToolName: "command",
+				Summary:  "second",
+				State:    runtimeagent.ToolCallStatePending,
+			},
+		},
+	}
+
+	got := MarkLatestPendingToolFailed(timeline, "boom")
+
+	if got[1].ToolCall == nil {
+		t.Fatalf("expected latest pending call to remain present")
+	}
+	if got[1].ToolCall.State != runtimeagent.ToolCallStateError {
+		t.Fatalf("expected latest pending call to be marked failed, got %+v", got[1].ToolCall)
+	}
+	if got[1].ToolCall.Result != "boom" {
+		t.Fatalf("expected failure reason to populate result, got %+v", got[1].ToolCall)
+	}
+	if got[0].ToolCall.State != runtimeagent.ToolCallStatePending {
+		t.Fatalf("expected earlier pending call to remain unchanged, got %+v", got[0].ToolCall)
+	}
+}

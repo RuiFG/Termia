@@ -56,37 +56,66 @@ func UpsertTimelineToolCall(entries []TimelineEntry, call runtimeagent.ToolCallE
 		return entries
 	}
 
-	for i := len(entries) - 1; i >= 0; i-- {
-		current := entries[i].ToolCall
-		if current == nil {
-			continue
+	if call.CallID != "" {
+		for i := len(entries) - 1; i >= 0; i-- {
+			current := entries[i].ToolCall
+			if current == nil {
+				continue
+			}
+			if strings.TrimSpace(current.CallID) != call.CallID {
+				continue
+			}
+			merged := mergeTimelineToolCall(*current, call)
+			entries[i].ToolCall = &merged
+			return entries
 		}
-		if call.CallID != "" && current.CallID == call.CallID {
-			merged := *current
-			if merged.CallID == "" {
-				merged.CallID = call.CallID
+	}
+
+	if call.State != runtimeagent.ToolCallStatePending {
+		for i := len(entries) - 1; i >= 0; i-- {
+			current := entries[i].ToolCall
+			if current == nil {
+				continue
 			}
-			if merged.AgentName == "" {
-				merged.AgentName = call.AgentName
+			if current.State != runtimeagent.ToolCallStatePending {
+				continue
 			}
-			if merged.ToolName == "" {
-				merged.ToolName = call.ToolName
+			if textutil.NormalizeInlineText(current.ToolName) != call.ToolName {
+				continue
 			}
-			if merged.Summary == "" {
-				merged.Summary = call.Summary
+			if textutil.NormalizeInlineText(current.Summary) != call.Summary {
+				continue
 			}
-			if merged.Result == "" {
-				merged.Result = call.Result
-			}
-			if call.State != "" && (merged.State == "" || merged.State == runtimeagent.ToolCallStatePending) {
-				merged.State = call.State
-			}
+			merged := mergeTimelineToolCall(*current, call)
 			entries[i].ToolCall = &merged
 			return entries
 		}
 	}
 
 	return append(entries, TimelineEntry{Role: "tool", ToolCall: &call})
+}
+
+func mergeTimelineToolCall(existing, incoming runtimeagent.ToolCallEvent) runtimeagent.ToolCallEvent {
+	merged := existing
+	if merged.CallID == "" {
+		merged.CallID = incoming.CallID
+	}
+	if incoming.AgentName != "" {
+		merged.AgentName = incoming.AgentName
+	}
+	if incoming.ToolName != "" {
+		merged.ToolName = incoming.ToolName
+	}
+	if incoming.Summary != "" {
+		merged.Summary = incoming.Summary
+	}
+	if incoming.Result != "" {
+		merged.Result = incoming.Result
+	}
+	if incoming.State != "" {
+		merged.State = incoming.State
+	}
+	return merged
 }
 
 func MarkLatestPendingToolFailed(entries []TimelineEntry, reason string) []TimelineEntry {

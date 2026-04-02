@@ -50,6 +50,10 @@ func TestResolveSharedSlashCommandBuildsRunScopedActivation(t *testing.T) {
 	if activation.Scope != MiddlewareScopeRun {
 		t.Fatalf("expected run-scoped activation, got %+v", activation)
 	}
+
+	if _, ok := ResolveSharedSlashCommand("ralph-loop", DefaultSharedSlashCommands()); ok {
+		t.Fatalf("expected plain non-slash input to not resolve")
+	}
 }
 
 func TestRalphLoopRequestsContinueAfterCommandRun(t *testing.T) {

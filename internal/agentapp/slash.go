@@ -1,7 +1,6 @@
 package agentapp
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 )
@@ -14,7 +13,12 @@ type SharedSlashCommand struct {
 }
 
 func ResolveSharedSlashCommand(input string, commands []SharedSlashCommand) (SharedSlashCommand, bool) {
-	name := normalizeSharedSlashCommandInput(input)
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "/") {
+		return SharedSlashCommand{}, false
+	}
+
+	name := normalizeSharedSlashCommandInput(trimmed)
 	if name == "" {
 		return SharedSlashCommand{}, false
 	}
@@ -62,14 +66,4 @@ func normalizeSharedSlashCommandInput(input string) string {
 		return ""
 	}
 	return strings.ToLower(fields[0])
-}
-
-func buildSharedSlashActivation(command SharedSlashCommand, args string) (MiddlewareActivation, error) {
-	if strings.TrimSpace(command.Name) == "" {
-		return MiddlewareActivation{}, fmt.Errorf("shared slash command name is required")
-	}
-	if command.BuildActivation == nil {
-		return MiddlewareActivation{}, fmt.Errorf("shared slash command %q has no activation builder", command.Name)
-	}
-	return command.BuildActivation(args)
 }

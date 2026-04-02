@@ -34,9 +34,10 @@ type Middleware interface {
 type MiddlewareFactory func(MiddlewareActivation) (Middleware, error)
 
 type MiddlewareSpec struct {
-	Name    string
-	Scope   MiddlewareScope
-	Factory MiddlewareFactory
+	Name        string
+	Description string
+	Scope       MiddlewareScope
+	Factory     MiddlewareFactory
 }
 
 type Registry struct {
@@ -46,8 +47,9 @@ type Registry struct {
 func DefaultMiddlewareSpecs() []MiddlewareSpec {
 	return []MiddlewareSpec{
 		{
-			Name:  "ralph-loop",
-			Scope: MiddlewareScopeRun,
+			Name:        "ralph-loop",
+			Description: "Repeat the run when a command was executed, otherwise emit completion.",
+			Scope:       MiddlewareScopeRun,
 			Factory: func(MiddlewareActivation) (Middleware, error) {
 				return ralphLoopMiddleware{}, nil
 			},

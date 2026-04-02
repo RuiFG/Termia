@@ -7,28 +7,10 @@ import (
 )
 
 type SharedSlashCommand struct {
-	Name        string
-	Description string
-
-	middlewareName string
-	scope          MiddlewareScope
-}
-
-func (c SharedSlashCommand) BuildActivation(args string) (MiddlewareActivation, error) {
-	if strings.TrimSpace(c.Name) == "" {
-		return MiddlewareActivation{}, fmt.Errorf("shared slash command name is required")
-	}
-	if strings.TrimSpace(c.middlewareName) == "" {
-		return MiddlewareActivation{}, fmt.Errorf("shared slash command %q has no middleware binding", c.Name)
-	}
-	activation := MiddlewareActivation{
-		Name:  c.middlewareName,
-		Scope: c.scope,
-	}
-	if trimmed := strings.TrimSpace(args); trimmed != "" {
-		activation.Args = map[string]string{"args": trimmed}
-	}
-	return activation, nil
+	Name            string
+	Description     string
+	Scope           MiddlewareScope
+	BuildActivation func(args string) (MiddlewareActivation, error)
 }
 
 func ResolveSharedSlashCommand(input string, commands []SharedSlashCommand) (SharedSlashCommand, bool) {
@@ -47,10 +29,19 @@ func ResolveSharedSlashCommand(input string, commands []SharedSlashCommand) (Sha
 func DefaultSharedSlashCommands() []SharedSlashCommand {
 	commands := []SharedSlashCommand{
 		{
-			Name:           "ralph-loop",
-			Description:    "Start the Ralph loop middleware",
-			middlewareName: "ralph-loop",
-			scope:          MiddlewareScopeRun,
+			Name:        "ralph-loop",
+			Description: "Start the Ralph loop middleware",
+			Scope:       MiddlewareScopeRun,
+			BuildActivation: func(args string) (MiddlewareActivation, error) {
+				activation := MiddlewareActivation{
+					Name:  "ralph-loop",
+					Scope: MiddlewareScopeRun,
+				}
+				if trimmed := strings.TrimSpace(args); trimmed != "" {
+					activation.Args = map[string]string{"args": trimmed}
+				}
+				return activation, nil
+			},
 		},
 	}
 	sort.SliceStable(commands, func(i, j int) bool {
@@ -71,4 +62,14 @@ func normalizeSharedSlashCommandInput(input string) string {
 		return ""
 	}
 	return strings.ToLower(fields[0])
+}
+
+func buildSharedSlashActivation(command SharedSlashCommand, args string) (MiddlewareActivation, error) {
+	if strings.TrimSpace(command.Name) == "" {
+		return MiddlewareActivation{}, fmt.Errorf("shared slash command name is required")
+	}
+	if command.BuildActivation == nil {
+		return MiddlewareActivation{}, fmt.Errorf("shared slash command %q has no activation builder", command.Name)
+	}
+	return command.BuildActivation(args)
 }

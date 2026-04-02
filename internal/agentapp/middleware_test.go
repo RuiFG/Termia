@@ -8,7 +8,15 @@ import (
 )
 
 func TestRegistryRejectsScopeMismatch(t *testing.T) {
-	registry := NewRegistry(DefaultMiddlewareSpecs()...)
+	specs := DefaultMiddlewareSpecs()
+	if len(specs) != 1 {
+		t.Fatalf("expected one default middleware spec, got %d", len(specs))
+	}
+	if specs[0].Description == "" {
+		t.Fatalf("expected default middleware description to be populated")
+	}
+
+	registry := NewRegistry(specs...)
 
 	_, err := registry.Build(MiddlewareActivation{Name: "ralph-loop", Scope: MiddlewareScopeSession})
 	if err == nil {
@@ -24,6 +32,12 @@ func TestResolveSharedSlashCommandBuildsRunScopedActivation(t *testing.T) {
 
 	if got.Name != "ralph-loop" {
 		t.Fatalf("unexpected slash command name: %+v", got)
+	}
+	if got.Scope != MiddlewareScopeRun {
+		t.Fatalf("expected run scope, got %+v", got.Scope)
+	}
+	if got.BuildActivation == nil {
+		t.Fatalf("expected build activation function to be set")
 	}
 
 	activation, err := got.BuildActivation("")

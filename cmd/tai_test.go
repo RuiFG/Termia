@@ -328,6 +328,60 @@ func TestTaiRunSupportsHSelectorPrefixWithSharedService(t *testing.T) {
 	}
 }
 
+func TestTaiRunReturnsErrorOnStreamErrorAndSkipsAnalysis(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "termia.db")
+
+	prevOpen := openTaiDB
+	openTaiDB = func() (*db.DB, error) {
+		return db.Open(dbPath, zap.NewNop())
+	}
+	t.Cleanup(func() {
+		openTaiDB = prevOpen
+	})
+
+	fakeSvc := &fakeTaiAgentAppService{
+		events: []agent.RuntimeEvent{
+			{Kind: agent.RuntimeEventError, Text: "runtime failed"},
+		},
+	}
+	prevFactory := newTaiAgentAppService
+	newTaiAgentAppService = func(_ *config.Config, _ *db.DB) taiAgentAppService {
+		return fakeSvc
+	}
+	t.Cleanup(func() {
+		newTaiAgentAppService = prevFactory
+	})
+
+	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	taiCommandCount = 0
+	taiAll = false
+	taiHistoryMode = "cmd"
+	t.Cleanup(func() {
+		taiCommandCount = prevCmdCount
+		taiAll = prevAll
+		taiHistoryMode = prevHistoryMode
+	})
+
+	cmd := newTaiRunTestCommand()
+	err := taiRun(cmd, []string{"inspect failure"})
+	if err == nil {
+		t.Fatalf("expected taiRun to return stream error")
+	}
+	if !strings.Contains(err.Error(), "runtime failed") {
+		t.Fatalf("expected returned error to include runtime failure text, got %v", err)
+	}
+
+	withTaiTestDB(t, dbPath, func(database *db.DB) {
+		analyses, listErr := database.ListAnalyses(10)
+		if listErr != nil {
+			t.Fatalf("ListAnalyses returned error: %v", listErr)
+		}
+		if len(analyses) != 0 {
+			t.Fatalf("expected no analysis rows on stream error, got %#v", analyses)
+		}
+	})
+}
+
 func TestTaiNormalizeToolCallNormalizesInlineFields(t *testing.T) {
 	toolCall := taiNormalizeToolCall(agent.ToolCallEvent{
 		CallID:    " call-1 ",

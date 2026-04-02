@@ -140,6 +140,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 
 	// Read from stream and print chunks
 	var fullResponse strings.Builder
+	var streamErrorText string
 	renderer := newTaiRenderer()
 	for chunk := range stream {
 		switch chunk.Kind {
@@ -158,10 +159,18 @@ func taiRun(cmd *cobra.Command, args []string) error {
 			}
 			renderer.WriteTool(*chunk.ToolCall)
 		case agent.RuntimeEventError:
+			if streamErrorText == "" {
+				if text := strings.TrimSpace(chunk.Text); text != "" {
+					streamErrorText = text
+				}
+			}
 			renderer.WriteError(chunk.Text)
 		}
 	}
 	renderer.Finish()
+	if streamErrorText != "" {
+		return fmt.Errorf("analysis failed: %s", streamErrorText)
+	}
 
 	// Store analysis in database
 	analysis := &db.Analysis{

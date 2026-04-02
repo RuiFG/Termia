@@ -149,6 +149,11 @@ func TestSubmitInputAbortsWhenSessionRuntimePersistenceFails(t *testing.T) {
 	if len(updated.agent.messages) == 0 {
 		t.Fatalf("expected agent timeline to contain an error message")
 	}
+	for _, message := range updated.agent.messages {
+		if normalizeConversationRole(message.Role) == "user" && strings.TrimSpace(message.Content) == "hello" {
+			t.Fatalf("expected failed submit to avoid ghost user message, got %#v", message)
+		}
+	}
 	last := updated.agent.messages[len(updated.agent.messages)-1]
 	if normalizeConversationRole(last.Role) != "error" {
 		t.Fatalf("expected last message to be error, got %#v", last)

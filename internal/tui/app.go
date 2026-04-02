@@ -1584,11 +1584,6 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 	// Regular text input -> Send to Agent
 	a.middleMode = ModeAgent
 	citedCommands := a.history.CitedCommands()
-	a.agent.AddTimelineMessage(AgentMessage{
-		Role:              "user",
-		Content:           val,
-		CitedCommandCount: len(citedCommands),
-	})
 
 	if a.activeSessionID == "" {
 		newSession, err := createSession(a.db, a.cwd, a.currentRuntimeMode(), a.activeTeamName)
@@ -1607,6 +1602,11 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		a.input.Reset()
 		return a, nil
 	}
+	a.agent.AddTimelineMessage(AgentMessage{
+		Role:              "user",
+		Content:           val,
+		CitedCommandCount: len(citedCommands),
+	})
 	selectedCommands := agentCommandsFromDBCommands(citedCommands)
 	messageMetadata := db.AgentMessageMetadata{
 		CitedCommands: db.AgentMessageCommandMetadataFromCommands(citedCommands),

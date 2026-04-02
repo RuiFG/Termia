@@ -97,3 +97,21 @@ func TestRalphLoopRequestsContinueAfterCommandRun(t *testing.T) {
 		t.Fatalf("expected completion text, got %+v", directive)
 	}
 }
+
+func TestRalphLoopInjectsContinuationQueryWhenMissing(t *testing.T) {
+	registry := NewRegistry(DefaultMiddlewareSpecs()...)
+
+	instance, err := registry.Build(MiddlewareActivation{Name: "ralph-loop", Scope: MiddlewareScopeRun})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	ctx := &RunContext{State: DefaultSessionState()}
+	if err := instance.BeforeRun(context.Background(), ctx); err != nil {
+		t.Fatalf("BeforeRun returned error: %v", err)
+	}
+
+	if ctx.Query == "" {
+		t.Fatalf("expected ralph-loop to populate a continuation query")
+	}
+}

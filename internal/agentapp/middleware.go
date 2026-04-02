@@ -44,6 +44,8 @@ type Registry struct {
 	specs map[string]MiddlewareSpec
 }
 
+const ralphLoopContinuationQuery = "请根据当前上下文继续执行任务。只有在不需要再执行命令时，回复“已完成”。"
+
 func DefaultMiddlewareSpecs() []MiddlewareSpec {
 	return []MiddlewareSpec{
 		{
@@ -112,7 +114,10 @@ func (r *Registry) Build(activation MiddlewareActivation) (Middleware, error) {
 
 type ralphLoopMiddleware struct{}
 
-func (ralphLoopMiddleware) BeforeRun(_ context.Context, _ *RunContext) error {
+func (ralphLoopMiddleware) BeforeRun(_ context.Context, runCtx *RunContext) error {
+	if runCtx != nil && strings.TrimSpace(runCtx.Query) == "" {
+		runCtx.Query = ralphLoopContinuationQuery
+	}
 	return nil
 }
 
@@ -120,7 +125,7 @@ func (ralphLoopMiddleware) AfterRun(_ context.Context, _ *RunContext, summary Ru
 	if summary.SawCommand {
 		return RunDirective{
 			Continue:  true,
-			NextQuery: "请继续处理上一个命令的结果。",
+			NextQuery: ralphLoopContinuationQuery,
 		}, nil
 	}
 	return RunDirective{

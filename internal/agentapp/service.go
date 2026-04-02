@@ -62,6 +62,7 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 		return nil, err
 	}
 
+	originalQuery := strings.TrimSpace(req.Query)
 	query, state, runMiddleware, err := s.applySharedSlashCommand(session.ID, state, req.Query)
 	if err != nil {
 		return nil, err
@@ -90,7 +91,7 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 			return nil, err
 		}
 	}
-	if err := s.persistUserMessage(runCtx.SessionID, runCtx.Query, runCtx.SelectedCommands); err != nil {
+	if err := s.persistUserMessage(runCtx.SessionID, originalQuery, runCtx.SelectedCommands); err != nil {
 		return nil, err
 	}
 

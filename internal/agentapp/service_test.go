@@ -266,6 +266,50 @@ func TestServiceRunPersistsSessionScopedSlashMiddleware(t *testing.T) {
 	}
 }
 
+func TestServiceRunPersistsOriginalSlashQueryText(t *testing.T) {
+	t.Setenv("TERMIA_SESSION_ID", "missing")
+	runtime := &fakeRuntime{eventsPerRun: [][]runtimeagent.RuntimeEvent{{}}}
+	svc, database := newTestService(t, runtime)
+
+	stream, err := svc.Run(context.Background(), RunRequest{
+		Query: "/ralph-loop inspect",
+		Cwd:   "/tmp/project",
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for event := range stream {
+		if event.Kind == runtimeagent.RuntimeEventError {
+			t.Fatalf("unexpected service error: %s", event.Text)
+		}
+	}
+
+	if len(runtime.requests) == 0 {
+		t.Fatalf("expected runtime request")
+	}
+	if runtime.requests[0].Query != "inspect" {
+		t.Fatalf("expected runtime query to use transformed slash args, got %q", runtime.requests[0].Query)
+	}
+
+	sessions, err := database.ListAgentSessions(10)
+	if err != nil {
+		t.Fatalf("ListAgentSessions returned error: %v", err)
+	}
+	if len(sessions) == 0 {
+		t.Fatalf("expected persisted session")
+	}
+	messages, err := database.ListAgentMessages(sessions[0].ID)
+	if err != nil {
+		t.Fatalf("ListAgentMessages returned error: %v", err)
+	}
+	if len(messages) == 0 {
+		t.Fatalf("expected persisted user message")
+	}
+	if messages[0].Role != "user" || messages[0].Content != "/ralph-loop inspect" {
+		t.Fatalf("expected persisted user content to keep original slash command, got %#v", messages[0])
+	}
+}
+
 func newTestService(t *testing.T, runtime Runtime) (*Service, *db.DB) {
 	t.Helper()
 

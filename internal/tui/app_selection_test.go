@@ -113,3 +113,47 @@ func TestRuntimeCwdEventUpdatesUIWithoutPersistingSessionCwd(t *testing.T) {
 		t.Fatalf("expected runtime cwd event to avoid db persistence, got persisted cwd %q", persisted.Cwd)
 	}
 }
+
+func TestSubmitInputAbortsWhenSessionRuntimePersistenceFails(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "termia.db"), zap.NewNop())
+	if err != nil {
+		t.Fatalf("db.Open returned error: %v", err)
+	}
+
+	session, err := createSession(database, "/cwd", agent.ModeAssistant, "")
+	if err != nil {
+		t.Fatalf("createSession returned error: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	app := New(database, config.DefaultConfig(), zap.NewNop())
+	app.activeSessionID = session.ID
+	app.sessions = []db.AgentSession{session}
+	app.agentService = &fakeTUIAgentAppService{}
+	app.input.SetValue("hello")
+
+	model, cmd := app.submitInput()
+	updated := model.(App)
+
+	if cmd != nil {
+		t.Fatalf("expected submit to abort before scheduling run cmd")
+	}
+	if updated.agentRunning {
+		t.Fatalf("expected agent run not to start")
+	}
+	if len(updated.agentService.(*fakeTUIAgentAppService).requests) != 0 {
+		t.Fatalf("expected shared service not to be called on persistence error")
+	}
+	if len(updated.agent.messages) == 0 {
+		t.Fatalf("expected agent timeline to contain an error message")
+	}
+	last := updated.agent.messages[len(updated.agent.messages)-1]
+	if normalizeConversationRole(last.Role) != "error" {
+		t.Fatalf("expected last message to be error, got %#v", last)
+	}
+	if !strings.Contains(strings.ToLower(last.Content), "error") {
+		t.Fatalf("expected error message content, got %q", last.Content)
+	}
+}

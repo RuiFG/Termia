@@ -13,21 +13,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-type AgentToolCall struct {
-	CallID    string
-	AgentName string
-	ToolName  string
-	Summary   string
-	Result    string
-	State     runtimeagent.ToolCallState
-}
-
-type AgentMessage struct {
-	Role              string
-	Content           string
-	CitedCommandCount int
-	ToolCall          *AgentToolCall
-}
+type AgentToolCall = runtimeagent.ToolCallEvent
+type AgentMessage = agentapp.TimelineEntry
 
 // AgentModel manages the agent interaction panel.
 type AgentModel struct {
@@ -61,9 +48,7 @@ func (m *AgentModel) SetSize(w, h int) {
 
 // AddMessage appends a new message block to the conversation timeline.
 func (m *AgentModel) AddMessage(role, content string) {
-	timeline := timelineFromAgentMessages(m.messages)
-	timeline = agentapp.AppendTimelineText(timeline, role, content, false)
-	m.messages = agentMessagesFromTimeline(timeline)
+	m.messages = agentapp.AppendTimelineText(m.messages, role, content, false)
 	m.refreshContent()
 	if m.ready {
 		m.viewport.GotoBottom()
@@ -102,9 +87,7 @@ func (m *AgentModel) SetMessages(messages []AgentMessage) {
 
 // AppendToLast appends assistant text to the latest assistant block, or starts one if needed.
 func (m *AgentModel) AppendToLast(chunk string) {
-	timeline := timelineFromAgentMessages(m.messages)
-	timeline = agentapp.AppendTimelineText(timeline, "assistant", chunk, true)
-	m.messages = agentMessagesFromTimeline(timeline)
+	m.messages = agentapp.AppendTimelineText(m.messages, "assistant", chunk, true)
 	m.refreshContent()
 	if m.ready {
 		m.viewport.GotoBottom()
@@ -112,9 +95,7 @@ func (m *AgentModel) AppendToLast(chunk string) {
 }
 
 func (m *AgentModel) AppendReasoning(chunk string) {
-	timeline := timelineFromAgentMessages(m.messages)
-	timeline = agentapp.AppendTimelineText(timeline, "reasoning", chunk, true)
-	m.messages = agentMessagesFromTimeline(timeline)
+	m.messages = agentapp.AppendTimelineText(m.messages, "reasoning", chunk, true)
 	m.refreshContent()
 	if m.ready {
 		m.viewport.GotoBottom()
@@ -122,9 +103,7 @@ func (m *AgentModel) AppendReasoning(chunk string) {
 }
 
 func (m *AgentModel) AppendToolCall(toolCall AgentToolCall) {
-	timeline := timelineFromAgentMessages(m.messages)
-	timeline = agentapp.UpsertTimelineToolCall(timeline, runtimeToolCallFromAgent(toolCall))
-	m.messages = agentMessagesFromTimeline(timeline)
+	m.messages = agentapp.UpsertTimelineToolCall(m.messages, normalizeToolCall(toolCall))
 	m.refreshContent()
 	if m.ready {
 		m.viewport.GotoBottom()
@@ -132,9 +111,7 @@ func (m *AgentModel) AppendToolCall(toolCall AgentToolCall) {
 }
 
 func (m *AgentModel) MarkLatestPendingToolFailed(reason string) {
-	timeline := timelineFromAgentMessages(m.messages)
-	timeline = agentapp.MarkLatestPendingToolFailed(timeline, reason)
-	m.messages = agentMessagesFromTimeline(timeline)
+	m.messages = agentapp.MarkLatestPendingToolFailed(m.messages, reason)
 	m.refreshContent()
 	if m.ready {
 		m.viewport.GotoBottom()
@@ -191,61 +168,8 @@ func (m *AgentModel) refreshContent() {
 	m.viewport.SetContent(renderConversationTimeline(m.messages, m.width))
 }
 
-func timelineFromAgentMessages(messages []AgentMessage) []agentapp.TimelineEntry {
-	if len(messages) == 0 {
-		return nil
-	}
-	timeline := make([]agentapp.TimelineEntry, 0, len(messages))
-	for _, message := range messages {
-		entry := agentapp.TimelineEntry{
-			Role:              normalizeConversationRole(message.Role),
-			Content:           textutil.NormalizeLineEndings(message.Content),
-			CitedCommandCount: maxInt(0, message.CitedCommandCount),
-		}
-		if message.ToolCall != nil {
-			call := runtimeToolCallFromAgent(*message.ToolCall)
-			entry.ToolCall = &call
-		}
-		timeline = append(timeline, entry)
-	}
-	return timeline
-}
-
-func agentMessagesFromTimeline(entries []agentapp.TimelineEntry) []AgentMessage {
-	if len(entries) == 0 {
-		return nil
-	}
-	messages := make([]AgentMessage, 0, len(entries))
-	for _, entry := range entries {
-		message := AgentMessage{
-			Role:              normalizeConversationRole(entry.Role),
-			Content:           textutil.NormalizeLineEndings(entry.Content),
-			CitedCommandCount: maxInt(0, entry.CitedCommandCount),
-		}
-		if entry.ToolCall != nil {
-			call := agentToolCallFromRuntime(*entry.ToolCall)
-			message.ToolCall = &call
-			message.Role = "tool"
-			message.Content = ""
-		}
-		messages = append(messages, message)
-	}
-	return messages
-}
-
-func runtimeToolCallFromAgent(toolCall AgentToolCall) runtimeagent.ToolCallEvent {
+func normalizeToolCall(toolCall AgentToolCall) AgentToolCall {
 	return runtimeagent.ToolCallEvent{
-		CallID:    strings.TrimSpace(toolCall.CallID),
-		AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
-		ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
-		Summary:   textutil.NormalizeInlineText(toolCall.Summary),
-		Result:    textutil.NormalizeInlineText(toolCall.Result),
-		State:     toolCall.State,
-	}
-}
-
-func agentToolCallFromRuntime(toolCall runtimeagent.ToolCallEvent) AgentToolCall {
-	return AgentToolCall{
 		CallID:    strings.TrimSpace(toolCall.CallID),
 		AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
 		ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
@@ -381,7 +305,7 @@ func renderPrefixedMarkdown(content string, width int, prefix, continuation stri
 }
 
 func renderToolMessage(toolCall AgentToolCall, width int) []string {
-	toolCall = agentToolCallFromRuntime(runtimeToolCallFromAgent(toolCall))
+	toolCall = normalizeToolCall(toolCall)
 	if toolCall.ToolName == "" {
 		return nil
 	}
@@ -431,11 +355,4 @@ func toolStyles(state runtimeagent.ToolCallState) (lipgloss.Style, lipgloss.Styl
 	default:
 		return toolPendingStyle.Copy().Bold(true), toolPendingStyle
 	}
-}
-
-func (m AgentMessage) String() string {
-	if m.ToolCall != nil {
-		return fmt.Sprintf("tool: %s", renderToolLine(*m.ToolCall))
-	}
-	return fmt.Sprintf("%s: %s", m.Role, m.Content)
 }

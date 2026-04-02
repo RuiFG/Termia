@@ -602,13 +602,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case agent.RuntimeEventToolCall:
 			if msg.event.ToolCall != nil {
-				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
-				a.agent.AppendToolCall(toolCall)
+				a.agent.AppendToolCall(normalizeToolCall(*msg.event.ToolCall))
 			}
 		case agent.RuntimeEventToolResult:
 			if msg.event.ToolCall != nil {
-				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
-				a.agent.AppendToolCall(toolCall)
+				a.agent.AppendToolCall(normalizeToolCall(*msg.event.ToolCall))
 			}
 		case agent.RuntimeEventCwd:
 			if cwd := strings.TrimSpace(msg.event.Cwd); cwd != "" {
@@ -875,7 +873,7 @@ func (a App) handleChordKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.agentMode = AgentModeAgent
 		a.middleMode = ModeAgent
 		a.statusMsg = "Mode set to Assistant."
-		a.updateActiveSessionRuntime()
+		a.updateActiveSessionRuntimeBestEffort()
 	case 't':
 		a.openPaletteStage(paletteStageTeams)
 	case 'c':
@@ -1604,7 +1602,11 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		a.applySessionRuntime(newSession.ID)
 	}
 	a.setActiveSessionID(a.activeSessionID)
-	a.updateActiveSessionRuntime()
+	if err := a.updateActiveSessionRuntime(); err != nil {
+		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
+		a.input.Reset()
+		return a, nil
+	}
 	selectedCommands := agentCommandsFromDBCommands(citedCommands)
 	messageMetadata := db.AgentMessageMetadata{
 		CitedCommands: db.AgentMessageCommandMetadataFromCommands(citedCommands),
@@ -1772,7 +1774,7 @@ func (a App) handleSlashResult(result SlashCommandResult) (tea.Model, tea.Cmd) {
 	}
 	if result.SwitchAgentMode != nil {
 		a.agentMode = *result.SwitchAgentMode
-		a.updateActiveSessionRuntime()
+		a.updateActiveSessionRuntimeBestEffort()
 	}
 	if result.OpenPalette != nil {
 		a.openPaletteStage(*result.OpenPalette)
@@ -2458,7 +2460,7 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		if item.Value == "assistant" {
 			a.agentMode = AgentModeAgent
 			a.statusMsg = "Mode set to Assistant."
-			a.updateActiveSessionRuntime()
+			a.updateActiveSessionRuntimeBestEffort()
 			a.closePalette()
 			return a, nil
 		}
@@ -2471,7 +2473,7 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 			a.agentMode = AgentModeTeam
 			a.activeTeamName = team.Name
 			a.statusMsg = fmt.Sprintf("Mode set to %s.", team.Name)
-			a.updateActiveSessionRuntime()
+			a.updateActiveSessionRuntimeBestEffort()
 		}
 		a.closePalette()
 		return a, nil
@@ -3570,14 +3572,14 @@ func buildSessionSpecSnapshot(mode agent.Mode, teamName string) string {
 	return string(data)
 }
 
-func (a *App) updateActiveSessionRuntime() {
-	a.updateSessionRuntime(a.activeSessionID, a.currentRuntimeMode(), a.activeTeamName)
+func (a *App) updateActiveSessionRuntime() error {
+	return a.updateSessionRuntime(a.activeSessionID, a.currentRuntimeMode(), a.activeTeamName)
 }
 
-func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName string) {
+func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return
+		return nil
 	}
 	if mode != agent.ModeTeam {
 		teamName = ""
@@ -3594,12 +3596,17 @@ func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName s
 		break
 	}
 	if a.db == nil {
-		return
+		return nil
 	}
 	if err := a.db.UpdateAgentSessionRuntime(sessionID, string(mode), teamName, specSnapshot, time.Now().UnixNano()); err != nil {
-		if a.logger != nil {
-			a.logger.Warn("failed to update session runtime metadata", zap.Error(err))
-		}
+		return err
+	}
+	return nil
+}
+
+func (a *App) updateActiveSessionRuntimeBestEffort() {
+	if err := a.updateActiveSessionRuntime(); err != nil && a.logger != nil {
+		a.logger.Warn("failed to update session runtime metadata", zap.Error(err))
 	}
 }
 

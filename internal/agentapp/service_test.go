@@ -310,7 +310,133 @@ func TestServiceRunPersistsOriginalSlashQueryText(t *testing.T) {
 	}
 }
 
+func TestServiceRunCreatesSessionFromConfigDefaults(t *testing.T) {
+	t.Setenv("TERMIA_SESSION_ID", "missing")
+	runtime := &fakeRuntime{eventsPerRun: [][]runtimeagent.RuntimeEvent{{}}}
+	cfg := config.DefaultConfig()
+	cfg.Agent.DefaultMode = string(runtimeagent.ModeTeam)
+	cfg.Agent.DefaultTeam = "ops"
+	svc, database := newTestServiceWithConfig(t, cfg, runtime)
+
+	stream, err := svc.Run(context.Background(), RunRequest{Query: "hello", Cwd: "/tmp/project"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for event := range stream {
+		if event.Kind == runtimeagent.RuntimeEventError {
+			t.Fatalf("unexpected service error: %s", event.Text)
+		}
+	}
+
+	if len(runtime.requests) != 1 {
+		t.Fatalf("expected one runtime request, got %d", len(runtime.requests))
+	}
+	if runtime.requests[0].Mode != runtimeagent.ModeTeam || runtime.requests[0].TeamName != "ops" {
+		t.Fatalf("expected runtime request to use config defaults, got %+v", runtime.requests[0])
+	}
+
+	sessions, err := database.ListAgentSessions(10)
+	if err != nil {
+		t.Fatalf("ListAgentSessions returned error: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected one created session, got %#v", sessions)
+	}
+	if sessions[0].Mode != string(runtimeagent.ModeTeam) || sessions[0].TeamName != "ops" {
+		t.Fatalf("expected created session to use config defaults, got %+v", sessions[0])
+	}
+	state, err := DecodeSessionState(sessions[0].SpecSnapshotJSON)
+	if err != nil {
+		t.Fatalf("DecodeSessionState returned error: %v", err)
+	}
+	if state.Mode != runtimeagent.ModeTeam || state.TeamName != "ops" {
+		t.Fatalf("expected session state to use config defaults, got %+v", state)
+	}
+}
+
+func TestServiceRunCreatesAssistantSessionWhenDefaultModeIsNotTeam(t *testing.T) {
+	t.Setenv("TERMIA_SESSION_ID", "missing")
+	runtime := &fakeRuntime{eventsPerRun: [][]runtimeagent.RuntimeEvent{{}}}
+	cfg := config.DefaultConfig()
+	cfg.Agent.DefaultMode = "assistant"
+	cfg.Agent.DefaultTeam = "ops"
+	svc, database := newTestServiceWithConfig(t, cfg, runtime)
+
+	stream, err := svc.Run(context.Background(), RunRequest{Query: "hello", Cwd: "/tmp/project"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for event := range stream {
+		if event.Kind == runtimeagent.RuntimeEventError {
+			t.Fatalf("unexpected service error: %s", event.Text)
+		}
+	}
+
+	sessions, err := database.ListAgentSessions(10)
+	if err != nil {
+		t.Fatalf("ListAgentSessions returned error: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected one created session, got %#v", sessions)
+	}
+	if sessions[0].Mode != string(runtimeagent.ModeAssistant) || sessions[0].TeamName != "" {
+		t.Fatalf("expected assistant session with cleared team, got %+v", sessions[0])
+	}
+}
+
+func TestServiceRunStopsAfterRuntimeErrorWithoutAfterRunContinuation(t *testing.T) {
+	t.Setenv("TERMIA_SESSION_ID", "missing")
+	runtime := &fakeRuntime{eventsPerRun: [][]runtimeagent.RuntimeEvent{{
+		{Kind: runtimeagent.RuntimeEventError, Text: "boom"},
+	}}}
+	svc, database := newTestService(t, runtime)
+
+	stream, err := svc.Run(context.Background(), RunRequest{Query: "/ralph-loop inspect", Cwd: "/tmp/project"})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	var sawError bool
+	for event := range stream {
+		if event.Kind == runtimeagent.RuntimeEventText && event.Text == "已完成" {
+			t.Fatalf("expected runtime error to stop before completion text")
+		}
+		if event.Kind == runtimeagent.RuntimeEventError && event.Text == "boom" {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatal("expected runtime error event")
+	}
+	if len(runtime.requests) != 1 {
+		t.Fatalf("expected runtime error to stop without continuation run, got %d requests", len(runtime.requests))
+	}
+
+	sessions, err := database.ListAgentSessions(10)
+	if err != nil {
+		t.Fatalf("ListAgentSessions returned error: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected one session, got %#v", sessions)
+	}
+	messages, err := database.ListAgentMessages(sessions[0].ID)
+	if err != nil {
+		t.Fatalf("ListAgentMessages returned error: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("expected user and error messages only, got %#v", messages)
+	}
+	if messages[1].Role != "error" || messages[1].Content != "boom" {
+		t.Fatalf("expected error timeline persistence, got %#v", messages[1])
+	}
+}
+
 func newTestService(t *testing.T, runtime Runtime) (*Service, *db.DB) {
+	t.Helper()
+	return newTestServiceWithConfig(t, &config.Config{}, runtime)
+}
+
+func newTestServiceWithConfig(t *testing.T, cfg *config.Config, runtime Runtime) (*Service, *db.DB) {
 	t.Helper()
 
 	database, err := db.Open(filepath.Join(t.TempDir(), "termia.db"), zap.NewNop())
@@ -321,7 +447,7 @@ func newTestService(t *testing.T, runtime Runtime) (*Service, *db.DB) {
 		_ = database.Close()
 	})
 
-	service := NewService(&config.Config{}, database, func(_ *config.Config, _ *db.DB, _ runtimeagent.HITLResponder) Runtime {
+	service := NewService(cfg, database, func(_ *config.Config, _ *db.DB, _ runtimeagent.HITLResponder) Runtime {
 		return runtime
 	})
 	return service, database

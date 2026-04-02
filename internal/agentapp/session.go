@@ -15,6 +15,7 @@ type SessionDB interface {
 	LatestAgentSession() (db.AgentSession, bool, error)
 	CreateAgentSession(session *db.AgentSession) error
 	UpdateAgentSessionRuntime(sessionID, mode, teamName, specSnapshotJSON string, updatedAt int64) error
+	UpdateAgentSessionCwd(sessionID, cwd string, updatedAt int64) error
 }
 
 type SessionService struct {
@@ -38,7 +39,7 @@ func (s *SessionService) Resolve(preferredID, cwd string, defaultState SessionSt
 		if session, state, found, err := s.resolveByID(preferredID); err != nil {
 			return db.AgentSession{}, SessionState{}, err
 		} else if found {
-			return session, state, nil
+			return s.applyRequestCwd(session, state, cwd, now())
 		}
 	}
 
@@ -47,14 +48,14 @@ func (s *SessionService) Resolve(preferredID, cwd string, defaultState SessionSt
 		if session, state, found, err := s.resolveByID(currentID); err != nil {
 			return db.AgentSession{}, SessionState{}, err
 		} else if found {
-			return session, state, nil
+			return s.applyRequestCwd(session, state, cwd, now())
 		}
 	}
 
 	if session, state, found, err := s.resolveLatest(); err != nil {
 		return db.AgentSession{}, SessionState{}, err
 	} else if found {
-		return session, state, nil
+		return s.applyRequestCwd(session, state, cwd, now())
 	}
 
 	return s.createSession(cwd, defaultState, now())
@@ -147,4 +148,17 @@ func normalizeResolvedSessionState(state SessionState) SessionState {
 		state.TeamName = ""
 	}
 	return state
+}
+
+func (s *SessionService) applyRequestCwd(session db.AgentSession, state SessionState, cwd string, now time.Time) (db.AgentSession, SessionState, error) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" || cwd == strings.TrimSpace(session.Cwd) {
+		return session, state, nil
+	}
+	if err := s.database.UpdateAgentSessionCwd(session.ID, cwd, now.UnixNano()); err != nil {
+		return db.AgentSession{}, SessionState{}, err
+	}
+	session.Cwd = cwd
+	session.UpdatedAt = now.UnixNano()
+	return session, state, nil
 }

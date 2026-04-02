@@ -57,7 +57,7 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 		return nil, fmt.Errorf("service is not initialized")
 	}
 
-	session, state, err := s.sessions.Resolve(req.SessionID, req.Cwd, DefaultSessionState(), nil)
+	session, state, err := s.sessions.Resolve(req.SessionID, req.Cwd, defaultSessionStateFromConfig(s.cfg), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +184,7 @@ func (s *Service) runLoop(
 
 		timeline := make([]TimelineEntry, 0, 8)
 		summary := RunSummary{}
+		runtimeFailed := false
 		for event := range stream {
 			switch event.Kind {
 			case runtimeagent.RuntimeEventText:
@@ -205,10 +206,20 @@ func (s *Service) runLoop(
 			case runtimeagent.RuntimeEventError:
 				timeline = MarkLatestPendingToolFailed(timeline, event.Text)
 				timeline = AppendTimelineText(timeline, "error", event.Text, false)
+				runtimeFailed = true
 			}
 			if !emitRuntimeEvent(ctx, out, event) {
 				return
 			}
+			if runtimeFailed {
+				break
+			}
+		}
+		if runtimeFailed {
+			if err := s.persistTimelineMessages(runCtx.SessionID, timeline); err != nil {
+				emitRuntimeEvent(ctx, out, runtimeagent.RuntimeEvent{Kind: runtimeagent.RuntimeEventError, Text: err.Error()})
+			}
+			return
 		}
 
 		directive, ok := s.runAfterRunMiddleware(ctx, out, runCtx, middleware, summary, &timeline)
@@ -489,6 +500,16 @@ func selectRunCwd(requestCwd, sessionCwd string) string {
 		return cwd
 	}
 	return strings.TrimSpace(sessionCwd)
+}
+
+func defaultSessionStateFromConfig(cfg *config.Config) SessionState {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Agent.DefaultMode), string(runtimeagent.ModeTeam)) {
+		return SessionState{
+			Mode:     runtimeagent.ModeTeam,
+			TeamName: strings.TrimSpace(cfg.Agent.DefaultTeam),
+		}
+	}
+	return DefaultSessionState()
 }
 
 func nextMessageID(offset int64) string {

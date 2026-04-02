@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/termia/termia/internal/agent"
+	"github.com/termia/termia/internal/agentapp"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"go.uber.org/zap"
@@ -160,5 +161,67 @@ func TestSubmitInputAbortsWhenSessionRuntimePersistenceFails(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(last.Content), "error") {
 		t.Fatalf("expected error message content, got %q", last.Content)
+	}
+}
+
+func TestUpdateSessionRuntimePreservesSessionMiddleware(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "termia.db"), zap.NewNop())
+	if err != nil {
+		t.Fatalf("db.Open returned error: %v", err)
+	}
+	defer database.Close()
+
+	state := agentapp.SessionState{
+		Mode:     agent.ModeAssistant,
+		TeamName: "",
+		SessionMiddleware: []agentapp.MiddlewareActivation{{
+			Name:  "sticky",
+			Scope: agentapp.MiddlewareScopeSession,
+			Args:  map[string]string{"level": "2"},
+		}},
+	}
+	snapshot, err := agentapp.EncodeSessionState(state)
+	if err != nil {
+		t.Fatalf("EncodeSessionState returned error: %v", err)
+	}
+	session := db.AgentSession{
+		ID:               "session-1",
+		Name:             "Session 1",
+		Mode:             string(agent.ModeAssistant),
+		SpecSnapshotJSON: snapshot,
+		Cwd:              "/cwd",
+		CreatedAt:        1,
+		UpdatedAt:        1,
+	}
+	if err := database.CreateAgentSession(&session); err != nil {
+		t.Fatalf("CreateAgentSession returned error: %v", err)
+	}
+
+	app := New(database, config.DefaultConfig(), zap.NewNop())
+	app.sessions = []db.AgentSession{session}
+
+	if err := app.updateSessionRuntime(session.ID, agent.ModeTeam, "ops"); err != nil {
+		t.Fatalf("updateSessionRuntime returned error: %v", err)
+	}
+
+	updated, ok, err := database.GetAgentSession(session.ID)
+	if err != nil {
+		t.Fatalf("GetAgentSession returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected updated session to exist")
+	}
+	if updated.Mode != string(agent.ModeTeam) || updated.TeamName != "ops" {
+		t.Fatalf("expected mode/team to update, got %+v", updated)
+	}
+	decoded, err := agentapp.DecodeSessionState(updated.SpecSnapshotJSON)
+	if err != nil {
+		t.Fatalf("DecodeSessionState returned error: %v", err)
+	}
+	if decoded.Mode != agent.ModeTeam || decoded.TeamName != "ops" {
+		t.Fatalf("expected snapshot mode/team to update, got %+v", decoded)
+	}
+	if len(decoded.SessionMiddleware) != 1 || decoded.SessionMiddleware[0].Name != "sticky" || decoded.SessionMiddleware[0].Args["level"] != "2" {
+		t.Fatalf("expected session middleware to be preserved, got %+v", decoded.SessionMiddleware)
 	}
 }

@@ -3581,11 +3581,43 @@ func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName s
 	if sessionID == "" {
 		return nil
 	}
+
+	state := agentapp.SessionState{Mode: mode, TeamName: strings.TrimSpace(teamName)}
+	foundSession := false
+	for i := range a.sessions {
+		if a.sessions[i].ID != sessionID {
+			continue
+		}
+		existingState, err := agentapp.DecodeSessionState(a.sessions[i].SpecSnapshotJSON)
+		if err != nil {
+			return err
+		}
+		state.SessionMiddleware = append([]agentapp.MiddlewareActivation(nil), existingState.SessionMiddleware...)
+		foundSession = true
+		break
+	}
+	if !foundSession && a.db != nil {
+		session, ok, err := a.db.GetAgentSession(sessionID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			existingState, err := agentapp.DecodeSessionState(session.SpecSnapshotJSON)
+			if err != nil {
+				return err
+			}
+			state.SessionMiddleware = append([]agentapp.MiddlewareActivation(nil), existingState.SessionMiddleware...)
+		}
+	}
+
+	specSnapshot, err := agentapp.EncodeSessionState(state)
+	if err != nil {
+		return err
+	}
 	if mode != agent.ModeTeam {
 		teamName = ""
 	}
 	teamName = strings.TrimSpace(teamName)
-	specSnapshot := buildSessionSpecSnapshot(mode, teamName)
 	for i := range a.sessions {
 		if a.sessions[i].ID != sessionID {
 			continue
@@ -3595,6 +3627,7 @@ func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName s
 		a.sessions[i].SpecSnapshotJSON = specSnapshot
 		break
 	}
+
 	if a.db == nil {
 		return nil
 	}
@@ -3720,33 +3753,6 @@ func buildInputHistoryEntries(messages []db.AgentMessage) []InputHistoryEntry {
 		return nil
 	}
 	return entries
-}
-
-func agentCommandsFromMessageMetadata(metadata db.AgentMessageMetadata) []agent.Command {
-	if len(metadata.CitedCommands) == 0 {
-		return nil
-	}
-	commands := make([]agent.Command, 0, len(metadata.CitedCommands))
-	for _, cited := range metadata.CitedCommands {
-		if cited.ID == "" || strings.TrimSpace(cited.Command) == "" {
-			continue
-		}
-		commands = append(commands, agent.Command{
-			ID:                  cited.ID,
-			TsStart:             cited.TsStart,
-			TsEnd:               cited.TsEnd,
-			Command:             cited.Command,
-			Cwd:                 cited.Cwd,
-			ExitCode:            cited.ExitCode,
-			DurationMs:          cited.DurationMs,
-			OutputSize:          cited.OutputSize,
-			TranscriptAvailable: cited.TranscriptAvailable,
-		})
-	}
-	if len(commands) == 0 {
-		return nil
-	}
-	return commands
 }
 
 func agentToolCallsFromMessageMetadata(metadata db.AgentMessageMetadata) []AgentToolCall {

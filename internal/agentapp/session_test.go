@@ -243,6 +243,47 @@ func TestSessionServiceResolveUsesLatestWhenPreferredAndCurrentMissing(t *testin
 	}
 }
 
+func TestSessionServiceResolveUpdatesExistingSessionCwdFromRequest(t *testing.T) {
+	state := SessionState{Mode: runtimeagent.ModeAssistant}
+	snapshot, err := EncodeSessionState(state)
+	if err != nil {
+		t.Fatalf("EncodeSessionState returned error: %v", err)
+	}
+	database := &fakeSessionDB{
+		sessions: map[string]db.AgentSession{
+			"session-1": {
+				ID:               "session-1",
+				Name:             "Session 1",
+				Mode:             string(runtimeagent.ModeAssistant),
+				SpecSnapshotJSON: snapshot,
+				Cwd:              "/old",
+			},
+		},
+	}
+
+	service := NewSessionService(database)
+	gotSession, gotState, err := service.Resolve("session-1", "  /new  ", DefaultSessionState(), func() time.Time {
+		return time.Unix(99, 0)
+	})
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+
+	if gotSession.Cwd != "/new" {
+		t.Fatalf("expected resolved session cwd to use request cwd, got %+v", gotSession)
+	}
+	if gotState.Mode != runtimeagent.ModeAssistant {
+		t.Fatalf("expected existing session state to remain intact, got %+v", gotState)
+	}
+	stored := database.sessions["session-1"]
+	if stored.Cwd != "/new" {
+		t.Fatalf("expected request cwd to persist to session row, got %+v", stored)
+	}
+	if stored.UpdatedAt != time.Unix(99, 0).UnixNano() {
+		t.Fatalf("expected cwd persistence timestamp to update, got %+v", stored)
+	}
+}
+
 func TestSessionServiceUpdatePersistsSessionState(t *testing.T) {
 	database := &fakeSessionDB{
 		sessions: map[string]db.AgentSession{
@@ -334,6 +375,20 @@ func (f *fakeSessionDB) UpdateAgentSessionRuntime(sessionID, mode, teamName, spe
 	session.Mode = mode
 	session.TeamName = teamName
 	session.SpecSnapshotJSON = specSnapshotJSON
+	session.UpdatedAt = updatedAt
+	f.sessions[strings.TrimSpace(sessionID)] = session
+	return nil
+}
+
+func (f *fakeSessionDB) UpdateAgentSessionCwd(sessionID, cwd string, updatedAt int64) error {
+	if f.sessions == nil {
+		return nil
+	}
+	session, ok := f.sessions[strings.TrimSpace(sessionID)]
+	if !ok {
+		return nil
+	}
+	session.Cwd = strings.TrimSpace(cwd)
 	session.UpdatedAt = updatedAt
 	f.sessions[strings.TrimSpace(sessionID)] = session
 	return nil

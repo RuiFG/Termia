@@ -471,7 +471,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.setActiveSessionID(selectedID)
 			a.applySessionRuntime(a.activeSessionID)
 			if strings.TrimSpace(a.launchCwd) != "" {
-				a.recordSessionCwd(a.activeSessionID, a.launchCwd)
+				a.recordSessionCwd(a.activeSessionID, a.launchCwd, true)
 			} else {
 				a.ensureSessionCwd(a.activeSessionID)
 			}
@@ -612,7 +612,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case agent.RuntimeEventCwd:
 			if cwd := strings.TrimSpace(msg.event.Cwd); cwd != "" {
-				a.setCwd(cwd)
+				a.setCwdFromRuntime(cwd)
 			}
 		case agent.RuntimeEventError:
 			if text := strings.TrimSpace(msg.event.Text); text != "" {
@@ -3854,16 +3854,24 @@ func (a *App) syncCitedCommandsFromInputHistory() {
 }
 
 func (a *App) setCwd(cwd string) {
+	a.setCwdInternal(cwd, true)
+}
+
+func (a *App) setCwdFromRuntime(cwd string) {
+	a.setCwdInternal(cwd, false)
+}
+
+func (a *App) setCwdInternal(cwd string, persist bool) {
 	if strings.TrimSpace(cwd) == "" {
 		return
 	}
 	a.cwd = cwd
-	a.recordSessionCwd(a.activeSessionID, cwd)
+	a.recordSessionCwd(a.activeSessionID, cwd, persist)
 	a.updateInputPrompt()
 	a.syncCwdToShell(cwd)
 }
 
-func (a *App) recordSessionCwd(sessionID, cwd string) {
+func (a *App) recordSessionCwd(sessionID, cwd string, persist bool) {
 	if strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -3875,6 +3883,9 @@ func (a *App) recordSessionCwd(sessionID, cwd string) {
 	}
 	a.sessionCwds[sessionID] = cwd
 	a.updateSessionCwd(sessionID, cwd)
+	if !persist {
+		return
+	}
 	if a.db == nil {
 		return
 	}
@@ -3898,7 +3909,7 @@ func (a *App) ensureSessionCwd(sessionID string) {
 	if strings.TrimSpace(a.cwd) == "" {
 		return
 	}
-	a.recordSessionCwd(sessionID, a.cwd)
+	a.recordSessionCwd(sessionID, a.cwd, true)
 }
 
 func (a *App) applySessionCwd(sessionID string) {
@@ -3914,7 +3925,7 @@ func (a *App) applySessionCwd(sessionID string) {
 	if !ok || strings.TrimSpace(stored) == "" {
 		stored = a.sessionCwdFromList(sessionID)
 		if strings.TrimSpace(stored) == "" {
-			a.recordSessionCwd(sessionID, a.cwd)
+			a.recordSessionCwd(sessionID, a.cwd, true)
 			return
 		}
 		a.sessionCwds[sessionID] = stored

@@ -586,6 +586,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.agent.AppendToLast(msg.event.Text)
 				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "assistant", msg.event.Text, true)
 			}
+		case agent.RuntimeEventReasoning:
+			if msg.event.Text != "" {
+				a.agent.AppendReasoning(msg.event.Text)
+				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "reasoning", msg.event.Text, true)
+			}
 		case agent.RuntimeEventToolCall:
 			if msg.event.ToolCall != nil {
 				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
@@ -1762,7 +1767,7 @@ func (a *App) conversationMessages(query string) []agent.Message {
 	output := make([]agent.Message, 0, len(messages))
 	for _, message := range messages {
 		role := normalizeConversationRole(message.Role)
-		if role == "tool" || role == "error" {
+		if role == "tool" || role == "error" || role == "reasoning" {
 			continue
 		}
 		content := strings.TrimSpace(message.Content)

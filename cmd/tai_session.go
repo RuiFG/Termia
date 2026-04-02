@@ -189,7 +189,7 @@ func taiConversationMessagesFromDB(messages []db.AgentMessage) []agent.Message {
 	output := make([]agent.Message, 0, len(messages))
 	for _, message := range messages {
 		role := normalizeTaiConversationRole(message.Role)
-		if role == "tool" || role == "error" {
+		if role == "tool" || role == "error" || role == "reasoning" {
 			continue
 		}
 		content := textutil.NormalizeTrimmedText(message.Content)
@@ -221,6 +221,8 @@ func normalizeTaiConversationRole(role string) string {
 		return "system"
 	case "error":
 		return "error"
+	case "reasoning":
+		return "reasoning"
 	default:
 		if role == "" {
 			return "assistant"

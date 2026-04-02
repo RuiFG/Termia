@@ -91,3 +91,19 @@ func TestAgentModelNormalizesCarriageReturnsInTimelineAndToolCalls(t *testing.T)
 		t.Fatalf("expected normalized tool call content, got %q", view)
 	}
 }
+
+func TestAgentModelRendersReasoningSeparatelyFromAssistantText(t *testing.T) {
+	model := NewAgentModel(DefaultKeyMap())
+	model.SetSize(60, 12)
+	model.AppendReasoning("Plan the next step.")
+	model.AppendToLast("Final answer.")
+
+	view := model.viewport.View()
+	normalized := strings.Join(strings.Fields(view), " ")
+	if !strings.Contains(normalized, "… Plan the next step.") {
+		t.Fatalf("expected reasoning block in viewport, got %q", view)
+	}
+	if !strings.Contains(normalized, "• Final answer.") {
+		t.Fatalf("expected assistant block in viewport, got %q", view)
+	}
+}

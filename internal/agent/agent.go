@@ -222,7 +222,7 @@ func collectEventMessage(
 		return nil, nil
 	}
 
-	msg, emittedText, err := materializeMessage(event.Output.MessageOutput, output)
+	msg, emittedContent, err := materializeMessage(event.Output.MessageOutput, output)
 	if err != nil {
 		return nil, err
 	}
@@ -231,28 +231,30 @@ func collectEventMessage(
 	}
 
 	emitMessageEvents(event.AgentName, msg, output, seenToolCalls, seenToolResults)
-	if !emittedText {
-		if text := assistantMessageText(msg); text != "" {
-			output <- RuntimeEvent{Kind: RuntimeEventText, Text: text}
+	for _, contentEvent := range assistantContentEvents(msg) {
+		if emittedContent.saw(contentEvent.Kind) {
+			continue
 		}
+		output <- contentEvent
+		emittedContent.mark(contentEvent.Kind)
 	}
 
 	return msg, nil
 }
 
-func materializeMessage(mv *adk.MessageVariant, output chan<- RuntimeEvent) (adk.Message, bool, error) {
+func materializeMessage(mv *adk.MessageVariant, output chan<- RuntimeEvent) (adk.Message, emittedAssistantContent, error) {
 	if mv == nil {
-		return nil, false, nil
+		return nil, emittedAssistantContent{}, nil
 	}
 	if !mv.IsStreaming {
-		return mv.Message, false, nil
+		return mv.Message, emittedAssistantContent{}, nil
 	}
 
 	defer mv.MessageStream.Close()
 
 	var (
-		chunks      []*schema.Message
-		emittedText bool
+		chunks         []*schema.Message
+		emittedContent emittedAssistantContent
 	)
 	for {
 		chunk, err := mv.MessageStream.Recv()
@@ -260,28 +262,28 @@ func materializeMessage(mv *adk.MessageVariant, output chan<- RuntimeEvent) (adk
 			if err == io.EOF {
 				break
 			}
-			return nil, emittedText, err
+			return nil, emittedContent, err
 		}
 		if chunk == nil {
 			continue
 		}
 
 		chunks = append(chunks, chunk)
-		if text := assistantMessageText(chunk); text != "" {
-			output <- RuntimeEvent{Kind: RuntimeEventText, Text: text}
-			emittedText = true
+		for _, contentEvent := range assistantContentEvents(chunk) {
+			output <- contentEvent
+			emittedContent.mark(contentEvent.Kind)
 		}
 	}
 
 	if len(chunks) == 0 {
-		return nil, emittedText, nil
+		return nil, emittedContent, nil
 	}
 
 	msg, err := schema.ConcatMessages(chunks)
 	if err != nil {
-		return nil, emittedText, err
+		return nil, emittedContent, err
 	}
-	return msg, emittedText, nil
+	return msg, emittedContent, nil
 }
 
 func (r *Runtime) buildRootAgent(ctx context.Context, req RunRequest, state *runtimeState) (adk.Agent, error) {
@@ -596,24 +598,65 @@ func emitMessageEvents(
 	}
 }
 
-func assistantMessageText(msg *schema.Message) string {
+type emittedAssistantContent struct {
+	text      bool
+	reasoning bool
+}
+
+func (e *emittedAssistantContent) mark(kind RuntimeEventKind) {
+	switch kind {
+	case RuntimeEventText:
+		e.text = true
+	case RuntimeEventReasoning:
+		e.reasoning = true
+	}
+}
+
+func (e emittedAssistantContent) saw(kind RuntimeEventKind) bool {
+	switch kind {
+	case RuntimeEventText:
+		return e.text
+	case RuntimeEventReasoning:
+		return e.reasoning
+	default:
+		return false
+	}
+}
+
+func assistantContentEvents(msg *schema.Message) []RuntimeEvent {
 	if msg == nil || msg.Role != schema.Assistant {
-		return ""
-	}
-	if msg.Content != "" {
-		return msg.Content
-	}
-	if len(msg.AssistantGenMultiContent) == 0 {
-		return ""
+		return nil
 	}
 
-	var sb strings.Builder
-	for _, part := range msg.AssistantGenMultiContent {
-		if part.Text != "" {
-			sb.WriteString(part.Text)
+	events := make([]RuntimeEvent, 0, len(msg.AssistantGenMultiContent)+2)
+	if len(msg.AssistantGenMultiContent) > 0 {
+		for _, part := range msg.AssistantGenMultiContent {
+			switch {
+			case part.Type == schema.ChatMessagePartTypeReasoning && part.Reasoning != nil && part.Reasoning.Text != "":
+				events = append(events, RuntimeEvent{Kind: RuntimeEventReasoning, Text: part.Reasoning.Text})
+			case part.Type == schema.ChatMessagePartTypeText && part.Text != "":
+				events = append(events, RuntimeEvent{Kind: RuntimeEventText, Text: part.Text})
+			case part.Reasoning != nil && part.Reasoning.Text != "":
+				events = append(events, RuntimeEvent{Kind: RuntimeEventReasoning, Text: part.Reasoning.Text})
+			case part.Text != "":
+				events = append(events, RuntimeEvent{Kind: RuntimeEventText, Text: part.Text})
+			}
+		}
+		if len(events) > 0 {
+			return events
 		}
 	}
-	return sb.String()
+
+	if msg.ReasoningContent != "" {
+		events = append(events, RuntimeEvent{Kind: RuntimeEventReasoning, Text: msg.ReasoningContent})
+	}
+	if msg.Content != "" {
+		events = append(events, RuntimeEvent{Kind: RuntimeEventText, Text: msg.Content})
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	return events
 }
 
 func extractToolCallEvents(agentName string, msg *schema.Message) []ToolCallEvent {

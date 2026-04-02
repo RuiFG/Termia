@@ -106,6 +106,14 @@ func (m *AgentModel) AppendToLast(chunk string) {
 	}
 }
 
+func (m *AgentModel) AppendReasoning(chunk string) {
+	m.messages = appendTimelineText(m.messages, "reasoning", chunk, true)
+	m.refreshContent()
+	if m.ready {
+		m.viewport.GotoBottom()
+	}
+}
+
 func (m *AgentModel) AppendToolCall(toolCall AgentToolCall) {
 	m.messages = upsertTimelineToolCall(m.messages, toolCall)
 	m.refreshContent()
@@ -323,6 +331,8 @@ func normalizeConversationRole(role string) string {
 		return "system"
 	case "error":
 		return "error"
+	case "reasoning":
+		return "reasoning"
 	default:
 		if role == "" {
 			return "assistant"
@@ -343,6 +353,8 @@ func renderTimelineMessage(message AgentMessage, width int) string {
 		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, systemBulletPrefixStyle.Render("• "), "  ", systemBodyStyle), "\n")
 	case "error":
 		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, errorBulletPrefixStyle.Render("• "), "  ", errorBodyStyle), "\n")
+	case "reasoning":
+		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, reasoningBulletPrefixStyle.Render("… "), "  ", reasoningBodyStyle), "\n")
 	default:
 		return strings.Join(renderPrefixedMarkdown(textutil.NormalizeTrimmedText(message.Content), width, assistantBulletPrefixStyle.Render("• "), "  ", assistantBodyStyle), "\n")
 	}

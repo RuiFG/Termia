@@ -43,26 +43,36 @@ func TestFormatSessionMessagesNormalizesCarriageReturns(t *testing.T) {
 			Content: "first\rsecond",
 		},
 		{
+			Role:    "reasoning",
+			Content: "plan\rmore",
+		},
+		{
 			Role:         "tool",
 			MetadataJSON: `{"tool_calls":[{"tool_name":"command\r","summary":"pwd\rnow","result":"ok\rdone","state":"success"}]}`,
 		},
 	})
-	if len(messages) != 2 {
-		t.Fatalf("expected assistant and tool messages, got %#v", messages)
+	if len(messages) != 3 {
+		t.Fatalf("expected assistant, reasoning, and tool messages, got %#v", messages)
 	}
 	if got := messages[0].Content; got != "first\nsecond" {
 		t.Fatalf("expected normalized assistant content, got %q", got)
 	}
-	if messages[1].ToolCall == nil {
+	if got := messages[1].Role; got != "reasoning" {
+		t.Fatalf("expected reasoning role, got %q", got)
+	}
+	if got := messages[1].Content; got != "plan\nmore" {
+		t.Fatalf("expected normalized reasoning content, got %q", got)
+	}
+	if messages[2].ToolCall == nil {
 		t.Fatalf("expected tool call metadata to load")
 	}
-	if got := messages[1].ToolCall.ToolName; got != "command" {
+	if got := messages[2].ToolCall.ToolName; got != "command" {
 		t.Fatalf("expected normalized tool name, got %q", got)
 	}
-	if got := messages[1].ToolCall.Summary; got != "pwd now" {
+	if got := messages[2].ToolCall.Summary; got != "pwd now" {
 		t.Fatalf("expected normalized tool summary, got %q", got)
 	}
-	if got := messages[1].ToolCall.Result; got != "ok done" {
+	if got := messages[2].ToolCall.Result; got != "ok done" {
 		t.Fatalf("expected normalized tool result, got %q", got)
 	}
 }

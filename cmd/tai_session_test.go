@@ -78,7 +78,7 @@ func TestResolveTaiRuntimeRejectsLiteralTeamMode(t *testing.T) {
 	}
 }
 
-func TestTaiConversationMessagesFromDBSkipsToolAndError(t *testing.T) {
+func TestTaiConversationMessagesFromDBSkipsToolReasoningAndError(t *testing.T) {
 	messages := taiConversationMessagesFromDB([]db.AgentMessage{
 		{
 			Role:         "user",
@@ -93,6 +93,10 @@ func TestTaiConversationMessagesFromDBSkipsToolAndError(t *testing.T) {
 		{
 			Role:    "assistant",
 			Content: "answer",
+		},
+		{
+			Role:    "reasoning",
+			Content: "plan",
 		},
 		{
 			Role:    "error",

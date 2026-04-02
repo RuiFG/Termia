@@ -31,6 +31,7 @@ type RuntimeEventKind string
 
 const (
 	RuntimeEventText       RuntimeEventKind = "text"
+	RuntimeEventReasoning  RuntimeEventKind = "reasoning"
 	RuntimeEventToolCall   RuntimeEventKind = "tool_call"
 	RuntimeEventToolResult RuntimeEventKind = "tool_result"
 	RuntimeEventCwd        RuntimeEventKind = "cwd"

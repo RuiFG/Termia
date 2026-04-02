@@ -59,3 +59,49 @@ func TestExtractToolResultEventsCapturesCommandFailure(t *testing.T) {
 		t.Fatalf("expected command failure state, got %#v", results[0])
 	}
 }
+
+func TestAssistantContentEventsIncludeReasoningAndTextInContentOrder(t *testing.T) {
+	msg := &schema.Message{
+		Role: schema.Assistant,
+		AssistantGenMultiContent: []schema.MessageOutputPart{
+			{
+				Type:      schema.ChatMessagePartTypeReasoning,
+				Reasoning: &schema.MessageOutputReasoning{Text: "plan"},
+			},
+			{
+				Type: schema.ChatMessagePartTypeText,
+				Text: "answer",
+			},
+		},
+	}
+
+	events := assistantContentEvents(msg)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 assistant content events, got %#v", events)
+	}
+	if events[0].Kind != RuntimeEventReasoning || events[0].Text != "plan" {
+		t.Fatalf("expected reasoning event first, got %#v", events[0])
+	}
+	if events[1].Kind != RuntimeEventText || events[1].Text != "answer" {
+		t.Fatalf("expected text event second, got %#v", events[1])
+	}
+}
+
+func TestAssistantContentEventsFallBackToReasoningContent(t *testing.T) {
+	msg := &schema.Message{
+		Role:             schema.Assistant,
+		ReasoningContent: "thinking",
+		Content:          "final",
+	}
+
+	events := assistantContentEvents(msg)
+	if len(events) != 2 {
+		t.Fatalf("expected reasoning and text fallback events, got %#v", events)
+	}
+	if events[0].Kind != RuntimeEventReasoning || events[0].Text != "thinking" {
+		t.Fatalf("expected reasoning fallback first, got %#v", events[0])
+	}
+	if events[1].Kind != RuntimeEventText || events[1].Text != "final" {
+		t.Fatalf("expected text fallback second, got %#v", events[1])
+	}
+}

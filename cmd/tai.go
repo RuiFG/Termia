@@ -177,6 +177,9 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		case agent.RuntimeEventText:
 			renderer.WriteAssistant(chunk.Text, &fullResponse)
 			timelineMessages = taiAppendTimelineText(timelineMessages, "assistant", chunk.Text, true)
+		case agent.RuntimeEventReasoning:
+			renderer.WriteReasoning(chunk.Text)
+			timelineMessages = taiAppendTimelineText(timelineMessages, "reasoning", chunk.Text, true)
 		case agent.RuntimeEventToolCall:
 			if chunk.ToolCall == nil {
 				continue
@@ -352,6 +355,8 @@ func workingDirectory() string {
 
 var (
 	taiAssistantPrefixStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1F2328", Dark: "#E6EDF3"}).Bold(true)
+	taiReasoningPrefixStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#656D76", Dark: "#8B949E"}).Bold(true)
+	taiReasoningBodyStyle   = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#656D76", Dark: "#8B949E"}).Italic(true)
 	taiToolPendingStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#656D76", Dark: "#8B949E"})
 	taiToolSuccessStyle     = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1A7F37", Dark: "#3FB950"})
 	taiToolErrorStyle       = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#CF222E", Dark: "#F85149"})
@@ -359,23 +364,39 @@ var (
 	taiErrorBodyStyle       = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#CF222E", Dark: "#F85149"})
 )
 
+type taiStreamKind int
+
+const (
+	taiStreamNone taiStreamKind = iota
+	taiStreamAssistant
+	taiStreamReasoning
+)
+
+type taiStreamStyle struct {
+	PrefixStyle  lipgloss.Style
+	BodyStyle    lipgloss.Style
+	Prefix       string
+	Continuation string
+}
+
 type taiRenderer struct {
-	assistantOpen      bool
-	assistantLineStart bool
-	assistantFirstLine bool
-	toolCalls          map[string]agent.ToolCallEvent
-	toolStateKeys      map[string]string
-	bufferedTools      map[string]agent.ToolCallEvent
-	bufferedToolOrder  []string
+	streamKind        taiStreamKind
+	streamOpen        bool
+	streamLineStart   bool
+	streamFirstLine   bool
+	toolCalls         map[string]agent.ToolCallEvent
+	toolStateKeys     map[string]string
+	bufferedTools     map[string]agent.ToolCallEvent
+	bufferedToolOrder []string
 }
 
 func newTaiRenderer() *taiRenderer {
 	return &taiRenderer{
-		assistantLineStart: true,
-		assistantFirstLine: true,
-		toolCalls:          make(map[string]agent.ToolCallEvent),
-		toolStateKeys:      make(map[string]string),
-		bufferedTools:      make(map[string]agent.ToolCallEvent),
+		streamLineStart: true,
+		streamFirstLine: true,
+		toolCalls:       make(map[string]agent.ToolCallEvent),
+		toolStateKeys:   make(map[string]string),
+		bufferedTools:   make(map[string]agent.ToolCallEvent),
 	}
 }
 
@@ -387,36 +408,51 @@ func (r *taiRenderer) WriteAssistant(text string, fullResponse *strings.Builder)
 	if fullResponse != nil {
 		fullResponse.WriteString(text)
 	}
-	if !r.assistantOpen {
-		r.assistantOpen = true
-		r.assistantLineStart = true
-		r.assistantFirstLine = true
+	r.writeStreamText(taiStreamAssistant, text)
+}
+
+func (r *taiRenderer) WriteReasoning(text string) {
+	r.writeStreamText(taiStreamReasoning, text)
+}
+
+func (r *taiRenderer) writeStreamText(kind taiStreamKind, text string) {
+	text = textutil.NormalizeLineEndings(text)
+	if text == "" {
+		return
 	}
 	agent.LockConsoleOutput()
 	defer agent.UnlockConsoleOutput()
 	if r.flushBufferedToolsLocked() {
-		r.assistantOpen = true
-		r.assistantLineStart = true
-		r.assistantFirstLine = true
+		r.resetStreamLocked()
 	}
+	if r.streamKind != kind {
+		r.closeStreamLocked()
+		r.streamKind = kind
+	}
+	if !r.streamOpen {
+		r.streamOpen = true
+		r.streamLineStart = true
+		r.streamFirstLine = true
+	}
+	style := taiStreamStyleFor(kind)
 	for len(text) > 0 {
-		if r.assistantLineStart {
-			if r.assistantFirstLine {
-				fmt.Print(taiAssistantPrefixStyle.Render("• "))
-				r.assistantFirstLine = false
+		if r.streamLineStart {
+			if r.streamFirstLine {
+				fmt.Print(style.PrefixStyle.Render(style.Prefix))
+				r.streamFirstLine = false
 			} else {
-				fmt.Print("  ")
+				fmt.Print(style.Continuation)
 			}
-			r.assistantLineStart = false
+			r.streamLineStart = false
 		}
 		idx := strings.IndexByte(text, '\n')
 		if idx < 0 {
-			fmt.Print(text)
+			fmt.Print(style.BodyStyle.Render(text))
 			return
 		}
-		fmt.Print(text[:idx+1])
+		fmt.Print(style.BodyStyle.Render(text[:idx+1]))
 		text = text[idx+1:]
-		r.assistantLineStart = true
+		r.streamLineStart = true
 	}
 }
 
@@ -443,7 +479,7 @@ func (r *taiRenderer) WriteError(text string) {
 	agent.LockConsoleOutput()
 	defer agent.UnlockConsoleOutput()
 	r.flushBufferedToolsLocked()
-	r.closeAssistantLineLocked()
+	r.closeStreamLocked()
 	fmt.Println(taiErrorPrefixStyle.Render("• ") + taiErrorBodyStyle.Render(text))
 }
 
@@ -451,22 +487,40 @@ func (r *taiRenderer) Finish() {
 	agent.LockConsoleOutput()
 	defer agent.UnlockConsoleOutput()
 	r.flushBufferedToolsLocked()
-	r.closeAssistantLineLocked()
+	r.closeStreamLocked()
 }
 
-func (r *taiRenderer) closeAssistantLine() {
-	agent.LockConsoleOutput()
-	defer agent.UnlockConsoleOutput()
-	r.closeAssistantLineLocked()
-}
-
-func (r *taiRenderer) closeAssistantLineLocked() {
-	if r.assistantOpen && !r.assistantLineStart {
+func (r *taiRenderer) closeStreamLocked() {
+	if r.streamOpen && !r.streamLineStart {
 		fmt.Println()
 	}
-	r.assistantOpen = false
-	r.assistantLineStart = true
-	r.assistantFirstLine = true
+	r.resetStreamLocked()
+}
+
+func (r *taiRenderer) resetStreamLocked() {
+	r.streamKind = taiStreamNone
+	r.streamOpen = false
+	r.streamLineStart = true
+	r.streamFirstLine = true
+}
+
+func taiStreamStyleFor(kind taiStreamKind) taiStreamStyle {
+	switch kind {
+	case taiStreamReasoning:
+		return taiStreamStyle{
+			PrefixStyle:  taiReasoningPrefixStyle,
+			BodyStyle:    taiReasoningBodyStyle,
+			Prefix:       "… ",
+			Continuation: "  ",
+		}
+	default:
+		return taiStreamStyle{
+			PrefixStyle:  taiAssistantPrefixStyle,
+			BodyStyle:    lipgloss.NewStyle(),
+			Prefix:       "• ",
+			Continuation: "  ",
+		}
+	}
 }
 
 func (r *taiRenderer) normalizeToolCall(toolCall agent.ToolCallEvent) (agent.ToolCallEvent, string) {
@@ -556,7 +610,7 @@ func (r *taiRenderer) flushBufferedToolsLocked() bool {
 	if len(r.bufferedToolOrder) == 0 {
 		return false
 	}
-	r.closeAssistantLineLocked()
+	r.closeStreamLocked()
 	for _, key := range r.bufferedToolOrder {
 		toolCall, ok := r.bufferedTools[key]
 		if !ok {

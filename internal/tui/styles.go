@@ -218,6 +218,9 @@ var (
 	assistantBulletPrefixStyle = lipgloss.NewStyle().
 					Foreground(colorOnSurface).
 					Bold(true)
+	reasoningBulletPrefixStyle = lipgloss.NewStyle().
+					Foreground(colorMuted).
+					Bold(true)
 	systemBulletPrefixStyle = lipgloss.NewStyle().
 				Foreground(colorWarning).
 				Bold(true)
@@ -228,6 +231,9 @@ var (
 			Foreground(colorOnSurface)
 	assistantBodyStyle = lipgloss.NewStyle().
 				Foreground(colorOnSurface)
+	reasoningBodyStyle = lipgloss.NewStyle().
+				Foreground(colorMuted).
+				Italic(true)
 	systemBodyStyle = lipgloss.NewStyle().
 			Foreground(colorWarning)
 	errorBodyStyle = lipgloss.NewStyle().

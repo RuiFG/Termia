@@ -71,7 +71,7 @@ func UpsertTimelineToolCall(entries []TimelineEntry, call runtimeagent.ToolCallE
 		}
 	}
 
-	if call.State != runtimeagent.ToolCallStatePending {
+	if call.State != "" && call.State != runtimeagent.ToolCallStatePending {
 		for i := len(entries) - 1; i >= 0; i-- {
 			current := entries[i].ToolCall
 			if current == nil {
@@ -100,10 +100,10 @@ func mergeTimelineToolCall(existing, incoming runtimeagent.ToolCallEvent) runtim
 	if merged.CallID == "" {
 		merged.CallID = incoming.CallID
 	}
-	if incoming.AgentName != "" {
+	if merged.AgentName == "" {
 		merged.AgentName = incoming.AgentName
 	}
-	if incoming.ToolName != "" {
+	if merged.ToolName == "" {
 		merged.ToolName = incoming.ToolName
 	}
 	if incoming.Summary != "" {

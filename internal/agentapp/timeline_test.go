@@ -142,3 +142,54 @@ func TestMarkLatestPendingToolFailed(t *testing.T) {
 		t.Fatalf("expected earlier pending call to remain unchanged, got %+v", got[0].ToolCall)
 	}
 }
+
+func TestUpsertTimelineToolCallDoesNotFallbackMergeWithoutState(t *testing.T) {
+	pending := runtimeagent.ToolCallEvent{
+		ToolName: "command",
+		Summary:  "pwd",
+		State:    runtimeagent.ToolCallStatePending,
+	}
+	update := runtimeagent.ToolCallEvent{
+		ToolName: "command",
+		Summary:  "pwd",
+		Result:   "still running",
+	}
+
+	timeline := UpsertTimelineToolCall(nil, pending)
+	timeline = UpsertTimelineToolCall(timeline, update)
+
+	if len(timeline) != 2 {
+		t.Fatalf("expected a separate entry when state is empty, got %+v", timeline)
+	}
+}
+
+func TestUpsertTimelineToolCallKeepsExistingAgentAndToolIdentity(t *testing.T) {
+	pending := runtimeagent.ToolCallEvent{
+		CallID:    "call-1",
+		AgentName: "alice",
+		ToolName:  "command",
+		Summary:   "pwd",
+		State:     runtimeagent.ToolCallStatePending,
+	}
+	success := runtimeagent.ToolCallEvent{
+		CallID:    "call-1",
+		AgentName: "bob",
+		ToolName:  "shell",
+		Summary:   "pwd",
+		Result:    "ok",
+		State:     runtimeagent.ToolCallStateSuccess,
+	}
+
+	timeline := UpsertTimelineToolCall(nil, pending)
+	timeline = UpsertTimelineToolCall(timeline, success)
+
+	if len(timeline) != 1 || timeline[0].ToolCall == nil {
+		t.Fatalf("expected merged tool call, got %+v", timeline)
+	}
+	if timeline[0].ToolCall.AgentName != "alice" {
+		t.Fatalf("expected existing agent identity to win, got %+v", timeline[0].ToolCall)
+	}
+	if timeline[0].ToolCall.ToolName != "command" {
+		t.Fatalf("expected existing tool identity to win, got %+v", timeline[0].ToolCall)
+	}
+}

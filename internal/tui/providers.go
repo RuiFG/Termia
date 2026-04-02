@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/llm"
+	"github.com/termia/termia/internal/providerpolicy"
 )
 
 func loadProviderModelsCmd(
@@ -27,7 +28,7 @@ func loadProviderModelsCmd(
 }
 
 func (a *App) beginProviderModelsLoad(provider string) tea.Cmd {
-	meta, ok := a.cfg.LLM.ProviderMeta(provider)
+	meta, ok := a.providerSvc.ProviderMeta(provider)
 	if !ok {
 		return nil
 	}
@@ -49,8 +50,9 @@ func (a *App) beginModelsPaletteLoad() tea.Cmd {
 }
 
 func (a App) providerPaletteItems() []paletteItem {
-	items := make([]paletteItem, 0, len(a.cfg.LLM.ManageableProviders()))
-	for _, provider := range a.cfg.LLM.ManageableProviders() {
+	providers := a.providerSvc.ManageableProviders()
+	items := make([]paletteItem, 0, len(providers))
+	for _, provider := range providers {
 		items = append(items, paletteItem{
 			Label:    provider.DisplayName,
 			Desc:     a.providerPaletteDescription(provider),
@@ -82,13 +84,13 @@ func (a App) providerPaletteSections() []paletteSection {
 
 func (a App) providerPaletteDescription(provider config.ProviderMeta) string {
 	parts := make([]string, 0, 3)
-	if config.NormalizeProviderName(a.cfg.LLM.DefaultProvider) == config.NormalizeProviderName(provider.ID) {
+	if providerpolicy.NormalizeProviderName(a.cfg.LLM.DefaultProvider) == providerpolicy.NormalizeProviderName(provider.ID) {
 		parts = append(parts, "current")
 	}
 	if provider.Custom {
-		parts = append(parts, config.ProviderDisplayName(provider.Kind))
+		parts = append(parts, providerpolicy.ProviderDisplayName(provider.Kind))
 	}
-	if err := llm.ValidateProviderConfig(provider.Kind, provider.Config); err != nil {
+	if err := a.providerSvc.ValidateProvider(provider); err != nil {
 		parts = append(parts, providerConfigErrorSummary(err))
 	} else {
 		parts = append(parts, "configured")
@@ -113,11 +115,30 @@ func providerConfigErrorSummary(err error) string {
 	}
 }
 
+func providerActionError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	switch strings.ToLower(text) {
+	case "unsupported provider":
+		return "Unsupported provider."
+	case "unsupported field":
+		return "Unsupported field."
+	case "provider not found":
+		return "Provider not found."
+	case "only custom providers can be deleted":
+		return "Only custom providers can be deleted."
+	default:
+		return fmt.Sprintf("Error: %s", text)
+	}
+}
+
 func (a App) providerDetailTitle() string {
 	if strings.TrimSpace(a.activePaletteProvider) == "" {
 		return "Provider"
 	}
-	return a.cfg.LLM.ProviderDisplayName(a.activePaletteProvider)
+	return a.providerSvc.ProviderDisplayName(a.activePaletteProvider)
 }
 
 func (a App) providerDetailPaletteItems() []paletteItem {
@@ -125,7 +146,7 @@ func (a App) providerDetailPaletteItems() []paletteItem {
 }
 
 func (a App) providerDetailSections() []paletteSection {
-	meta, ok := a.cfg.LLM.ProviderMeta(a.activePaletteProvider)
+	meta, ok := a.providerSvc.ProviderMeta(a.activePaletteProvider)
 	if !ok {
 		return nil
 	}
@@ -137,7 +158,7 @@ func (a App) providerDetailSections() []paletteSection {
 		},
 	}
 
-	fields := llm.ConfigFields(meta.Kind)
+	fields := a.providerSvc.ConfigFields(meta.Kind)
 	if len(fields) > 0 {
 		items := make([]paletteItem, 0, len(fields))
 		for _, field := range fields {
@@ -203,10 +224,10 @@ func (a App) modelPaletteSections() []paletteSection {
 }
 
 func (a App) modelPaletteProviders() []config.ProviderMeta {
-	providers := a.cfg.LLM.ModelProviders()
+	providers := a.providerSvc.ModelProviders()
 	configured := make([]config.ProviderMeta, 0, len(providers))
 	for _, provider := range providers {
-		if err := llm.ValidateModelCatalogConfig(provider); err != nil {
+		if err := a.providerSvc.ValidateModelCatalog(provider); err != nil {
 			continue
 		}
 		configured = append(configured, provider)
@@ -215,7 +236,7 @@ func (a App) modelPaletteProviders() []config.ProviderMeta {
 }
 
 func (a App) providerModelItems(provider config.ProviderMeta) []paletteItem {
-	providerID := config.NormalizeProviderName(provider.ID)
+	providerID := providerpolicy.NormalizeProviderName(provider.ID)
 	if providerID == "" {
 		return nil
 	}
@@ -231,8 +252,8 @@ func (a App) providerModelItems(provider config.ProviderMeta) []paletteItem {
 		return []paletteItem{{Label: "No models available", Action: paletteActionNoop}}
 	}
 
-	providerCfg, _ := a.cfg.LLM.ProviderConfig(providerID)
-	isCurrentProvider := config.NormalizeProviderName(a.cfg.LLM.DefaultProvider) == providerID
+	providerCfg, _ := a.providerSvc.ProviderConfig(providerID)
+	isCurrentProvider := providerpolicy.NormalizeProviderName(a.cfg.LLM.DefaultProvider) == providerID
 	items := make([]paletteItem, 0, len(models))
 	for _, model := range models {
 		parts := make([]string, 0, 3)
@@ -272,7 +293,7 @@ func formatThinkingCapability(model llm.ModelDescriptor) string {
 
 func (a *App) openProviderConfigPrompt(provider string, field llm.ProviderConfigField) {
 	a.providerConfigOpen = true
-	a.providerConfigProvider = config.NormalizeProviderName(provider)
+	a.providerConfigProvider = providerpolicy.NormalizeProviderName(provider)
 	a.providerConfigField = field
 	a.providerConfigError = ""
 	a.providerConfigInput.SetValue(a.providerFieldRawValue(provider, field))
@@ -314,7 +335,7 @@ func (a App) handleProviderConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a App) submitProviderConfigPrompt() (tea.Model, tea.Cmd) {
-	provider := config.NormalizeProviderName(a.providerConfigProvider)
+	provider := providerpolicy.NormalizeProviderName(a.providerConfigProvider)
 	field := a.providerConfigField
 	value := strings.TrimSpace(a.providerConfigInput.Value())
 
@@ -325,28 +346,8 @@ func (a App) submitProviderConfigPrompt() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		a.providerConfigError = "Unsupported provider."
-		return a, nil
-	}
-
-	switch field {
-	case llm.ProviderFieldAPIKey:
-		providerCfg.APIKey = value
-	case llm.ProviderFieldBaseURL:
-		providerCfg.BaseURL = value
-	default:
-		a.providerConfigError = "Unsupported field."
-		return a, nil
-	}
-
-	if !a.cfg.LLM.SetProviderConfig(provider, providerCfg) {
-		a.providerConfigError = "Unsupported provider."
-		return a, nil
-	}
-	if err := a.saveConfigFn(a.cfg); err != nil {
-		a.providerConfigError = err.Error()
+	if err := a.providerSvc.UpdateProviderField(provider, field, value); err != nil {
+		a.providerConfigError = providerActionError(err)
 		return a, nil
 	}
 
@@ -516,17 +517,8 @@ func (a App) submitCustomProviderPrompt() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	custom, err := a.cfg.LLM.AddCustomProvider(name, config.ProviderOpenAICompatible, config.LLMProviderConfig{
-		APIKey:    apiKey,
-		Model:     "",
-		MaxTokens: 2000,
-		BaseURL:   baseURL,
-	})
+	custom, err := a.providerSvc.CreateCustomProvider(name, apiKey, baseURL)
 	if err != nil {
-		a.customProviderError = err.Error()
-		return a, nil
-	}
-	if err := a.saveConfigFn(a.cfg); err != nil {
 		a.customProviderError = err.Error()
 		return a, nil
 	}
@@ -584,7 +576,7 @@ func (a App) renderCustomProviderHeader(width int) string {
 }
 
 func (a App) providerFieldTitle(provider string, field llm.ProviderConfigField) string {
-	return fmt.Sprintf("%s %s", a.cfg.LLM.ProviderDisplayName(provider), providerFieldLabel(field))
+	return fmt.Sprintf("%s %s", a.providerSvc.ProviderDisplayName(provider), providerFieldLabel(field))
 }
 
 func providerFieldLabel(field llm.ProviderConfigField) string {
@@ -607,41 +599,11 @@ func (a App) providerFieldPlaceholder(provider string, field llm.ProviderConfigF
 }
 
 func (a App) providerFieldRawValue(provider string, field llm.ProviderConfigField) string {
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		return ""
-	}
-	switch field {
-	case llm.ProviderFieldAPIKey:
-		return strings.TrimSpace(providerCfg.APIKey)
-	case llm.ProviderFieldBaseURL:
-		return strings.TrimSpace(providerCfg.BaseURL)
-	default:
-		return ""
-	}
+	return a.providerSvc.ProviderFieldRawValue(provider, field)
 }
 
 func (a App) providerFieldDisplayValue(provider string, field llm.ProviderConfigField) string {
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		return "(not set)"
-	}
-	providerKind := a.cfg.LLM.ProviderKind(provider)
-	switch field {
-	case llm.ProviderFieldAPIKey:
-		return maskSecret(providerCfg.ResolvedAPIKey())
-	case llm.ProviderFieldBaseURL:
-		value := strings.TrimSpace(providerCfg.BaseURL)
-		if value == "" {
-			value = llm.EffectiveBaseURL(providerKind, providerCfg)
-		}
-		if value == "" {
-			return "(not set)"
-		}
-		return value
-	default:
-		return "(not set)"
-	}
+	return a.providerSvc.ProviderFieldDisplayValue(provider, field)
 }
 
 func maskSecret(value string) string {
@@ -657,27 +619,9 @@ func maskSecret(value string) string {
 }
 
 func (a App) clearProviderField(provider string, field llm.ProviderConfigField) (tea.Model, tea.Cmd) {
-	provider = config.NormalizeProviderName(provider)
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		a.statusMsg = "Unsupported provider."
-		return a, nil
-	}
-	switch field {
-	case llm.ProviderFieldAPIKey:
-		providerCfg.APIKey = ""
-	case llm.ProviderFieldBaseURL:
-		providerCfg.BaseURL = ""
-	default:
-		a.statusMsg = "Unsupported field."
-		return a, nil
-	}
-	if !a.cfg.LLM.SetProviderConfig(provider, providerCfg) {
-		a.statusMsg = "Unsupported provider."
-		return a, nil
-	}
-	if err := a.saveConfigFn(a.cfg); err != nil {
-		a.statusMsg = fmt.Sprintf("Error: %v", err)
+	provider = providerpolicy.NormalizeProviderName(provider)
+	if err := a.providerSvc.ClearProviderField(provider, field); err != nil {
+		a.statusMsg = providerActionError(err)
 		return a, nil
 	}
 	delete(a.providerModels, provider)
@@ -688,21 +632,10 @@ func (a App) clearProviderField(provider string, field llm.ProviderConfigField) 
 }
 
 func (a App) deleteCustomProvider(provider string) (tea.Model, tea.Cmd) {
-	provider = config.NormalizeProviderName(provider)
-	meta, ok := a.cfg.LLM.ProviderMeta(provider)
-	if !ok || !meta.Custom {
-		a.statusMsg = "Only custom providers can be deleted."
-		return a, nil
-	}
-	if !a.cfg.LLM.RemoveCustomProvider(provider) {
-		a.statusMsg = "Provider not found."
-		return a, nil
-	}
-	if config.NormalizeProviderName(a.cfg.LLM.DefaultProvider) == provider {
-		a.cfg.LLM.DefaultProvider = config.ProviderOpenAI
-	}
-	if err := a.saveConfigFn(a.cfg); err != nil {
-		a.statusMsg = fmt.Sprintf("Error: %v", err)
+	provider = providerpolicy.NormalizeProviderName(provider)
+	meta, err := a.providerSvc.DeleteCustomProvider(provider)
+	if err != nil {
+		a.statusMsg = providerActionError(err)
 		return a, nil
 	}
 	delete(a.providerModels, provider)
@@ -715,46 +648,20 @@ func (a App) deleteCustomProvider(provider string) (tea.Model, tea.Cmd) {
 }
 
 func (a App) selectProviderModel(provider string, modelID string) (tea.Model, tea.Cmd) {
-	provider = config.NormalizeProviderName(provider)
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		a.statusMsg = "Unsupported provider."
-		return a, nil
-	}
-
-	providerCfg.Model = strings.TrimSpace(modelID)
-	if !a.cfg.LLM.SetProviderConfig(provider, providerCfg) {
-		a.statusMsg = "Unsupported provider."
-		return a, nil
-	}
-	a.cfg.LLM.DefaultProvider = provider
-	if err := a.saveConfigFn(a.cfg); err != nil {
-		a.statusMsg = fmt.Sprintf("Error: %v", err)
+	provider = providerpolicy.NormalizeProviderName(provider)
+	if err := a.providerSvc.SelectModel(provider, modelID); err != nil {
+		a.statusMsg = providerActionError(err)
 		return a, nil
 	}
 
 	a.syncThinkLevelForCurrentModel()
-	a.statusMsg = fmt.Sprintf("Model switched to %s (%s).", modelID, a.cfg.LLM.ProviderDisplayName(provider))
+	a.statusMsg = fmt.Sprintf("Model switched to %s (%s).", modelID, a.providerSvc.ProviderDisplayName(provider))
 	a.closePalette()
 	return a, nil
 }
 
 func (a App) currentModelDescriptor() (llm.ModelDescriptor, bool) {
-	provider := config.NormalizeProviderName(a.cfg.LLM.DefaultProvider)
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		return llm.ModelDescriptor{}, false
-	}
-	modelID := strings.TrimSpace(providerCfg.Model)
-	if modelID == "" {
-		return llm.ModelDescriptor{}, false
-	}
-	for _, model := range a.providerModels[provider] {
-		if strings.EqualFold(strings.TrimSpace(model.ID), modelID) {
-			return model, true
-		}
-	}
-	return llm.ModelDescriptor{}, false
+	return a.providerSvc.CurrentModelDescriptor(a.providerModels)
 }
 
 func (a App) currentThinkingLevels() []ThinkLevel {
@@ -804,31 +711,12 @@ func thinkLevelConfigValue(level ThinkLevel) string {
 }
 
 func (a App) currentConfiguredThinkLevel() (ThinkLevel, bool) {
-	provider := config.NormalizeProviderName(a.cfg.LLM.DefaultProvider)
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		return ThinkLow, false
-	}
-	return parseThinkLevel(providerCfg.ThinkingLevel)
+	return parseThinkLevel(a.providerSvc.CurrentConfiguredThinkingLevel())
 }
 
 func (a *App) persistCurrentThinkLevel() bool {
-	provider := config.NormalizeProviderName(a.cfg.LLM.DefaultProvider)
-	providerCfg, ok := a.cfg.LLM.ProviderConfig(provider)
-	if !ok {
-		return false
-	}
-	value := thinkLevelConfigValue(a.thinkLevel)
-	if strings.TrimSpace(providerCfg.ThinkingLevel) == value {
-		return true
-	}
-	providerCfg.ThinkingLevel = value
-	if !a.cfg.LLM.SetProviderConfig(provider, providerCfg) {
-		a.statusMsg = "Unsupported provider."
-		return false
-	}
-	if err := a.saveConfigFn(a.cfg); err != nil {
-		a.statusMsg = fmt.Sprintf("Error: %v", err)
+	if err := a.providerSvc.PersistCurrentThinkingLevel(thinkLevelConfigValue(a.thinkLevel)); err != nil {
+		a.statusMsg = providerActionError(err)
 		return false
 	}
 	return true
@@ -852,7 +740,7 @@ func (a *App) syncThinkLevelForCurrentModel() {
 			return
 		}
 	}
-	if preferred, ok := parseThinkLevel(llm.DefaultThinkingLevel(config.NormalizeProviderName(a.cfg.LLM.DefaultProvider), a.currentModelLabel())); ok {
+	if preferred, ok := parseThinkLevel(llm.DefaultThinkingLevel(providerpolicy.NormalizeProviderName(a.cfg.LLM.DefaultProvider), a.currentModelLabel())); ok {
 		for _, level := range levels {
 			if level == preferred {
 				a.thinkLevel = level

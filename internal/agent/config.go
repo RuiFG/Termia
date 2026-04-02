@@ -2,10 +2,9 @@ package agent
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/termia/termia/internal/config"
-	"github.com/termia/termia/internal/llm"
+	"github.com/termia/termia/internal/modelspec"
 )
 
 const (
@@ -54,43 +53,11 @@ func AssistantSpecFromConfig(cfg *config.Config) (AgentSpec, error) {
 }
 
 func DefaultModelSpecFromConfig(llmCfg *config.LLMConfig) (ModelSpec, error) {
-	if llmCfg == nil {
-		return ModelSpec{}, fmt.Errorf("llm config is nil")
+	spec, err := modelspec.DefaultFromConfig(llmCfg)
+	if err != nil {
+		return ModelSpec{}, err
 	}
-
-	provider := strings.ToLower(strings.TrimSpace(llmCfg.DefaultProvider))
-	meta, ok := llmCfg.ProviderMeta(provider)
-	if !ok {
-		return ModelSpec{}, fmt.Errorf("unsupported default provider %q", provider)
-	}
-	return modelSpecFromProviderConfig(meta.Kind, meta.Config)
-}
-
-func modelSpecFromProviderConfig(provider string, cfg config.LLMProviderConfig) (ModelSpec, error) {
-	provider = strings.TrimSpace(strings.ToLower(provider))
-	if provider == "" {
-		return ModelSpec{}, fmt.Errorf("provider is empty")
-	}
-	if strings.TrimSpace(cfg.Model) == "" {
-		return ModelSpec{}, fmt.Errorf("model is required for provider %s", provider)
-	}
-
-	thinkingLevel := llm.NormalizeThinkingLevel(cfg.ThinkingLevel)
-	if thinkingLevel != "" && !llm.SupportsThinkingLevel(provider, cfg.Model, thinkingLevel) {
-		thinkingLevel = ""
-	}
-	if thinkingLevel == "" {
-		thinkingLevel = llm.DefaultThinkingLevel(provider, cfg.Model)
-	}
-
-	return ModelSpec{
-		Provider:      provider,
-		Model:         strings.TrimSpace(cfg.Model),
-		APIKey:        strings.TrimSpace(cfg.APIKey),
-		BaseURL:       strings.TrimSpace(llm.EffectiveBaseURL(provider, cfg)),
-		ThinkingLevel: thinkingLevel,
-		MaxTokens:     cfg.MaxTokens,
-	}, nil
+	return spec, nil
 }
 
 func defaultToolNames() []string {

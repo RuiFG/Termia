@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/termia/termia/internal/config"
+	"github.com/termia/termia/internal/providerpolicy"
 )
 
 const (
@@ -108,18 +109,10 @@ func shouldSkipModelsDevModel(meta config.ProviderMeta, providerID, modelID stri
 }
 
 func providerUsesOpenAIResponses(meta config.ProviderMeta, providerID string) bool {
-	providerKind := config.NormalizeProviderName(meta.Kind)
-	if providerKind == config.ProviderOpenAI {
-		return true
-	}
-	if providerKind != config.ProviderOpenAICompatible {
-		return false
-	}
 	if providerID != "openai" {
 		return false
 	}
-	host, _ := normalizeModelsDevURLParts(strings.TrimSpace(meta.Config.BaseURL))
-	return strings.Contains(host, "api.openai.com")
+	return providerpolicy.UsesNativeOpenAIResponses(meta.Kind, meta.Config.BaseURL)
 }
 
 func loadModelsDevCatalog(ctx context.Context) (modelsDevCatalog, error) {

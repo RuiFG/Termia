@@ -9,28 +9,25 @@ import (
 	"strings"
 
 	"github.com/termia/termia/internal/config"
+	"github.com/termia/termia/internal/providerpolicy"
 )
 
-type ThinkingSupport int
+type ThinkingSupport = providerpolicy.ThinkingSupport
 
 const (
-	ThinkingSupportUnknown ThinkingSupport = iota
-	ThinkingSupportUnsupported
-	ThinkingSupportSupported
+	ThinkingSupportUnknown     = providerpolicy.ThinkingSupportUnknown
+	ThinkingSupportUnsupported = providerpolicy.ThinkingSupportUnsupported
+	ThinkingSupportSupported   = providerpolicy.ThinkingSupportSupported
 )
 
-type ProviderConfigField string
+type ProviderConfigField = providerpolicy.ConfigField
 
 const (
-	ProviderFieldAPIKey  ProviderConfigField = "api_key"
-	ProviderFieldBaseURL ProviderConfigField = "base_url"
+	ProviderFieldAPIKey  = providerpolicy.ConfigFieldAPIKey
+	ProviderFieldBaseURL = providerpolicy.ConfigFieldBaseURL
 )
 
-type ProviderConfigFieldSpec struct {
-	Field  ProviderConfigField
-	Label  string
-	Secret bool
-}
+type ProviderConfigFieldSpec = providerpolicy.ConfigFieldSpec
 
 type ModelDescriptor struct {
 	ID              string
@@ -41,68 +38,27 @@ type ModelDescriptor struct {
 }
 
 func ConfigFields(provider string) []ProviderConfigFieldSpec {
-	switch config.NormalizeProviderName(provider) {
-	case config.ProviderOpenAI, config.ProviderAnthropic, config.ProviderDeepSeek:
-		return []ProviderConfigFieldSpec{
-			{Field: ProviderFieldAPIKey, Label: "API Key", Secret: true},
-		}
-	case config.ProviderOllama:
-		return []ProviderConfigFieldSpec{
-			{Field: ProviderFieldBaseURL, Label: "Base URL", Secret: false},
-		}
-	case config.ProviderOpenAICompatible:
-		return []ProviderConfigFieldSpec{
-			{Field: ProviderFieldAPIKey, Label: "API Key", Secret: true},
-			{Field: ProviderFieldBaseURL, Label: "Base URL", Secret: false},
-		}
-	default:
-		return nil
-	}
+	return providerpolicy.ConfigFields(provider)
 }
 
 func RequiresAPIKey(provider string) bool {
-	switch config.NormalizeProviderName(provider) {
-	case config.ProviderOpenAI, config.ProviderAnthropic, config.ProviderDeepSeek, config.ProviderOpenAICompatible:
-		return true
-	default:
-		return false
-	}
+	return providerpolicy.RequiresAPIKey(provider)
 }
 
 func RequiresExplicitBaseURL(provider string) bool {
-	switch config.NormalizeProviderName(provider) {
-	case config.ProviderOpenAICompatible:
-		return true
-	default:
-		return false
-	}
+	return providerpolicy.RequiresExplicitBaseURL(provider)
 }
 
 func DefaultBaseURL(provider string) string {
-	switch config.NormalizeProviderName(provider) {
-	case config.ProviderOpenAI:
-		return "https://api.openai.com/v1"
-	case config.ProviderAnthropic:
-		return "https://api.anthropic.com"
-	case config.ProviderDeepSeek:
-		return "https://api.deepseek.com"
-	case config.ProviderOllama:
-		return "http://localhost:11434"
-	default:
-		return ""
-	}
+	return providerpolicy.DefaultBaseURL(provider)
 }
 
 func EffectiveBaseURL(provider string, providerCfg config.LLMProviderConfig) string {
-	baseURL := strings.TrimSpace(providerCfg.BaseURL)
-	if baseURL != "" {
-		return baseURL
-	}
-	return DefaultBaseURL(provider)
+	return providerpolicy.EffectiveBaseURL(provider, providerCfg.BaseURL)
 }
 
 func ValidateProviderConfig(provider string, providerCfg config.LLMProviderConfig) error {
-	provider = config.NormalizeProviderName(provider)
+	provider = providerpolicy.NormalizeProviderName(provider)
 	if provider == "" {
 		return fmt.Errorf("provider is empty")
 	}
@@ -122,7 +78,7 @@ func ValidateProviderConfig(provider string, providerCfg config.LLMProviderConfi
 }
 
 func ListModels(ctx context.Context, meta config.ProviderMeta) ([]ModelDescriptor, error) {
-	provider := config.NormalizeProviderName(meta.Kind)
+	provider := providerpolicy.NormalizeProviderName(meta.Kind)
 	if provider == "" {
 		return nil, fmt.Errorf("provider is empty")
 	}
@@ -133,12 +89,12 @@ func ListModels(ctx context.Context, meta config.ProviderMeta) ([]ModelDescripto
 }
 
 func ValidateModelCatalogConfig(meta config.ProviderMeta) error {
-	provider := config.NormalizeProviderName(meta.Kind)
+	provider := providerpolicy.NormalizeProviderName(meta.Kind)
 	if provider == "" {
 		return fmt.Errorf("provider is empty")
 	}
 
-	baseURL := strings.TrimSpace(EffectiveBaseURL(provider, meta.Config))
+	baseURL := strings.TrimSpace(providerpolicy.EffectiveBaseURL(provider, meta.Config.BaseURL))
 	if provider == config.ProviderOpenAICompatible && baseURL == "" {
 		return fmt.Errorf("base URL is required for %s", config.ProviderDisplayName(provider))
 	}
@@ -152,7 +108,7 @@ func ValidateModelCatalogConfig(meta config.ProviderMeta) error {
 
 func newDescriptor(provider, id, label, raw string) ModelDescriptor {
 	support, levels := parseThinkingMetadata(raw)
-	inferredSupport, inferredLevels := inferThinkingMetadata(provider, id)
+	inferredSupport, inferredLevels := providerpolicy.InferThinkingMetadata(provider, id)
 	if support == ThinkingSupportUnknown && inferredSupport != ThinkingSupportUnknown {
 		support = inferredSupport
 		levels = inferredLevels
@@ -163,7 +119,7 @@ func newDescriptor(provider, id, label, raw string) ModelDescriptor {
 	return ModelDescriptor{
 		ID:              strings.TrimSpace(id),
 		DisplayName:     strings.TrimSpace(label),
-		Provider:        config.NormalizeProviderName(provider),
+		Provider:        providerpolicy.NormalizeProviderName(provider),
 		ThinkingSupport: support,
 		ThinkingLevels:  levels,
 	}
@@ -210,124 +166,23 @@ func parseThinkingMetadata(raw string) (ThinkingSupport, []string) {
 }
 
 func ThinkingLevelsForModel(provider, modelID string) []string {
-	_, levels := inferThinkingMetadata(provider, modelID)
-	if len(levels) == 0 {
-		return nil
-	}
-	return append([]string(nil), levels...)
+	return providerpolicy.ThinkingLevelsForModel(provider, modelID)
 }
 
 func SupportsThinkingLevel(provider, modelID, level string) bool {
-	level = NormalizeThinkingLevel(level)
-	if level == "" {
-		return false
-	}
-	for _, candidate := range ThinkingLevelsForModel(provider, modelID) {
-		if candidate == level {
-			return true
-		}
-	}
-	return false
+	return providerpolicy.SupportsThinkingLevel(provider, modelID, level)
 }
 
 func DefaultThinkingLevel(provider, modelID string) string {
-	levels := ThinkingLevelsForModel(provider, modelID)
-	if len(levels) == 0 {
-		return ""
-	}
-	for _, preferred := range []string{"medium", "low", "high"} {
-		for _, level := range levels {
-			if level == preferred {
-				return level
-			}
-		}
-	}
-	return levels[0]
+	return providerpolicy.DefaultThinkingLevel(provider, modelID)
 }
 
 func NormalizeThinkingLevel(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
-	case "minimal":
-		return "low"
-	case "standard":
-		return "medium"
-	case "max":
-		return "high"
-	default:
-		return value
-	}
-}
-
-func inferThinkingMetadata(provider, modelID string) (ThinkingSupport, []string) {
-	id := normalizedInferenceModelID(modelID)
-	if id == "" {
-		return ThinkingSupportUnknown, nil
-	}
-
-	switch config.NormalizeProviderName(provider) {
-	case config.ProviderOpenAI, config.ProviderOpenAICompatible:
-		if isOpenAIChatLatestModel(id) {
-			return ThinkingSupportSupported, []string{"medium"}
-		}
-		if isOpenAIReasoningModel(id) {
-			return ThinkingSupportSupported, []string{"low", "medium", "high"}
-		}
-	case config.ProviderAnthropic:
-		if isAnthropicThinkingModel(id) {
-			return ThinkingSupportSupported, []string{"low", "medium", "high"}
-		}
-	}
-
-	return ThinkingSupportUnknown, nil
-}
-
-func normalizedInferenceModelID(modelID string) string {
-	id := strings.ToLower(strings.TrimSpace(modelID))
-	if id == "" {
-		return ""
-	}
-	parts := strings.FieldsFunc(id, func(r rune) bool {
-		return r == '/' || r == ':'
-	})
-	if len(parts) == 0 {
-		return id
-	}
-	return parts[len(parts)-1]
-}
-
-func isOpenAIReasoningModel(id string) bool {
-	switch {
-	case strings.HasPrefix(id, "gpt-5"):
-		return true
-	case strings.HasPrefix(id, "o1"):
-		return true
-	case strings.HasPrefix(id, "o3"):
-		return true
-	case strings.HasPrefix(id, "o4-mini"):
-		return true
-	default:
-		return false
-	}
-}
-
-func isOpenAIChatLatestModel(id string) bool {
-	return strings.HasPrefix(id, "gpt-5") && strings.HasSuffix(id, "-chat-latest")
+	return providerpolicy.NormalizeThinkingLevel(value)
 }
 
 func IsOpenAIResponsesOnlyModel(modelID string) bool {
-	id := normalizedInferenceModelID(modelID)
-	return strings.Contains(id, "codex")
-}
-
-func isAnthropicThinkingModel(id string) bool {
-	if !strings.Contains(id, "claude") {
-		return false
-	}
-	return strings.Contains(id, "3-7") ||
-		strings.Contains(id, "claude-4") ||
-		strings.Contains(id, "sonnet-4") ||
-		strings.Contains(id, "opus-4")
+	return providerpolicy.IsOpenAIResponsesOnlyModel(modelID)
 }
 
 func anyToStringSlice(value any) []string {
@@ -348,20 +203,7 @@ func anyToStringSlice(value any) []string {
 }
 
 func normalizeThinkingLevelList(values []string) []string {
-	seen := make(map[string]struct{}, len(values))
-	levels := make([]string, 0, len(values))
-	for _, value := range values {
-		value = NormalizeThinkingLevel(value)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		levels = append(levels, value)
-	}
-	return levels
+	return providerpolicy.NormalizeThinkingLevelList(values)
 }
 
 func sortDescriptors(models []ModelDescriptor) {

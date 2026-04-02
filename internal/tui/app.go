@@ -217,6 +217,7 @@ type App struct {
 	providerModelLoading   map[string]bool
 	saveConfigFn           func(*config.Config) error
 	listModelsFn           func(context.Context, config.ProviderMeta) ([]llm.ModelDescriptor, error)
+	providerSvc            providerService
 
 	customProviderOpen         bool
 	customProviderFocus        customProviderField
@@ -397,6 +398,7 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		},
 		listModelsFn: llm.ListModels,
 	}
+	app.providerSvc = newProviderService(cfg, app.saveConfigFn)
 	app.updateInputPrompt()
 	return app
 }

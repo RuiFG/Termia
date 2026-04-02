@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/BurntSushi/toml"
+	"github.com/termia/termia/internal/providerpolicy"
 )
 
 // Config represents the complete Termia configuration structure.
@@ -70,57 +71,27 @@ type ProviderMeta struct {
 }
 
 const (
-	ProviderOpenAI           = "openai"
-	ProviderAnthropic        = "anthropic"
-	ProviderDeepSeek         = "deepseek"
-	ProviderOllama           = "ollama"
-	ProviderOpenAICompatible = "openai_compatible"
+	ProviderOpenAI           = providerpolicy.ProviderOpenAI
+	ProviderAnthropic        = providerpolicy.ProviderAnthropic
+	ProviderDeepSeek         = providerpolicy.ProviderDeepSeek
+	ProviderOllama           = providerpolicy.ProviderOllama
+	ProviderOpenAICompatible = providerpolicy.ProviderOpenAICompatible
 )
 
 func NormalizeProviderName(provider string) string {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	switch provider {
-	case "claude":
-		return ProviderAnthropic
-	default:
-		return provider
-	}
+	return providerpolicy.NormalizeProviderName(provider)
 }
 
 func ProviderDisplayName(provider string) string {
-	switch NormalizeProviderName(provider) {
-	case ProviderOpenAI:
-		return "OpenAI"
-	case ProviderAnthropic:
-		return "Anthropic"
-	case ProviderDeepSeek:
-		return "DeepSeek"
-	case ProviderOllama:
-		return "Ollama"
-	case ProviderOpenAICompatible:
-		return "OpenAI Compatible"
-	default:
-		return strings.TrimSpace(provider)
-	}
+	return providerpolicy.ProviderDisplayName(provider)
 }
 
 func ProviderOrder() []string {
-	return []string{
-		ProviderOpenAI,
-		ProviderAnthropic,
-		ProviderDeepSeek,
-		ProviderOllama,
-		ProviderOpenAICompatible,
-	}
+	return providerpolicy.ProviderOrder()
 }
 
 func BuiltinProviderOrder() []string {
-	return []string{
-		ProviderOpenAI,
-		ProviderAnthropic,
-		ProviderDeepSeek,
-		ProviderOllama,
-	}
+	return providerpolicy.BuiltinProviderOrder()
 }
 
 func (c CustomLLMProviderConfig) ProviderConfig() LLMProviderConfig {

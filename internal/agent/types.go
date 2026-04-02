@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"time"
+
+	"github.com/termia/termia/internal/modelspec"
 )
 
 type Mode string
@@ -71,16 +73,7 @@ type Command struct {
 	TranscriptAvailable bool
 }
 
-type ModelSpec struct {
-	Provider      string   `toml:"provider" json:"provider"`
-	Model         string   `toml:"model" json:"model"`
-	APIKey        string   `toml:"api_key" json:"api_key,omitempty"`
-	APIKeyEnv     string   `toml:"api_key_env" json:"api_key_env"`
-	BaseURL       string   `toml:"base_url" json:"base_url"`
-	ThinkingLevel string   `toml:"thinking_level" json:"thinking_level,omitempty"`
-	MaxTokens     int      `toml:"max_tokens" json:"max_tokens"`
-	Temperature   *float64 `toml:"temperature" json:"temperature,omitempty"`
-}
+type ModelSpec = modelspec.Spec
 
 type AgentSpec struct {
 	Name        string    `toml:"name" json:"name"`

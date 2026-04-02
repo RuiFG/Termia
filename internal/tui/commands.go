@@ -2,9 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/termia/termia/internal/agentapp"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 )
@@ -20,6 +22,68 @@ type SlashCommandResult struct {
 	Quit            bool // true means exit TUI
 }
 
+var localUISlashCommands = []SlashSuggestion{
+	{Name: "exit", Desc: "exit tui"},
+}
+
+func localSlashSuggestions() []SlashSuggestion {
+	suggestions := make([]SlashSuggestion, len(localUISlashCommands))
+	copy(suggestions, localUISlashCommands)
+	return suggestions
+}
+
+func sharedSlashSuggestions() []SlashSuggestion {
+	shared := agentapp.DefaultSharedSlashCommands()
+	if len(shared) == 0 {
+		return nil
+	}
+	suggestions := make([]SlashSuggestion, 0, len(shared))
+	for _, command := range shared {
+		name := strings.TrimSpace(strings.ToLower(command.Name))
+		if name == "" {
+			continue
+		}
+		suggestions = append(suggestions, SlashSuggestion{
+			Name: name,
+			Desc: strings.TrimSpace(command.Description),
+		})
+	}
+	if len(suggestions) == 0 {
+		return nil
+	}
+	return suggestions
+}
+
+func combinedSlashSuggestions() []SlashSuggestion {
+	local := localSlashSuggestions()
+	shared := sharedSlashSuggestions()
+	if len(shared) == 0 {
+		return local
+	}
+
+	merged := make([]SlashSuggestion, 0, len(local)+len(shared))
+	merged = append(merged, local...)
+	for _, candidate := range shared {
+		if slices.ContainsFunc(merged, func(existing SlashSuggestion) bool {
+			return existing.Name == candidate.Name
+		}) {
+			continue
+		}
+		merged = append(merged, candidate)
+	}
+	return merged
+}
+
+func isLocalSlashCommand(name string) bool {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return false
+	}
+	return slices.ContainsFunc(localUISlashCommands, func(command SlashSuggestion) bool {
+		return command.Name == name
+	})
+}
+
 // executeSlashCommand processes a slash command and returns a tea.Cmd.
 func executeSlashCommand(cmd *SlashCommand, database *db.DB, cfg *config.LLMConfig) tea.Cmd {
 	if cmd == nil {
@@ -32,10 +96,6 @@ func executeSlashCommand(cmd *SlashCommand, database *db.DB, cfg *config.LLMConf
 	case "exit":
 		return func() tea.Msg {
 			return SlashCommandResult{Quit: true}
-		}
-	case "ralph-loop":
-		return func() tea.Msg {
-			return SlashCommandResult{Output: "Ralph loop started (placeholder)."}
 		}
 	default:
 		return func() tea.Msg {

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -45,6 +46,12 @@ func agenticMessageToMessage(msg *schema.AgenticMessage) (*schema.Message, error
 		case schema.ContentBlockTypeReasoning:
 			if block.Reasoning == nil {
 				continue
+			}
+			if text := strings.TrimSpace(block.Reasoning.Text); text != "" {
+				if out.ReasoningContent != "" {
+					out.ReasoningContent += "\n"
+				}
+				out.ReasoningContent += text
 			}
 			parts = append(parts, schema.MessageOutputPart{
 				Type: schema.ChatMessagePartTypeReasoning,

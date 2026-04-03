@@ -126,6 +126,32 @@ func TestBeginModelsPaletteLoadDoesNotSetProviderLoadingState(t *testing.T) {
 	}
 }
 
+func TestProviderModelItemsTrimModelLabelAndValue(t *testing.T) {
+	cfg := config.DefaultConfig()
+	app := New(nil, cfg, nil)
+	app.providerModels[config.ProviderOpenAI] = []llm.ModelDescriptor{{
+		ID:          "gpt-5\r\n",
+		DisplayName: "GPT-5\r\n",
+		Provider:    config.ProviderOpenAI,
+	}}
+
+	meta, ok := cfg.LLM.ProviderMeta(config.ProviderOpenAI)
+	if !ok {
+		t.Fatalf("expected OpenAI provider meta")
+	}
+	items := app.providerModelItems(meta)
+
+	if len(items) != 1 {
+		t.Fatalf("expected one model item, got %#v", items)
+	}
+	if items[0].Label != "GPT-5" {
+		t.Fatalf("expected trimmed model label, got %q", items[0].Label)
+	}
+	if items[0].Value != "gpt-5" {
+		t.Fatalf("expected trimmed model value, got %q", items[0].Value)
+	}
+}
+
 func sectionItemsByLabel(sections []paletteSection, label string) []paletteItem {
 	for _, section := range sections {
 		if section.Label == label {

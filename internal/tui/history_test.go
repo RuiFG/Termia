@@ -21,6 +21,24 @@ func TestHistoryModelRenderRowUsesCheckMarkerForCitedCommand(t *testing.T) {
 	}
 }
 
+func TestHistoryModelRenderRowFallsBackToEmptyForControlOnlyCommand(t *testing.T) {
+	history := NewHistoryModel(DefaultKeyMap())
+	history.SetSize(60, 6)
+	history.SetCommands([]db.Command{{ID: "cmd-1", Command: "\x00\r\n\t"}})
+
+	view := stripANSICodes(history.View())
+	lines := strings.Split(view, "\n")
+	if len(lines) == 0 {
+		t.Fatalf("expected history view to contain at least one row, got %q", view)
+	}
+	if !strings.Contains(lines[0], "(empty)") {
+		t.Fatalf("expected control-only command to render as (empty), got %q", lines[0])
+	}
+	if strings.ContainsAny(lines[0], "\x00\r\t") {
+		t.Fatalf("expected control characters to be stripped from the history row, got %q", lines[0])
+	}
+}
+
 func TestHistoryMouseWheelMovesSelection(t *testing.T) {
 	app := New(nil, config.DefaultConfig(), nil)
 	app.width = 120

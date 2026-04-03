@@ -7,6 +7,7 @@ import (
 
 	einoollama "github.com/cloudwego/eino-ext/components/model/ollama"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/termia/termia/internal/providerpolicy"
 )
 
 func newOllamaModel(ctx context.Context, spec ModelSpec) (model.ToolCallingChatModel, error) {
@@ -24,5 +25,18 @@ func newOllamaModel(ctx context.Context, spec ModelSpec) (model.ToolCallingChatM
 			Temperature: temp,
 		}
 	}
+	if thinking, ok := ollamaThinking(spec.ThinkingLevel); ok {
+		cfg.Thinking = thinking
+	}
 	return einoollama.NewChatModel(ctx, cfg)
+}
+
+func ollamaThinking(level string) (*einoollama.ThinkValue, bool) {
+	level = providerpolicy.NormalizeThinkingLevel(level)
+	switch level {
+	case "low", "medium", "high":
+		return &einoollama.ThinkValue{Value: level}, true
+	default:
+		return nil, false
+	}
 }

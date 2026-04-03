@@ -255,8 +255,16 @@ func (a App) providerModelItems(provider config.ProviderMeta) []paletteItem {
 	isCurrentProvider := providerpolicy.NormalizeProviderName(a.cfg.LLM.DefaultProvider) == providerID
 	items := make([]paletteItem, 0, len(models))
 	for _, model := range models {
+		modelID := strings.TrimSpace(model.ID)
+		modelLabel := strings.TrimSpace(model.DisplayName)
+		if modelLabel == "" {
+			modelLabel = modelID
+		}
+		if modelID == "" && modelLabel == "" {
+			continue
+		}
 		parts := make([]string, 0, 3)
-		if strings.TrimSpace(providerCfg.Model) == strings.TrimSpace(model.ID) {
+		if strings.TrimSpace(providerCfg.Model) == modelID {
 			parts = append(parts, "configured")
 			if isCurrentProvider {
 				parts = append(parts, "current")
@@ -266,10 +274,10 @@ func (a App) providerModelItems(provider config.ProviderMeta) []paletteItem {
 			parts = append(parts, capability)
 		}
 		items = append(items, paletteItem{
-			Label:    model.DisplayName,
+			Label:    modelLabel,
 			Desc:     strings.Join(parts, " • "),
 			Action:   paletteActionSelectModel,
-			Value:    model.ID,
+			Value:    modelID,
 			Provider: providerID,
 		})
 	}

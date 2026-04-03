@@ -314,14 +314,7 @@ func (m *HistoryModel) ensureVisible() {
 func (m HistoryModel) renderRow(cmd db.Command, selected bool) string {
 	w := m.width - 2 // padding
 
-	// Build the command text — ensure single line (no newlines, no empty)
-	cmdText := strings.TrimSpace(cmd.Command)
-	if cmdText == "" {
-		cmdText = "(empty)"
-	}
-	// Replace any newlines with spaces to keep on one line
-	cmdText = strings.ReplaceAll(cmdText, "\n", " ")
-	cmdText = strings.ReplaceAll(cmdText, "\r", "")
+	cmdText := normalizeHistoryCommandText(cmd.Command)
 
 	// Citation marker
 	citeMarker := ""
@@ -395,4 +388,23 @@ func (m HistoryModel) renderRow(cmd db.Command, selected bool) string {
 		return selectedRowStyle.Width(w).Render(line)
 	}
 	return normalRowStyle.Width(w).Render(line)
+}
+
+func normalizeHistoryCommandText(command string) string {
+	command = strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n', '\t':
+			return ' '
+		default:
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}
+	}, command)
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "(empty)"
+	}
+	return command
 }

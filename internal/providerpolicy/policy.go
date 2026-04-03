@@ -222,6 +222,14 @@ func InferThinkingMetadata(provider, modelID string) (ThinkingSupport, []string)
 		if isAnthropicThinkingModel(id) {
 			return ThinkingSupportSupported, []string{"low", "medium", "high"}
 		}
+	case ProviderDeepSeek:
+		if isDeepSeekReasonerModel(id) {
+			return ThinkingSupportSupported, []string{"medium"}
+		}
+	case ProviderOllama:
+		if isOllamaThinkingModel(modelID) {
+			return ThinkingSupportSupported, []string{"low", "medium", "high"}
+		}
 	}
 
 	return ThinkingSupportUnknown, nil
@@ -285,4 +293,30 @@ func isAnthropicThinkingModel(id string) bool {
 		strings.Contains(id, "claude-4") ||
 		strings.Contains(id, "sonnet-4") ||
 		strings.Contains(id, "opus-4")
+}
+
+func isDeepSeekReasonerModel(id string) bool {
+	return strings.HasPrefix(id, "deepseek-reasoner")
+}
+
+func isOllamaThinkingModel(modelID string) bool {
+	id := normalizeOllamaFamilyID(modelID)
+	return strings.HasPrefix(id, "deepseek-r1") ||
+		strings.HasPrefix(id, "gpt-oss") ||
+		strings.HasPrefix(id, "qwen3") ||
+		strings.HasPrefix(id, "qwq")
+}
+
+func normalizeOllamaFamilyID(modelID string) string {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if id == "" {
+		return ""
+	}
+	if slash := strings.LastIndexByte(id, '/'); slash >= 0 {
+		id = strings.TrimSpace(id[slash+1:])
+	}
+	if colon := strings.IndexByte(id, ':'); colon >= 0 {
+		id = strings.TrimSpace(id[:colon])
+	}
+	return id
 }

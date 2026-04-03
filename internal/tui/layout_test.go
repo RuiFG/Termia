@@ -223,6 +223,44 @@ func TestApprovalResponseDoesNotSetStatusMessage(t *testing.T) {
 	}
 }
 
+func TestStatusMessageExpiresAndIgnoresStaleTimeout(t *testing.T) {
+	app := New(nil, config.DefaultConfig(), nil)
+
+	cmd := app.setTransientStatus("Thinking level set to High.")
+	if cmd == nil {
+		t.Fatalf("expected transient status timeout command")
+	}
+	if app.statusMsg == "" {
+		t.Fatalf("expected status message to be set")
+	}
+
+	msg, ok := cmd().(statusMsgExpiredMsg)
+	if !ok {
+		t.Fatalf("expected statusMsgExpiredMsg, got %T", cmd())
+	}
+
+	newCmd := app.setTransientStatus("Model switched to gpt-5 (OpenAI).")
+	if newCmd == nil {
+		t.Fatalf("expected newer transient status timeout command")
+	}
+
+	model, _ := app.Update(msg)
+	updated := model.(App)
+	if updated.statusMsg == "" {
+		t.Fatalf("expected stale timeout not to clear newer status")
+	}
+
+	freshMsg, ok := newCmd().(statusMsgExpiredMsg)
+	if !ok {
+		t.Fatalf("expected statusMsgExpiredMsg, got %T", newCmd())
+	}
+	model, _ = updated.Update(freshMsg)
+	updated = model.(App)
+	if updated.statusMsg != "" {
+		t.Fatalf("expected current timeout to clear status, got %q", updated.statusMsg)
+	}
+}
+
 func TestApprovalLayoutKeepsActionsVisibleWhenCommandOverflows(t *testing.T) {
 	app := New(nil, config.DefaultConfig(), nil)
 	app.width = 60

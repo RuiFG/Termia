@@ -212,7 +212,18 @@ func (s providerService) CurrentModelDescriptor(providerModels map[string][]llm.
 			return model, true
 		}
 	}
-	return llm.ModelDescriptor{}, false
+	levels := llm.ThinkingLevelsForModel(s.cfg.LLM.ProviderKind(provider), modelID)
+	support := llm.ThinkingSupportUnknown
+	if len(levels) > 0 {
+		support = llm.ThinkingSupportSupported
+	}
+	return llm.ModelDescriptor{
+		ID:              modelID,
+		DisplayName:     modelID,
+		Provider:        s.cfg.LLM.ProviderKind(provider),
+		ThinkingSupport: support,
+		ThinkingLevels:  levels,
+	}, true
 }
 
 func (s providerService) CurrentConfiguredThinkingLevel() string {

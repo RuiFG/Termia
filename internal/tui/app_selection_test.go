@@ -412,6 +412,9 @@ func TestSessionsLoadedCreatesNewSessionWhenRequestedByEnv(t *testing.T) {
 	}
 	created, ok := msgs[0].(sessionCreatedMsg)
 	if !ok {
+		if failure, isError := msgs[0].(sessionsErrorMsg); isError {
+			t.Fatalf("expected sessionCreatedMsg, got sessionsErrorMsg err=%v", failure.err)
+		}
 		t.Fatalf("expected sessionCreatedMsg, got %#v", msgs[0])
 	}
 	model, _ = updated.Update(created)

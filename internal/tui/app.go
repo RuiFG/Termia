@@ -37,7 +37,10 @@ const (
 	FocusInput
 )
 
-const mouseMotionThrottle = 20 * time.Millisecond
+const (
+	mouseMotionThrottle = 20 * time.Millisecond
+	statusMessageTTL    = 3 * time.Second
+)
 
 // MiddleMode determines what the middle panel displays.
 type MiddleMode int
@@ -181,6 +184,7 @@ type App struct {
 	firstUpdate      *bool
 	firstView        *bool
 	statusMsg        string
+	statusMsgToken   uint64
 	contentSelection textSelection
 	inputSelection   textSelection
 	lastMouseMotion  time.Time
@@ -329,6 +333,10 @@ type providerModelsErrorMsg struct {
 	err      error
 }
 
+type statusMsgExpiredMsg struct {
+	token uint64
+}
+
 func newDirPromptInput() textinput.Model {
 	input := textinput.New()
 	input.Placeholder = ""
@@ -411,7 +419,7 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		saveConfigFn: func(cfg *config.Config) error {
 			return config.Save(cfg, config.ConfigPath())
 		},
-		listModelsFn: llm.ListModels,
+		listModelsFn: llm.ListCachedModels,
 	}
 	app.providerSvc = newProviderService(cfg, app.saveConfigFn)
 	app.updateInputPrompt()
@@ -486,8 +494,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.logger != nil {
 			a.logger.Warn("failed to load sessions", zap.Error(msg.err))
 		}
-		a.statusMsg = fmt.Sprintf("Error: %v", msg.err)
-		return a, nil
+		return a, a.setTransientStatus(fmt.Sprintf("Error: %v", msg.err))
 
 	case sessionCreatedMsg:
 		a.sessions = append([]db.AgentSession{msg.session}, a.sessions...)
@@ -542,23 +549,20 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.logger != nil {
 			a.logger.Warn("failed to load session messages", zap.Error(msg.err))
 		}
-		a.statusMsg = fmt.Sprintf("Error: %v", msg.err)
-		return a, nil
+		return a, a.setTransientStatus(fmt.Sprintf("Error: %v", msg.err))
 
 	case commandsErrorMsg:
 		if a.logger != nil {
 			a.logger.Warn("failed to load commands", zap.Error(msg.err))
 		}
-		a.statusMsg = fmt.Sprintf("Error: %v", msg.err)
-		return a, nil
+		return a, a.setTransientStatus(fmt.Sprintf("Error: %v", msg.err))
 
 	case commandExecutedMsg:
 		return a, tea.Batch(loadCommandsCmd(a.db), waitForCommandExecutedCmd())
 
 	case commandDeletedMsg:
 		a.history.RemoveCommand(msg.id)
-		a.statusMsg = "Command deleted"
-		return a, nil
+		return a, a.setTransientStatus("Command deleted")
 
 	case outputLoadedMsg:
 		if a.modal.IsOpen() && a.modal.CommandID() == msg.commandID {
@@ -588,6 +592,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case providerModelsErrorMsg:
 		a.providerModelLoading[msg.provider] = false
 		a.providerModelErrors[msg.provider] = msg.err.Error()
+		return a, nil
+
+	case statusMsgExpiredMsg:
+		if msg.token == a.statusMsgToken {
+			a.statusMsg = ""
+		}
 		return a, nil
 
 	case SlashCommandResult:
@@ -786,8 +796,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		if key.Matches(msg, a.keys.Variants) {
-			a.cycleThinkLevel()
-			return a, nil
+			return a, a.cycleThinkLevel()
 		}
 
 		// Tab switching (Focus Cycle)
@@ -881,8 +890,9 @@ func (a App) handleChordKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case 'a':
 		a.agentMode = AgentModeAgent
 		a.middleMode = ModeAgent
-		a.statusMsg = "Mode set to Assistant."
 		a.updateActiveSessionRuntimeBestEffort()
+		a.chordPending = false
+		return a, a.setTransientStatus("Mode set to Assistant.")
 	case 't':
 		a.openPaletteStage(paletteStageTeams)
 	case 'c':
@@ -1164,15 +1174,13 @@ func (a App) handleApprovalResponse(response agent.HITLResponse) (tea.Model, tea
 			if a.logger != nil {
 				a.logger.Warn("failed to encode hitl approval response", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to encode approval response"
-			return a, nil
+			return a, a.setTransientStatus("Error: failed to encode approval response")
 		}
 		if err := a.db.ResolvePendingPromptWithResponse(promptID, string(payload)); err != nil {
 			if a.logger != nil {
 				a.logger.Warn("failed to resolve hitl approval prompt", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to resolve approval prompt"
-			return a, nil
+			return a, a.setTransientStatus("Error: failed to resolve approval prompt")
 		}
 		_ = a.updatePendingPromptCount()
 	}
@@ -1201,15 +1209,13 @@ func (a App) handleAskResponse(response agent.HITLResponse) (tea.Model, tea.Cmd)
 			if a.logger != nil {
 				a.logger.Warn("failed to encode hitl input response", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to encode input response"
-			return a, nil
+			return a, a.setTransientStatus("Error: failed to encode input response")
 		}
 		if err := a.db.ResolvePendingPromptWithResponse(promptID, string(payload)); err != nil {
 			if a.logger != nil {
 				a.logger.Warn("failed to resolve input prompt", zap.Error(err))
 			}
-			a.statusMsg = "Error: failed to resolve input prompt"
-			return a, nil
+			return a, a.setTransientStatus("Error: failed to resolve input prompt")
 		}
 		_ = a.updatePendingPromptCount()
 	}
@@ -1304,7 +1310,7 @@ func (a *App) activatePendingPrompt() {
 }
 
 func (a *App) handleInvalidPendingPrompt(prompt db.PendingPrompt, message string) {
-	a.statusMsg = message
+	a.setStatusMsg(message)
 	if a.db != nil && prompt.PromptID != "" {
 		if err := a.db.ResolvePendingPromptWithResponse(prompt.PromptID, ""); err != nil {
 			if a.logger != nil {
@@ -1322,6 +1328,22 @@ func (a *App) handleInvalidPendingPrompt(prompt db.PendingPrompt, message string
 		a.pendingPromptID = ""
 		a.pendingPromptSessionID = ""
 	}
+}
+
+func (a *App) setStatusMsg(message string) {
+	a.statusMsgToken++
+	a.statusMsg = strings.TrimSpace(message)
+}
+
+func (a *App) setTransientStatus(message string) tea.Cmd {
+	a.setStatusMsg(message)
+	if a.statusMsg == "" {
+		return nil
+	}
+	token := a.statusMsgToken
+	return tea.Tick(statusMessageTTL, func(time.Time) tea.Msg {
+		return statusMsgExpiredMsg{token: token}
+	})
 }
 
 func (a *App) dequeuePendingPrompt(sessionID string, promptID string) {
@@ -2247,7 +2269,7 @@ func (a App) handleAgentEsc() (tea.Model, tea.Cmd) {
 	now := time.Now()
 	if !a.agentLastEsc.IsZero() && now.Sub(a.agentLastEsc) <= time.Second {
 		a.agentCancel()
-		a.statusMsg = "Stopping agent..."
+		a.setStatusMsg("Stopping agent...")
 		a.agentLastEsc = time.Time{}
 		return a, nil
 	}
@@ -2516,10 +2538,9 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 	case paletteActionSelectAgent:
 		if item.Value == "assistant" {
 			a.agentMode = AgentModeAgent
-			a.statusMsg = "Mode set to Assistant."
 			a.updateActiveSessionRuntimeBestEffort()
 			a.closePalette()
-			return a, nil
+			return a, a.setTransientStatus("Mode set to Assistant.")
 		}
 		if strings.TrimSpace(item.Value) == "" {
 			a.closePalette()
@@ -2529,8 +2550,9 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		if ok {
 			a.agentMode = AgentModeTeam
 			a.activeTeamName = team.Name
-			a.statusMsg = fmt.Sprintf("Mode set to %s.", team.Name)
 			a.updateActiveSessionRuntimeBestEffort()
+			a.closePalette()
+			return a, a.setTransientStatus(fmt.Sprintf("Mode set to %s.", team.Name))
 		}
 		a.closePalette()
 		return a, nil
@@ -2763,11 +2785,10 @@ func (a App) handleInputSelection(msg tea.MouseMsg, contentX, contentY int) (boo
 	return true, nil
 }
 
-func (a *App) cycleThinkLevel() {
+func (a *App) cycleThinkLevel() tea.Cmd {
 	levels := a.currentThinkingLevels()
 	if len(levels) == 0 {
-		a.statusMsg = "Current model does not advertise thinking levels."
-		return
+		return a.setTransientStatus("Current model does not advertise thinking levels.")
 	}
 
 	currentIndex := 0
@@ -2779,9 +2800,9 @@ func (a *App) cycleThinkLevel() {
 	}
 	a.thinkLevel = levels[(currentIndex+1)%len(levels)]
 	if !a.persistCurrentThinkLevel() {
-		return
+		return nil
 	}
-	a.statusMsg = fmt.Sprintf("Thinking level set to %s.", a.thinkLevelLabel())
+	return a.setTransientStatus(fmt.Sprintf("Thinking level set to %s.", a.thinkLevelLabel()))
 }
 
 func (a App) renderCommandPalette(totalWidth int, totalHeight int) string {
@@ -4005,7 +4026,7 @@ func (a *App) applySessionCwd(sessionID string) {
 		return
 	}
 	if err := os.Chdir(stored); err != nil {
-		a.statusMsg = fmt.Sprintf("Failed to switch directory: %v", err)
+		a.setStatusMsg(fmt.Sprintf("Failed to switch directory: %v", err))
 		return
 	}
 	a.setCwd(stored)
@@ -4086,21 +4107,21 @@ func (a *App) syncCwdToShell(cwd string) {
 	cdFile := strings.TrimSpace(os.Getenv("TERMIA_CD_FILE"))
 	if cdFile == "" {
 		if !a.cwdSyncWarned {
-			a.statusMsg = "Shell sync inactive (run 'termia init')."
+			a.setStatusMsg("Shell sync inactive (run 'termia init').")
 			a.cwdSyncWarned = true
 		}
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(cdFile), 0o700); err != nil {
 		if !a.cwdSyncWarned {
-			a.statusMsg = "Shell sync failed; using TUI-only CWD."
+			a.setStatusMsg("Shell sync failed; using TUI-only CWD.")
 			a.cwdSyncWarned = true
 		}
 		return
 	}
 	if err := os.WriteFile(cdFile, []byte(cwd), 0o600); err != nil {
 		if !a.cwdSyncWarned {
-			a.statusMsg = "Shell sync failed; using TUI-only CWD."
+			a.setStatusMsg("Shell sync failed; using TUI-only CWD.")
 			a.cwdSyncWarned = true
 		}
 		return

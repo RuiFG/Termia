@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	modelsDevAPIURL   = "https://models.dev/api.json"
-	modelsDevCacheTTL = 24 * time.Hour
+	modelsDevAPIURL            = "https://models.dev/api.json"
+	modelsDevCacheRefreshAfter = 48 * time.Hour
+	modelsDevCacheTTL          = 72 * time.Hour
 )
 
 var (
@@ -53,10 +54,24 @@ func listModelsFromModelsDev(ctx context.Context, meta config.ProviderMeta) ([]M
 	if err != nil {
 		return nil, err
 	}
+	return listModelsFromModelsDevCatalog(meta, catalog), nil
+}
 
+func listCachedModelsFromModelsDev(meta config.ProviderMeta) ([]ModelDescriptor, error) {
+	catalog, err := readModelsDevCatalogCache(false)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return listModelsFromModelsDevCatalog(meta, catalog), nil
+}
+
+func listModelsFromModelsDevCatalog(meta config.ProviderMeta, catalog modelsDevCatalog) []ModelDescriptor {
 	providerIDs := modelsDevProviderIDsForMeta(meta, catalog)
 	if len(providerIDs) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	models := make([]ModelDescriptor, 0, 64)
@@ -94,7 +109,7 @@ func listModelsFromModelsDev(ctx context.Context, meta config.ProviderMeta) ([]M
 	}
 
 	sortDescriptors(models)
-	return models, nil
+	return models
 }
 
 func shouldSkipModelsDevModel(meta config.ProviderMeta, providerID, modelID string) bool {
@@ -130,6 +145,31 @@ func loadModelsDevCatalog(ctx context.Context) (modelsDevCatalog, error) {
 		return cached, nil
 	}
 	return nil, err
+}
+
+func StartModelsCatalogRefresh() {
+	if !modelsDevCatalogCacheShouldRefresh() {
+		return
+	}
+
+	go func() {
+		_, raw, err := fetchModelsDevCatalog(context.Background())
+		if err != nil {
+			return
+		}
+		_ = writeModelsDevCatalogCache(raw)
+	}()
+}
+
+func modelsDevCatalogCacheShouldRefresh() bool {
+	info, err := os.Stat(modelsDevCachePath())
+	if err != nil {
+		return true
+	}
+	if modelsDevCacheRefreshAfter <= 0 {
+		return true
+	}
+	return modelsDevNow().Sub(info.ModTime()) > modelsDevCacheRefreshAfter
 }
 
 func readModelsDevCatalogCache(requireFresh bool) (modelsDevCatalog, error) {

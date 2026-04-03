@@ -164,19 +164,19 @@ func renderModelsText(cfg *config.LLMConfig) string {
 
 	for _, provider := range cfg.ModelProviders() {
 		providerCfg := provider.Config
-		model := providerCfg.Model
+		model := strings.TrimSpace(providerCfg.Model)
 		if model == "" {
 			model = "(not set)"
 		}
 		keyState := "(not set)"
-		if providerCfg.ResolvedAPIKey() != "" {
+		if strings.TrimSpace(providerCfg.ResolvedAPIKey()) != "" {
 			keyState = "configured"
 		}
 		b.WriteString(fmt.Sprintf("  %s:\n", provider.DisplayName))
 		b.WriteString(fmt.Sprintf("    Model:   %s\n", model))
 		b.WriteString(fmt.Sprintf("    API Key: %s\n", keyState))
-		if providerCfg.BaseURL != "" {
-			b.WriteString(fmt.Sprintf("    URL:     %s\n", providerCfg.BaseURL))
+		if baseURL := strings.TrimSpace(providerCfg.BaseURL); baseURL != "" {
+			b.WriteString(fmt.Sprintf("    URL:     %s\n", baseURL))
 		}
 		b.WriteString("\n")
 	}

@@ -32,7 +32,6 @@ func (a *App) beginProviderModelsLoad(provider string) tea.Cmd {
 	if !ok {
 		return nil
 	}
-	a.providerModelLoading[meta.ID] = true
 	delete(a.providerModelErrors, meta.ID)
 	return loadProviderModelsCmd(a.listModelsFn, meta)
 }
@@ -356,8 +355,7 @@ func (a App) submitProviderConfigPrompt() (tea.Model, tea.Cmd) {
 	delete(a.providerModelLoading, provider)
 	a.closeProviderConfigPrompt()
 	a.openProviderPalette(provider)
-	a.statusMsg = fmt.Sprintf("%s updated.", a.providerFieldTitle(provider, field))
-	return a, nil
+	return a, a.setTransientStatus(fmt.Sprintf("%s updated.", a.providerFieldTitle(provider, field)))
 }
 
 func (a App) renderProviderConfigPrompt(totalWidth int) string {
@@ -525,8 +523,7 @@ func (a App) submitCustomProviderPrompt() (tea.Model, tea.Cmd) {
 
 	a.closeCustomProviderPrompt()
 	a.openProviderPalette(custom.ID)
-	a.statusMsg = fmt.Sprintf("%s created.", strings.TrimSpace(custom.Name))
-	return a, nil
+	return a, a.setTransientStatus(fmt.Sprintf("%s created.", strings.TrimSpace(custom.Name)))
 }
 
 func (a App) renderCustomProviderPrompt(totalWidth int) string {
@@ -621,43 +618,37 @@ func maskSecret(value string) string {
 func (a App) clearProviderField(provider string, field llm.ProviderConfigField) (tea.Model, tea.Cmd) {
 	provider = providerpolicy.NormalizeProviderName(provider)
 	if err := a.providerSvc.ClearProviderField(provider, field); err != nil {
-		a.statusMsg = providerActionError(err)
-		return a, nil
+		return a, a.setTransientStatus(providerActionError(err))
 	}
 	delete(a.providerModels, provider)
 	delete(a.providerModelErrors, provider)
 	delete(a.providerModelLoading, provider)
-	a.statusMsg = fmt.Sprintf("%s cleared.", a.providerFieldTitle(provider, field))
-	return a, nil
+	return a, a.setTransientStatus(fmt.Sprintf("%s cleared.", a.providerFieldTitle(provider, field)))
 }
 
 func (a App) deleteCustomProvider(provider string) (tea.Model, tea.Cmd) {
 	provider = providerpolicy.NormalizeProviderName(provider)
 	meta, err := a.providerSvc.DeleteCustomProvider(provider)
 	if err != nil {
-		a.statusMsg = providerActionError(err)
-		return a, nil
+		return a, a.setTransientStatus(providerActionError(err))
 	}
 	delete(a.providerModels, provider)
 	delete(a.providerModelErrors, provider)
 	delete(a.providerModelLoading, provider)
 	a.syncThinkLevelForCurrentModel()
 	a.openPaletteStage(paletteStageProviders)
-	a.statusMsg = fmt.Sprintf("%s deleted.", meta.DisplayName)
-	return a, nil
+	return a, a.setTransientStatus(fmt.Sprintf("%s deleted.", meta.DisplayName))
 }
 
 func (a App) selectProviderModel(provider string, modelID string) (tea.Model, tea.Cmd) {
 	provider = providerpolicy.NormalizeProviderName(provider)
 	if err := a.providerSvc.SelectModel(provider, modelID); err != nil {
-		a.statusMsg = providerActionError(err)
-		return a, nil
+		return a, a.setTransientStatus(providerActionError(err))
 	}
 
 	a.syncThinkLevelForCurrentModel()
-	a.statusMsg = fmt.Sprintf("Model switched to %s (%s).", modelID, a.providerSvc.ProviderDisplayName(provider))
 	a.closePalette()
-	return a, nil
+	return a, a.setTransientStatus(fmt.Sprintf("Model switched to %s (%s).", strings.TrimSpace(modelID), a.providerSvc.ProviderDisplayName(provider)))
 }
 
 func (a App) currentModelDescriptor() (llm.ModelDescriptor, bool) {
@@ -716,7 +707,7 @@ func (a App) currentConfiguredThinkLevel() (ThinkLevel, bool) {
 
 func (a *App) persistCurrentThinkLevel() bool {
 	if err := a.providerSvc.PersistCurrentThinkingLevel(thinkLevelConfigValue(a.thinkLevel)); err != nil {
-		a.statusMsg = providerActionError(err)
+		a.setStatusMsg(providerActionError(err))
 		return false
 	}
 	return true

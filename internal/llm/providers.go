@@ -88,6 +88,18 @@ func ListModels(ctx context.Context, meta config.ProviderMeta) ([]ModelDescripto
 	return listModelsFromModelsDev(ctx, meta)
 }
 
+func ListCachedModels(ctx context.Context, meta config.ProviderMeta) ([]ModelDescriptor, error) {
+	_ = ctx
+	provider := providerpolicy.NormalizeProviderName(meta.Kind)
+	if provider == "" {
+		return nil, fmt.Errorf("provider is empty")
+	}
+	if err := ValidateModelCatalogConfig(meta); err != nil {
+		return nil, err
+	}
+	return listCachedModelsFromModelsDev(meta)
+}
+
 func ValidateModelCatalogConfig(meta config.ProviderMeta) error {
 	provider := providerpolicy.NormalizeProviderName(meta.Kind)
 	if provider == "" {

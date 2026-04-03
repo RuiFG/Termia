@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -300,5 +301,113 @@ func TestListModelsKeepsCodexForNativeOpenAI(t *testing.T) {
 	}
 	if len(models) != 2 || models[0].ID != "gpt-5.1" || models[1].ID != "gpt-5.1-codex" {
 		t.Fatalf("expected codex to remain available for native openai, got %#v", models)
+	}
+}
+
+func TestStartModelsCatalogRefreshSkipsFreshCacheYoungerThan48Hours(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "models.dev-api.json")
+	if err := os.WriteFile(cachePath, []byte(`{"openai":{"id":"openai","name":"OpenAI","models":{}}}`), 0o644); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	modTime := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(cachePath, modTime, modTime); err != nil {
+		t.Fatalf("chtimes cache: %v", err)
+	}
+
+	oldCachePath := modelsDevCachePath
+	oldNow := modelsDevNow
+	oldClient := modelsDevHTTPClient
+	t.Cleanup(func() {
+		modelsDevCachePath = oldCachePath
+		modelsDevNow = oldNow
+		modelsDevHTTPClient = oldClient
+	})
+
+	modelsDevCachePath = func() string { return cachePath }
+	modelsDevNow = func() time.Time { return modTime.Add(47 * time.Hour) }
+	calls := 0
+	modelsDevHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("network should not be used for a fresh cache")
+	})}
+
+	StartModelsCatalogRefresh()
+
+	if calls != 0 {
+		t.Fatalf("expected no refresh request for cache younger than 48h, got %d", calls)
+	}
+}
+
+func TestStartModelsCatalogRefreshRefreshesCacheOlderThan48Hours(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "models.dev-api.json")
+	if err := os.WriteFile(cachePath, []byte(`{"openai":{"id":"openai","name":"OpenAI","models":{}}}`), 0o644); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	modTime := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(cachePath, modTime, modTime); err != nil {
+		t.Fatalf("chtimes cache: %v", err)
+	}
+
+	oldCachePath := modelsDevCachePath
+	oldNow := modelsDevNow
+	oldClient := modelsDevHTTPClient
+	t.Cleanup(func() {
+		modelsDevCachePath = oldCachePath
+		modelsDevNow = oldNow
+		modelsDevHTTPClient = oldClient
+	})
+
+	modelsDevCachePath = func() string { return cachePath }
+	modelsDevNow = func() time.Time { return modTime.Add(49 * time.Hour) }
+	var mu sync.Mutex
+	calls := 0
+	modelsDevHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: io.NopCloser(strings.NewReader(`{
+				"openai": {
+					"id": "openai",
+					"name": "OpenAI",
+					"api": "https://api.openai.com/v1",
+					"models": {
+						"gpt-5": {
+							"id": "gpt-5",
+							"name": "GPT-5",
+							"reasoning": true,
+							"tool_call": true,
+							"temperature": false
+						}
+					}
+				}
+			}`)),
+			Header: make(http.Header),
+		}, nil
+	})}
+
+	StartModelsCatalogRefresh()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		gotCalls := calls
+		mu.Unlock()
+		if gotCalls > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected background refresh request")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	if !strings.Contains(string(data), `"gpt-5"`) {
+		t.Fatalf("expected refreshed cache to be written, got %s", string(data))
 	}
 }

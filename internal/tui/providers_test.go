@@ -97,6 +97,35 @@ func TestCurrentThinkingLevelsFollowProviderMetadata(t *testing.T) {
 	}
 }
 
+func TestCycleThinkLevelFallsBackToCurrentConfiguredModelMetadata(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LLM.DefaultProvider = config.ProviderOpenAI
+	cfg.LLM.OpenAI.Model = "gpt-5"
+	cfg.LLM.OpenAI.ThinkingLevel = "medium"
+	app := New(nil, cfg, nil)
+
+	app.cycleThinkLevel()
+
+	if app.statusMsg == "Current model does not advertise thinking levels." {
+		t.Fatalf("expected current model fallback metadata to avoid no-thinking warning")
+	}
+	if app.thinkLevel != ThinkHigh {
+		t.Fatalf("expected thinking level to advance to high, got %v", app.thinkLevel)
+	}
+}
+
+func TestBeginModelsPaletteLoadDoesNotSetProviderLoadingState(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LLM.OpenAI.APIKey = "sk-openai"
+	app := New(nil, cfg, nil)
+
+	_ = app.beginModelsPaletteLoad()
+
+	if app.providerModelLoading[config.ProviderOpenAI] {
+		t.Fatalf("expected model palette load not to set per-provider loading state")
+	}
+}
+
 func sectionItemsByLabel(sections []paletteSection, label string) []paletteItem {
 	for _, section := range sections {
 		if section.Label == label {

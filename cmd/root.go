@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/diagnostics"
+	"github.com/termia/termia/internal/llm"
 	"go.uber.org/zap"
 )
 
@@ -18,6 +19,10 @@ var (
 	logger  *zap.Logger
 	verbose bool
 )
+
+var startModelsCatalogRefresh = func() {
+	llm.StartModelsCatalogRefresh()
+}
 
 // rootCmd is initialized at package level so all init() functions across
 // cmd/*.go files can safely call rootCmd.AddCommand() regardless of init order.
@@ -85,6 +90,8 @@ func prepare() error {
 	}(); err != nil {
 		return err
 	}
+
+	startModelsCatalogRefresh()
 
 	return nil
 }

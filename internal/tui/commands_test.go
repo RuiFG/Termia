@@ -2,9 +2,11 @@ package tui
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"go.uber.org/zap"
 )
@@ -64,5 +66,24 @@ func TestLoadCommandsCmdSkipsTermiaBinaryLaunchCommands(t *testing.T) {
 	}
 	if loaded.commands[0].ID != "user" || loaded.commands[1].ID != "same-name" {
 		t.Fatalf("expected only the active Termia launcher command to be hidden, got %#v", loaded.commands)
+	}
+}
+
+func TestRenderModelsTextTrimsModelAndBaseURL(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.LLM.DefaultProvider = config.ProviderOpenAI
+	cfg.LLM.OpenAI.Model = "gpt-5\r\n"
+	cfg.LLM.OpenAI.BaseURL = "https://api.openai.com/v1\r\n"
+
+	got := renderModelsText(&cfg.LLM)
+
+	if strings.Contains(got, "\r") {
+		t.Fatalf("expected CR characters to be trimmed, got %q", got)
+	}
+	if !strings.Contains(got, "Model:   gpt-5\n") {
+		t.Fatalf("expected trimmed model, got %q", got)
+	}
+	if !strings.Contains(got, "URL:     https://api.openai.com/v1\n") {
+		t.Fatalf("expected trimmed base URL, got %q", got)
 	}
 }

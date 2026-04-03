@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -12,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/agent"
+	"github.com/termia/termia/internal/agentapp"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"github.com/termia/termia/internal/sessionstate"
@@ -23,11 +25,27 @@ import (
 var (
 	taiCmd          *cobra.Command
 	taiCommandCount int
-	taiNewSession   bool
 	taiAll          bool
 	taiHistoryMode  string
-	taiMode         string
 )
+
+type taiAgentAppService interface {
+	Run(context.Context, agentapp.RunRequest) (<-chan agent.RuntimeEvent, error)
+}
+
+var openTaiDB = func() (*db.DB, error) {
+	runLogger := logger
+	if runLogger == nil {
+		runLogger = zap.NewNop()
+	}
+	return db.Open(config.DBPath(), runLogger)
+}
+
+var newTaiAgentAppService = func(cfg *config.Config, database *db.DB) taiAgentAppService {
+	return agentapp.NewService(cfg, database, func(cfg *config.Config, database *db.DB, responder agent.HITLResponder) agentapp.Runtime {
+		return agent.NewRuntime(cfg, database, responder)
+	})
+}
 
 func init() {
 	if os.Getenv("TERMIA_WRAPPED") != "1" {
@@ -43,13 +61,6 @@ func init() {
 	}
 
 	// Add flags to tai command
-	taiCmd.Flags().BoolVarP(
-		&taiNewSession,
-		"new",
-		"n",
-		false,
-		"start a new session",
-	)
 	taiCmd.Flags().IntVarP(
 		&taiCommandCount,
 		"cmd",
@@ -69,13 +80,6 @@ func init() {
 		"H",
 		"cmd",
 		"history mode: cmd|ai|all",
-	)
-	taiCmd.Flags().StringVarP(
-		&taiMode,
-		"mode",
-		"m",
-		"assistant",
-		"assistant or a configured team name",
 	)
 
 	rootCmd.AddCommand(taiCmd)
@@ -98,7 +102,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 	_ = os.Setenv("TERMIA_APPROVAL_MODE", "prompt")
 
 	// Open database
-	database, err := db.Open(config.DBPath(), logger)
+	database, err := openTaiDB()
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -110,35 +114,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	cwd := workingDirectory()
-	sessionRecord, runtimeMode, runtimeTeam, err := resolveTaiSession(cmd, database, cwd)
-	if err != nil {
-		return err
-	}
-	runCwd := cwd
-	if runCwd == "" {
-		runCwd = strings.TrimSpace(sessionRecord.Cwd)
-	}
-	if err := sessionstate.SetCurrentID(sessionRecord.ID); err != nil {
-		logger.Warn("failed to persist current tai session", zap.Error(err))
-	}
-	conversationMessages, err := taiConversationMessages(database, sessionRecord.ID)
-	if err != nil {
-		return fmt.Errorf("failed to load session messages: %w", err)
-	}
-	metadataJSON, err := taiEncodeSelectedCommandMetadata(selectedCommands)
-	if err != nil {
-		return fmt.Errorf("failed to encode cited commands: %w", err)
-	}
-	if err := database.CreateAgentMessage(&db.AgentMessage{
-		ID:           generateID(),
-		SessionID:    sessionRecord.ID,
-		Role:         "user",
-		Content:      userQuery,
-		MetadataJSON: metadataJSON,
-		CreatedAt:    time.Now().UnixNano(),
-	}); err != nil {
-		return fmt.Errorf("failed to store user message: %w", err)
-	}
+	sessionID := strings.TrimSpace(sessionstate.CurrentID())
 
 	// Create context with signal cancellation
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -149,16 +125,14 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		streamReader = agent.NewStreamReader(os.Stdin)
 	}
 
-	runtime := agent.NewRuntime(cfg, database, agent.NewCLIResponder())
-	stream, err := runtime.Run(ctx, agent.RunRequest{
-		Mode:             runtimeMode,
-		TeamName:         runtimeTeam,
-		SessionID:        sessionRecord.ID,
+	appService := newTaiAgentAppService(cfg, database)
+	stream, err := appService.Run(ctx, agentapp.RunRequest{
+		SessionID:        sessionID,
 		Query:            userQuery,
-		Cwd:              runCwd,
+		Cwd:              cwd,
 		SelectedCommands: taiAgentCommandsFromDBCommands(selectedCommands),
-		Messages:         conversationMessages,
 		StreamReader:     streamReader,
+		Responder:        agent.NewCLIResponder(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to run analysis: %w", err)
@@ -166,51 +140,36 @@ func taiRun(cmd *cobra.Command, args []string) error {
 
 	// Read from stream and print chunks
 	var fullResponse strings.Builder
-	timelineMessages := make([]taiTimelineMessage, 0, 16)
+	var streamErrorText string
 	renderer := newTaiRenderer()
-	currentCwd := strings.TrimSpace(sessionRecord.Cwd)
-	if runCwd != "" {
-		currentCwd = runCwd
-	}
 	for chunk := range stream {
 		switch chunk.Kind {
 		case agent.RuntimeEventText:
 			renderer.WriteAssistant(chunk.Text, &fullResponse)
-			timelineMessages = taiAppendTimelineText(timelineMessages, "assistant", chunk.Text, true)
 		case agent.RuntimeEventReasoning:
 			renderer.WriteReasoning(chunk.Text)
-			timelineMessages = taiAppendTimelineText(timelineMessages, "reasoning", chunk.Text, true)
 		case agent.RuntimeEventToolCall:
 			if chunk.ToolCall == nil {
 				continue
 			}
 			renderer.WriteTool(*chunk.ToolCall)
-			timelineMessages = taiUpsertTimelineToolCall(timelineMessages, *chunk.ToolCall)
 		case agent.RuntimeEventToolResult:
 			if chunk.ToolCall == nil {
 				continue
 			}
 			renderer.WriteTool(*chunk.ToolCall)
-			timelineMessages = taiUpsertTimelineToolCall(timelineMessages, *chunk.ToolCall)
-		case agent.RuntimeEventCwd:
-			nextCwd := strings.TrimSpace(chunk.Cwd)
-			if nextCwd != "" {
-				currentCwd = nextCwd
-			}
 		case agent.RuntimeEventError:
+			if streamErrorText == "" {
+				if text := strings.TrimSpace(chunk.Text); text != "" {
+					streamErrorText = text
+				}
+			}
 			renderer.WriteError(chunk.Text)
-			timelineMessages = taiMarkLatestPendingToolFailed(timelineMessages, chunk.Text)
-			timelineMessages = taiAppendTimelineText(timelineMessages, "error", chunk.Text, false)
 		}
 	}
 	renderer.Finish()
-	if currentCwd != "" && currentCwd != strings.TrimSpace(sessionRecord.Cwd) {
-		if err := database.UpdateAgentSessionCwd(sessionRecord.ID, currentCwd, time.Now().UnixNano()); err != nil {
-			logger.Warn("failed to update tai session cwd", zap.Error(err))
-		}
-	}
-	if err := taiPersistTimelineMessages(database, sessionRecord.ID, timelineMessages); err != nil {
-		logger.Warn("failed to store tai timeline", zap.Error(err))
+	if streamErrorText != "" {
+		return fmt.Errorf("analysis failed: %s", streamErrorText)
 	}
 
 	// Store analysis in database
@@ -219,7 +178,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		CommandIDs: taiEncodeSelectedCommandIDs(selectedCommands),
 		Prompt:     userQuery,
 		Response:   fullResponse.String(),
-		Model:      describeTaiModel(string(runtimeMode), runtimeTeam),
+		Model:      taiAnalysisModel(database, sessionID),
 		CreatedAt:  time.Now().UnixNano(),
 	}
 
@@ -345,12 +304,89 @@ func describeTaiModel(mode, team string) string {
 	return "team:" + team
 }
 
+func taiAnalysisModel(database *db.DB, preferredSessionID string) string {
+	if database == nil {
+		return "assistant"
+	}
+	sessionID := strings.TrimSpace(preferredSessionID)
+	if sessionID != "" {
+		session, ok, err := database.GetAgentSession(sessionID)
+		if err == nil && ok {
+			return describeTaiModel(session.Mode, session.TeamName)
+		}
+	}
+	session, ok, err := database.LatestAgentSession()
+	if err == nil && ok {
+		return describeTaiModel(session.Mode, session.TeamName)
+	}
+	return "assistant"
+}
+
 func workingDirectory() string {
 	wd, err := os.Getwd()
 	if err != nil {
 		return ""
 	}
 	return wd
+}
+
+func taiAgentCommandsFromDBCommands(commands []db.Command) []agent.Command {
+	if len(commands) == 0 {
+		return nil
+	}
+	result := make([]agent.Command, 0, len(commands))
+	for _, cmd := range commands {
+		if strings.TrimSpace(cmd.ID) == "" || strings.TrimSpace(cmd.Command) == "" {
+			continue
+		}
+		result = append(result, agent.Command{
+			ID:                  cmd.ID,
+			TsStart:             cmd.TsStart,
+			TsEnd:               cmd.TsEnd,
+			Command:             cmd.Command,
+			Cwd:                 cmd.Cwd,
+			ExitCode:            cmd.ExitCode,
+			DurationMs:          cmd.DurationMs,
+			OutputSize:          cmd.OutputSize,
+			TranscriptAvailable: cmd.TranscriptPath != nil,
+		})
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func taiEncodeSelectedCommandIDs(commands []db.Command) string {
+	if len(commands) == 0 {
+		return "[]"
+	}
+	ids := make([]string, 0, len(commands))
+	for _, command := range commands {
+		if command.ID == "" {
+			continue
+		}
+		ids = append(ids, command.ID)
+	}
+	if len(ids) == 0 {
+		return "[]"
+	}
+	data, err := json.Marshal(ids)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+
+func taiNormalizeToolCall(toolCall agent.ToolCallEvent) agent.ToolCallEvent {
+	return agent.ToolCallEvent{
+		CallID:    strings.TrimSpace(toolCall.CallID),
+		AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
+		ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
+		Summary:   textutil.NormalizeInlineText(toolCall.Summary),
+		Result:    textutil.NormalizeInlineText(toolCall.Result),
+		State:     toolCall.State,
+	}
 }
 
 var (

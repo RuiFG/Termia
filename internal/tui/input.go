@@ -103,19 +103,16 @@ func NewInputModel() InputModel {
 	})
 	ta.Focus()
 
-	suggestions := []SlashSuggestion{
-		{Name: "exit", Desc: "exit tui"},
-		{Name: "ralph-loop", Desc: "start ralph loop"},
+	model := InputModel{
+		textInput:    ti,
+		textarea:     ta,
+		focused:      true,
+		pasteBlocks:  make(map[rune]pasteBlock),
+		prompt:       inputPrompt,
+		historyIndex: 0,
 	}
-	return InputModel{
-		textInput:        ti,
-		textarea:         ta,
-		focused:          true,
-		slashSuggestions: suggestions,
-		pasteBlocks:      make(map[rune]pasteBlock),
-		prompt:           inputPrompt,
-		historyIndex:     0,
-	}
+	model.SetSlashSuggestions(localSlashSuggestions())
+	return model
 }
 
 func (m *InputModel) SetPrompt(prompt string) {
@@ -135,6 +132,33 @@ func (m *InputModel) SetPrompt(prompt string) {
 	if m.width > 0 {
 		m.SetWidth(m.width)
 	}
+}
+
+func (m *InputModel) SetSlashSuggestions(suggestions []SlashSuggestion) {
+	if len(suggestions) == 0 {
+		m.slashSuggestions = nil
+		m.slashIndex = 0
+		return
+	}
+
+	cleaned := make([]SlashSuggestion, 0, len(suggestions))
+	seen := make(map[string]struct{}, len(suggestions))
+	for _, suggestion := range suggestions {
+		name := strings.TrimSpace(strings.ToLower(suggestion.Name))
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		cleaned = append(cleaned, SlashSuggestion{
+			Name: name,
+			Desc: strings.TrimSpace(suggestion.Desc),
+		})
+	}
+	m.slashSuggestions = cleaned
+	m.slashIndex = 0
 }
 
 // Focus sets focus on the input.

@@ -1,11 +1,18 @@
 package cmd
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/termia/termia/internal/agent"
+	"github.com/termia/termia/internal/agentapp"
+	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"go.uber.org/zap"
 )
 
 func TestTaiRendererNormalizesToolResultSummaryFromPendingCall(t *testing.T) {
@@ -181,4 +188,294 @@ func TestFilterTaiHistoryCmdExcludesTaiCommands(t *testing.T) {
 	if strings.TrimSpace(filtered[0].Command) != "ls" || strings.TrimSpace(filtered[1].Command) != "pwd" {
 		t.Fatalf("expected non-AI command order preserved, got %#v", filtered)
 	}
+}
+
+func TestTaiRunUsesSharedAgentAppServiceAndStoresAnalysis(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "termia.db")
+	seedTaiTestDB(t, dbPath, func(database *db.DB) {
+		now := time.Now().UnixNano()
+		createTaiTestCommand(t, database, "cmd-ai", "tai explain", now+2, false)
+		createTaiTestCommand(t, database, "cmd-shell", "git status", now+1, true)
+	})
+
+	prevOpen := openTaiDB
+	openTaiDB = func() (*db.DB, error) {
+		return db.Open(dbPath, zap.NewNop())
+	}
+	t.Cleanup(func() {
+		openTaiDB = prevOpen
+	})
+
+	fakeSvc := &fakeTaiAgentAppService{
+		events: []agent.RuntimeEvent{
+			{Kind: agent.RuntimeEventText, Text: "analysis result"},
+		},
+	}
+	prevFactory := newTaiAgentAppService
+	newTaiAgentAppService = func(_ *config.Config, _ *db.DB) taiAgentAppService {
+		return fakeSvc
+	}
+	t.Cleanup(func() {
+		newTaiAgentAppService = prevFactory
+	})
+
+	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	taiCommandCount = 1
+	taiAll = false
+	taiHistoryMode = "cmd"
+	t.Cleanup(func() {
+		taiCommandCount = prevCmdCount
+		taiAll = prevAll
+		taiHistoryMode = prevHistoryMode
+	})
+
+	t.Setenv("TERMIA_SESSION_ID", "session-current")
+
+	cmd := newTaiRunTestCommand()
+	if err := taiRun(cmd, []string{"summarize"}); err != nil {
+		t.Fatalf("taiRun returned error: %v", err)
+	}
+	if len(fakeSvc.requests) != 1 {
+		t.Fatalf("expected one service run request, got %d", len(fakeSvc.requests))
+	}
+	req := fakeSvc.requests[0]
+	if req.Query != "summarize" {
+		t.Fatalf("expected query to pass through unchanged, got %q", req.Query)
+	}
+	if req.SessionID != "session-current" {
+		t.Fatalf("expected current session ID to be forwarded, got %q", req.SessionID)
+	}
+	if len(req.SelectedCommands) != 1 || req.SelectedCommands[0].ID != "cmd-shell" {
+		t.Fatalf("expected selected shell history to be forwarded, got %#v", req.SelectedCommands)
+	}
+	if !req.SelectedCommands[0].TranscriptAvailable {
+		t.Fatalf("expected transcript availability to be forwarded from db command")
+	}
+
+	withTaiTestDB(t, dbPath, func(database *db.DB) {
+		analyses, err := database.ListAnalyses(10)
+		if err != nil {
+			t.Fatalf("ListAnalyses returned error: %v", err)
+		}
+		if len(analyses) != 1 {
+			t.Fatalf("expected one analysis row, got %#v", analyses)
+		}
+		if analyses[0].Prompt != "summarize" || analyses[0].Response != "analysis result" {
+			t.Fatalf("expected analysis row to store prompt/response, got %#v", analyses[0])
+		}
+		if analyses[0].CommandIDs != `["cmd-shell"]` {
+			t.Fatalf("expected selected command IDs to persist, got %s", analyses[0].CommandIDs)
+		}
+	})
+}
+
+func TestTaiRunSupportsHSelectorPrefixWithSharedService(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "termia.db")
+	seedTaiTestDB(t, dbPath, func(database *db.DB) {
+		now := time.Now().UnixNano()
+		createTaiTestCommand(t, database, "cmd-1", "pwd", now+1, false)
+		createTaiTestCommand(t, database, "cmd-2", "ls", now+2, false)
+	})
+
+	prevOpen := openTaiDB
+	openTaiDB = func() (*db.DB, error) {
+		return db.Open(dbPath, zap.NewNop())
+	}
+	t.Cleanup(func() {
+		openTaiDB = prevOpen
+	})
+
+	fakeSvc := &fakeTaiAgentAppService{}
+	prevFactory := newTaiAgentAppService
+	newTaiAgentAppService = func(_ *config.Config, _ *db.DB) taiAgentAppService {
+		return fakeSvc
+	}
+	t.Cleanup(func() {
+		newTaiAgentAppService = prevFactory
+	})
+
+	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	taiCommandCount = 0
+	taiAll = false
+	taiHistoryMode = "cmd"
+	t.Cleanup(func() {
+		taiCommandCount = prevCmdCount
+		taiAll = prevAll
+		taiHistoryMode = prevHistoryMode
+	})
+
+	runCmd := &cobra.Command{
+		Use:  "tai",
+		Args: cobra.MinimumNArgs(1),
+		RunE: taiRun,
+	}
+	runCmd.SetArgs([]string{"h~2", "why"})
+	if err := runCmd.Execute(); err != nil {
+		t.Fatalf("command execution returned error: %v", err)
+	}
+	if len(fakeSvc.requests) != 1 {
+		t.Fatalf("expected one service run request, got %d", len(fakeSvc.requests))
+	}
+	req := fakeSvc.requests[0]
+	if req.Query != "why" {
+		t.Fatalf("expected h-selector to be stripped from query, got %q", req.Query)
+	}
+	if len(req.SelectedCommands) != 2 {
+		t.Fatalf("expected two selected commands from h~2, got %#v", req.SelectedCommands)
+	}
+	if req.SelectedCommands[0].ID != "cmd-1" || req.SelectedCommands[1].ID != "cmd-2" {
+		t.Fatalf("expected commands in chronological order, got %#v", req.SelectedCommands)
+	}
+}
+
+func TestTaiRunReturnsErrorOnStreamErrorAndSkipsAnalysis(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "termia.db")
+
+	prevOpen := openTaiDB
+	openTaiDB = func() (*db.DB, error) {
+		return db.Open(dbPath, zap.NewNop())
+	}
+	t.Cleanup(func() {
+		openTaiDB = prevOpen
+	})
+
+	fakeSvc := &fakeTaiAgentAppService{
+		events: []agent.RuntimeEvent{
+			{Kind: agent.RuntimeEventError, Text: "runtime failed"},
+		},
+	}
+	prevFactory := newTaiAgentAppService
+	newTaiAgentAppService = func(_ *config.Config, _ *db.DB) taiAgentAppService {
+		return fakeSvc
+	}
+	t.Cleanup(func() {
+		newTaiAgentAppService = prevFactory
+	})
+
+	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	taiCommandCount = 0
+	taiAll = false
+	taiHistoryMode = "cmd"
+	t.Cleanup(func() {
+		taiCommandCount = prevCmdCount
+		taiAll = prevAll
+		taiHistoryMode = prevHistoryMode
+	})
+
+	cmd := newTaiRunTestCommand()
+	err := taiRun(cmd, []string{"inspect failure"})
+	if err == nil {
+		t.Fatalf("expected taiRun to return stream error")
+	}
+	if !strings.Contains(err.Error(), "runtime failed") {
+		t.Fatalf("expected returned error to include runtime failure text, got %v", err)
+	}
+
+	withTaiTestDB(t, dbPath, func(database *db.DB) {
+		analyses, listErr := database.ListAnalyses(10)
+		if listErr != nil {
+			t.Fatalf("ListAnalyses returned error: %v", listErr)
+		}
+		if len(analyses) != 0 {
+			t.Fatalf("expected no analysis rows on stream error, got %#v", analyses)
+		}
+	})
+}
+
+func TestTaiNormalizeToolCallNormalizesInlineFields(t *testing.T) {
+	toolCall := taiNormalizeToolCall(agent.ToolCallEvent{
+		CallID:    " call-1 ",
+		AgentName: " assistant\r ",
+		ToolName:  " command\r ",
+		Summary:   " netstat\r\n-tuln ",
+		Result:    " open\r ports ",
+	})
+	if toolCall.CallID != "call-1" {
+		t.Fatalf("expected trimmed call id, got %q", toolCall.CallID)
+	}
+	if toolCall.AgentName != "assistant" {
+		t.Fatalf("expected normalized agent name, got %q", toolCall.AgentName)
+	}
+	if toolCall.ToolName != "command" {
+		t.Fatalf("expected normalized tool name, got %q", toolCall.ToolName)
+	}
+	if toolCall.Summary != "netstat -tuln" {
+		t.Fatalf("expected normalized summary, got %q", toolCall.Summary)
+	}
+	if toolCall.Result != "open ports" {
+		t.Fatalf("expected normalized result, got %q", toolCall.Result)
+	}
+}
+
+type fakeTaiAgentAppService struct {
+	requests []agentapp.RunRequest
+	events   []agent.RuntimeEvent
+	err      error
+}
+
+func (f *fakeTaiAgentAppService) Run(ctx context.Context, req agentapp.RunRequest) (<-chan agent.RuntimeEvent, error) {
+	f.requests = append(f.requests, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	stream := make(chan agent.RuntimeEvent, len(f.events))
+	for _, event := range f.events {
+		select {
+		case <-ctx.Done():
+			close(stream)
+			return stream, nil
+		case stream <- event:
+		}
+	}
+	close(stream)
+	return stream, nil
+}
+
+func newTaiRunTestCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "tai"}
+	cmd.Flags().Int("cmd", 0, "")
+	cmd.Flags().Bool("all", false, "")
+	cmd.Flags().String("history-mode", "cmd", "")
+	return cmd
+}
+
+func seedTaiTestDB(t *testing.T, dbPath string, seed func(*db.DB)) {
+	t.Helper()
+	withTaiTestDB(t, dbPath, seed)
+}
+
+func withTaiTestDB(t *testing.T, dbPath string, fn func(*db.DB)) {
+	t.Helper()
+	database, err := db.Open(dbPath, zap.NewNop())
+	if err != nil {
+		t.Fatalf("db.Open returned error: %v", err)
+	}
+	defer func() {
+		_ = database.Close()
+	}()
+	fn(database)
+}
+
+func createTaiTestCommand(t *testing.T, database *db.DB, id, command string, tsEnd int64, withTranscript bool) {
+	t.Helper()
+	var transcriptPath *string
+	if withTranscript {
+		path := "/tmp/transcript.log"
+		transcriptPath = &path
+	}
+	if err := database.CreateCommand(&db.Command{
+		ID:             id,
+		TsStart:        tsEnd - int64(time.Second),
+		TsEnd:          ptrInt64(tsEnd),
+		DurationMs:     ptrInt64(100),
+		Command:        command,
+		Cwd:            "/tmp/project",
+		TranscriptPath: transcriptPath,
+	}); err != nil {
+		t.Fatalf("CreateCommand returned error: %v", err)
+	}
+}
+
+func ptrInt64(v int64) *int64 {
+	return &v
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/truncate"
 	"github.com/termia/termia/internal/agent"
+	"github.com/termia/termia/internal/agentapp"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
 	"github.com/termia/termia/internal/diagnostics"
@@ -116,12 +117,23 @@ const (
 	customProviderFieldBaseURL
 )
 
+type tuiAgentAppService interface {
+	Run(context.Context, agentapp.RunRequest) (<-chan agent.RuntimeEvent, error)
+}
+
+var newTUIAgentAppService = func(cfg *config.Config, database *db.DB) tuiAgentAppService {
+	return agentapp.NewService(cfg, database, func(cfg *config.Config, database *db.DB, responder agent.HITLResponder) agentapp.Runtime {
+		return agent.NewRuntime(cfg, database, responder)
+	})
+}
+
 // App is the main TUI model that orchestrates the 3-panel layout.
 type App struct {
 	// Dependencies
-	db     *db.DB
-	logger *zap.Logger
-	cfg    *config.Config
+	db           *db.DB
+	logger       *zap.Logger
+	cfg          *config.Config
+	agentService tuiAgentAppService
 
 	// Layout
 	width         int
@@ -184,7 +196,6 @@ type App struct {
 	// Sessions
 	sessions               []db.AgentSession
 	activeSessionID        string
-	pendingTurnMessages    []AgentMessage
 	pendingPromptID        string
 	pendingPromptSessionID string
 	agentRunning           bool
@@ -352,6 +363,7 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		cwd = ""
 	}
 	input := NewInputModel()
+	input.SetSlashSuggestions(combinedSlashSuggestions())
 	firstUpdate := false
 	firstView := false
 	mode := AgentModeAgent
@@ -362,6 +374,7 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		db:                         database,
 		cfg:                        cfg,
 		logger:                     logger,
+		agentService:               newTUIAgentAppService(cfg, database),
 		focus:                      FocusInput, // Start with input focused (standard TUI pattern)
 		middleMode:                 ModeAgent,  // Default to Agent view
 		agentMode:                  mode,
@@ -458,7 +471,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.setActiveSessionID(selectedID)
 			a.applySessionRuntime(a.activeSessionID)
 			if strings.TrimSpace(a.launchCwd) != "" {
-				a.recordSessionCwd(a.activeSessionID, a.launchCwd)
+				a.recordSessionCwd(a.activeSessionID, a.launchCwd, true)
 			} else {
 				a.ensureSessionCwd(a.activeSessionID)
 			}
@@ -484,7 +497,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.input.SetHistoryEntries(nil)
 		a.agent.SetMessages(nil)
 		a.history.ClearCited()
-		a.pendingTurnMessages = nil
 		if a.ready {
 			a.layoutPanels()
 		}
@@ -495,7 +507,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.agent.SetMessages(formatSessionMessages(msg.messages))
-		a.pendingTurnMessages = nil
 		a.input.SetHistoryEntries(buildInputHistoryEntries(msg.messages))
 		a.pendingPrompts[msg.sessionID] = msg.pending
 		a.syncCitedCommandsFromInputHistory()
@@ -584,35 +595,27 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.RuntimeEventText:
 			if msg.event.Text != "" {
 				a.agent.AppendToLast(msg.event.Text)
-				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "assistant", msg.event.Text, true)
 			}
 		case agent.RuntimeEventReasoning:
 			if msg.event.Text != "" {
 				a.agent.AppendReasoning(msg.event.Text)
-				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "reasoning", msg.event.Text, true)
 			}
 		case agent.RuntimeEventToolCall:
 			if msg.event.ToolCall != nil {
-				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
-				a.agent.AppendToolCall(toolCall)
-				a.pendingTurnMessages = upsertTimelineToolCall(a.pendingTurnMessages, toolCall)
+				a.agent.AppendToolCall(normalizeToolCall(*msg.event.ToolCall))
 			}
 		case agent.RuntimeEventToolResult:
 			if msg.event.ToolCall != nil {
-				toolCall := agentToolCallFromRuntime(*msg.event.ToolCall)
-				a.agent.AppendToolCall(toolCall)
-				a.pendingTurnMessages = upsertTimelineToolCall(a.pendingTurnMessages, toolCall)
+				a.agent.AppendToolCall(normalizeToolCall(*msg.event.ToolCall))
 			}
 		case agent.RuntimeEventCwd:
 			if cwd := strings.TrimSpace(msg.event.Cwd); cwd != "" {
-				a.setCwd(cwd)
+				a.setCwdFromRuntime(cwd)
 			}
 		case agent.RuntimeEventError:
 			if text := strings.TrimSpace(msg.event.Text); text != "" {
 				a.agent.MarkLatestPendingToolFailed(text)
 				a.agent.AddMessage("error", text)
-				a.pendingTurnMessages = markLatestPendingToolFailed(a.pendingTurnMessages, text)
-				a.pendingTurnMessages = appendTimelineText(a.pendingTurnMessages, "error", text, false)
 			}
 		}
 		return a, readAgentEventCmd(msg.stream)
@@ -624,7 +627,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.agentCancel = nil
 			a.agentLastEsc = time.Time{}
 			a.agentProgressStep = 0
-			a.pendingTurnMessages = nil
 			return a, nil
 		}
 		if msg.stream == nil {
@@ -633,7 +635,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.agentCancel = nil
 			a.agentLastEsc = time.Time{}
 			a.agentProgressStep = 0
-			a.pendingTurnMessages = nil
 			return a, nil
 		}
 		return a, readAgentEventCmd(msg.stream)
@@ -646,16 +647,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.statusMsg == "Stopping agent..." {
 			a.statusMsg = ""
 		}
-		if a.activeSessionID == "" {
-			a.pendingTurnMessages = nil
-			return a, nil
-		}
-		messages := append([]AgentMessage(nil), a.pendingTurnMessages...)
-		a.pendingTurnMessages = nil
-		if len(messages) == 0 {
-			return a, nil
-		}
-		return a, createTimelineMessagesCmd(a.db, a.activeSessionID, messages)
+		return a, nil
 
 	case agentErrorMsg:
 		errText := fmt.Sprintf("Error: %v", msg.err)
@@ -665,7 +657,6 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.agentCancel = nil
 		a.agentLastEsc = time.Time{}
 		a.agentProgressStep = 0
-		a.pendingTurnMessages = nil
 		if a.statusMsg == "Stopping agent..." {
 			a.statusMsg = ""
 		}
@@ -882,7 +873,7 @@ func (a App) handleChordKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.agentMode = AgentModeAgent
 		a.middleMode = ModeAgent
 		a.statusMsg = "Mode set to Assistant."
-		a.updateActiveSessionRuntime()
+		a.updateActiveSessionRuntimeBestEffort()
 	case 't':
 		a.openPaletteStage(paletteStageTeams)
 	case 'c':
@@ -1583,8 +1574,9 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Check for slash command
-	if cmd := a.input.ParseSlashCommand(); cmd != nil {
+	// Consume only UI-local slash commands here; shared slash commands must
+	// flow through to the shared agent service unchanged.
+	if cmd := a.input.ParseSlashCommand(); cmd != nil && isLocalSlashCommand(cmd.Name) {
 		a.input.Reset()
 		return a, executeSlashCommand(cmd, a.db, &a.cfg.LLM)
 	}
@@ -1592,12 +1584,6 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 	// Regular text input -> Send to Agent
 	a.middleMode = ModeAgent
 	citedCommands := a.history.CitedCommands()
-	a.agent.AddTimelineMessage(AgentMessage{
-		Role:              "user",
-		Content:           val,
-		CitedCommandCount: len(citedCommands),
-	})
-	a.pendingTurnMessages = nil
 
 	if a.activeSessionID == "" {
 		newSession, err := createSession(a.db, a.cwd, a.currentRuntimeMode(), a.activeTeamName)
@@ -1611,31 +1597,21 @@ func (a App) submitInput() (tea.Model, tea.Cmd) {
 		a.applySessionRuntime(newSession.ID)
 	}
 	a.setActiveSessionID(a.activeSessionID)
-	a.updateActiveSessionRuntime()
+	if err := a.updateActiveSessionRuntime(); err != nil {
+		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
+		a.input.Reset()
+		return a, nil
+	}
+	a.agent.AddTimelineMessage(AgentMessage{
+		Role:              "user",
+		Content:           val,
+		CitedCommandCount: len(citedCommands),
+	})
 	selectedCommands := agentCommandsFromDBCommands(citedCommands)
 	messageMetadata := db.AgentMessageMetadata{
 		CitedCommands: db.AgentMessageCommandMetadataFromCommands(citedCommands),
 	}
-	metadataJSON, err := db.EncodeAgentMessageMetadata(messageMetadata)
-	if err != nil {
-		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
-		a.input.Reset()
-		return a, nil
-	}
 	citedCommandIDs := messageMetadata.CommandIDs()
-
-	if err := a.db.CreateAgentMessage(&db.AgentMessage{
-		ID:           generateID(),
-		SessionID:    a.activeSessionID,
-		Role:         "user",
-		Content:      val,
-		MetadataJSON: metadataJSON,
-		CreatedAt:    time.Now().UnixNano(),
-	}); err != nil {
-		a.agent.AddMessage("error", fmt.Sprintf("Error: %v", err))
-		a.input.Reset()
-		return a, nil
-	}
 	a.input.AddHistoryEntry(val, citedCommandIDs)
 	a.input.SetHistoryDraftCitedCommandIDs(nil)
 	a.history.ClearCited()
@@ -1745,61 +1721,16 @@ func copyToClipboardCmd(text string) tea.Cmd {
 	}
 }
 
-func (a *App) conversationMessages(query string) []agent.Message {
-	if a.db == nil {
-		return nil
-	}
-	sessionID := strings.TrimSpace(a.activeSessionID)
-	if sessionID == "" {
-		return nil
-	}
-	messages, err := a.db.ListAgentMessages(sessionID)
-	if err != nil {
-		return nil
-	}
-	trimmedQuery := strings.TrimSpace(query)
-	if len(messages) > 0 {
-		last := messages[len(messages)-1]
-		if strings.EqualFold(strings.TrimSpace(last.Role), "user") && strings.TrimSpace(last.Content) == trimmedQuery {
-			messages = messages[:len(messages)-1]
-		}
-	}
-	output := make([]agent.Message, 0, len(messages))
-	for _, message := range messages {
-		role := normalizeConversationRole(message.Role)
-		if role == "tool" || role == "error" || role == "reasoning" {
-			continue
-		}
-		content := strings.TrimSpace(message.Content)
-		if content == "" {
-			continue
-		}
-		output = append(output, agent.Message{
-			Role:     role,
-			Content:  content,
-			Commands: agentCommandsFromMessageMetadata(db.ParseAgentMessageMetadata(message)),
-		})
-	}
-	return output
-}
-
-func (a *App) selectedCommandsForAgent() []agent.Command {
-	return agentCommandsFromDBCommands(a.history.CitedCommands())
-}
-
 func (a *App) runAIQuery(ctx context.Context, query string, selectedCommands []agent.Command) (<-chan agent.RuntimeEvent, error) {
-	if a.db == nil {
-		return nil, fmt.Errorf("database not initialized")
+	if a.agentService == nil {
+		return nil, fmt.Errorf("agent service not initialized")
 	}
-	runtime := agent.NewRuntime(a.cfg, a.db, newTUIResponder(a.approvalRequests, a.askRequests))
-	return runtime.Run(ctx, agent.RunRequest{
-		Mode:             a.currentRuntimeMode(),
-		TeamName:         strings.TrimSpace(a.activeTeamName),
+	return a.agentService.Run(ctx, agentapp.RunRequest{
 		SessionID:        strings.TrimSpace(a.activeSessionID),
 		Query:            query,
 		Cwd:              strings.TrimSpace(a.cwd),
-		SelectedCommands: selectedCommands,
-		Messages:         a.conversationMessages(query),
+		SelectedCommands: append([]agent.Command(nil), selectedCommands...),
+		Responder:        newTUIResponder(a.approvalRequests, a.askRequests),
 	})
 }
 
@@ -1843,7 +1774,7 @@ func (a App) handleSlashResult(result SlashCommandResult) (tea.Model, tea.Cmd) {
 	}
 	if result.SwitchAgentMode != nil {
 		a.agentMode = *result.SwitchAgentMode
-		a.updateActiveSessionRuntime()
+		a.updateActiveSessionRuntimeBestEffort()
 	}
 	if result.OpenPalette != nil {
 		a.openPaletteStage(*result.OpenPalette)
@@ -2529,7 +2460,7 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 		if item.Value == "assistant" {
 			a.agentMode = AgentModeAgent
 			a.statusMsg = "Mode set to Assistant."
-			a.updateActiveSessionRuntime()
+			a.updateActiveSessionRuntimeBestEffort()
 			a.closePalette()
 			return a, nil
 		}
@@ -2542,7 +2473,7 @@ func (a App) handlePaletteSelect() (tea.Model, tea.Cmd) {
 			a.agentMode = AgentModeTeam
 			a.activeTeamName = team.Name
 			a.statusMsg = fmt.Sprintf("Mode set to %s.", team.Name)
-			a.updateActiveSessionRuntime()
+			a.updateActiveSessionRuntimeBestEffort()
 		}
 		a.closePalette()
 		return a, nil
@@ -3556,68 +3487,6 @@ func createSessionCmd(database *db.DB, cwd string, mode agent.Mode, teamName str
 	}
 }
 
-func createTimelineMessagesCmd(database *db.DB, sessionID string, messages []AgentMessage) tea.Cmd {
-	return func() tea.Msg {
-		createdAt := time.Now().UnixNano()
-		persisted := normalizeTimelineMessagesForPersistence(messages)
-		for idx, message := range persisted {
-			metadataJSON, err := encodeTimelineMessageMetadata(message)
-			if err != nil {
-				return agentErrorMsg{err: err}
-			}
-			msg := &db.AgentMessage{
-				ID:           generateID(),
-				SessionID:    sessionID,
-				Role:         normalizeConversationRole(message.Role),
-				Content:      textutil.NormalizeTrimmedText(message.Content),
-				MetadataJSON: metadataJSON,
-				CreatedAt:    createdAt + int64(idx),
-			}
-			if err := database.CreateAgentMessage(msg); err != nil {
-				return agentErrorMsg{err: err}
-			}
-		}
-		return nil
-	}
-}
-
-func normalizeTimelineMessagesForPersistence(messages []AgentMessage) []AgentMessage {
-	if len(messages) == 0 {
-		return nil
-	}
-	result := make([]AgentMessage, 0, len(messages))
-	for _, message := range messages {
-		if !renderableTimelineMessage(message) {
-			continue
-		}
-		result = append(result, message)
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
-}
-
-func encodeTimelineMessageMetadata(message AgentMessage) (string, error) {
-	if message.ToolCall == nil {
-		return "", nil
-	}
-	toolCall := normalizeToolCall(*message.ToolCall)
-	metadata := db.AgentMessageMetadata{
-		ToolCalls: []db.AgentMessageToolCallMetadata{
-			{
-				CallID:    toolCall.CallID,
-				AgentName: toolCall.AgentName,
-				ToolName:  toolCall.ToolName,
-				Summary:   toolCall.Summary,
-				Result:    toolCall.Result,
-				State:     string(toolCall.State),
-			},
-		},
-	}
-	return db.EncodeAgentMessageMetadata(metadata)
-}
-
 func (a *App) enqueuePendingPrompt(content string, createdAt int64) error {
 	if a.db == nil {
 		return fmt.Errorf("database is nil")
@@ -3703,20 +3572,52 @@ func buildSessionSpecSnapshot(mode agent.Mode, teamName string) string {
 	return string(data)
 }
 
-func (a *App) updateActiveSessionRuntime() {
-	a.updateSessionRuntime(a.activeSessionID, a.currentRuntimeMode(), a.activeTeamName)
+func (a *App) updateActiveSessionRuntime() error {
+	return a.updateSessionRuntime(a.activeSessionID, a.currentRuntimeMode(), a.activeTeamName)
 }
 
-func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName string) {
+func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return
+		return nil
+	}
+
+	state := agentapp.SessionState{Mode: mode, TeamName: strings.TrimSpace(teamName)}
+	var snapshotSource string
+	if a.db != nil {
+		session, ok, err := a.db.GetAgentSession(sessionID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			snapshotSource = session.SpecSnapshotJSON
+		}
+	}
+	if strings.TrimSpace(snapshotSource) == "" {
+		for i := range a.sessions {
+			if a.sessions[i].ID != sessionID {
+				continue
+			}
+			snapshotSource = a.sessions[i].SpecSnapshotJSON
+			break
+		}
+	}
+	if strings.TrimSpace(snapshotSource) != "" {
+		existingState, err := agentapp.DecodeSessionState(snapshotSource)
+		if err != nil {
+			return err
+		}
+		state.SessionMiddleware = append([]agentapp.MiddlewareActivation(nil), existingState.SessionMiddleware...)
+	}
+
+	specSnapshot, err := agentapp.EncodeSessionState(state)
+	if err != nil {
+		return err
 	}
 	if mode != agent.ModeTeam {
 		teamName = ""
 	}
 	teamName = strings.TrimSpace(teamName)
-	specSnapshot := buildSessionSpecSnapshot(mode, teamName)
 	for i := range a.sessions {
 		if a.sessions[i].ID != sessionID {
 			continue
@@ -3726,13 +3627,19 @@ func (a *App) updateSessionRuntime(sessionID string, mode agent.Mode, teamName s
 		a.sessions[i].SpecSnapshotJSON = specSnapshot
 		break
 	}
+
 	if a.db == nil {
-		return
+		return nil
 	}
 	if err := a.db.UpdateAgentSessionRuntime(sessionID, string(mode), teamName, specSnapshot, time.Now().UnixNano()); err != nil {
-		if a.logger != nil {
-			a.logger.Warn("failed to update session runtime metadata", zap.Error(err))
-		}
+		return err
+	}
+	return nil
+}
+
+func (a *App) updateActiveSessionRuntimeBestEffort() {
+	if err := a.updateActiveSessionRuntime(); err != nil && a.logger != nil {
+		a.logger.Warn("failed to update session runtime metadata", zap.Error(err))
 	}
 }
 
@@ -3848,33 +3755,6 @@ func buildInputHistoryEntries(messages []db.AgentMessage) []InputHistoryEntry {
 	return entries
 }
 
-func agentCommandsFromMessageMetadata(metadata db.AgentMessageMetadata) []agent.Command {
-	if len(metadata.CitedCommands) == 0 {
-		return nil
-	}
-	commands := make([]agent.Command, 0, len(metadata.CitedCommands))
-	for _, cited := range metadata.CitedCommands {
-		if cited.ID == "" || strings.TrimSpace(cited.Command) == "" {
-			continue
-		}
-		commands = append(commands, agent.Command{
-			ID:                  cited.ID,
-			TsStart:             cited.TsStart,
-			TsEnd:               cited.TsEnd,
-			Command:             cited.Command,
-			Cwd:                 cited.Cwd,
-			ExitCode:            cited.ExitCode,
-			DurationMs:          cited.DurationMs,
-			OutputSize:          cited.OutputSize,
-			TranscriptAvailable: cited.TranscriptAvailable,
-		})
-	}
-	if len(commands) == 0 {
-		return nil
-	}
-	return commands
-}
-
 func agentToolCallsFromMessageMetadata(metadata db.AgentMessageMetadata) []AgentToolCall {
 	if len(metadata.ToolCalls) == 0 {
 		return nil
@@ -3905,17 +3785,6 @@ func agentToolCallFromMessageMetadata(metadata db.AgentMessageMetadata) (AgentTo
 		return AgentToolCall{}, false
 	}
 	return toolCalls[0], true
-}
-
-func agentToolCallFromRuntime(toolCall agent.ToolCallEvent) AgentToolCall {
-	return AgentToolCall{
-		CallID:    strings.TrimSpace(toolCall.CallID),
-		AgentName: textutil.NormalizeInlineText(toolCall.AgentName),
-		ToolName:  textutil.NormalizeInlineText(toolCall.ToolName),
-		Summary:   textutil.NormalizeInlineText(toolCall.Summary),
-		Result:    textutil.NormalizeInlineText(toolCall.Result),
-		State:     toolCall.State,
-	}
 }
 
 func agentCommandsFromDBCommands(commands []db.Command) []agent.Command {
@@ -3998,16 +3867,24 @@ func (a *App) syncCitedCommandsFromInputHistory() {
 }
 
 func (a *App) setCwd(cwd string) {
+	a.setCwdInternal(cwd, true)
+}
+
+func (a *App) setCwdFromRuntime(cwd string) {
+	a.setCwdInternal(cwd, false)
+}
+
+func (a *App) setCwdInternal(cwd string, persist bool) {
 	if strings.TrimSpace(cwd) == "" {
 		return
 	}
 	a.cwd = cwd
-	a.recordSessionCwd(a.activeSessionID, cwd)
+	a.recordSessionCwd(a.activeSessionID, cwd, persist)
 	a.updateInputPrompt()
 	a.syncCwdToShell(cwd)
 }
 
-func (a *App) recordSessionCwd(sessionID, cwd string) {
+func (a *App) recordSessionCwd(sessionID, cwd string, persist bool) {
 	if strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -4019,6 +3896,9 @@ func (a *App) recordSessionCwd(sessionID, cwd string) {
 	}
 	a.sessionCwds[sessionID] = cwd
 	a.updateSessionCwd(sessionID, cwd)
+	if !persist {
+		return
+	}
 	if a.db == nil {
 		return
 	}
@@ -4042,7 +3922,7 @@ func (a *App) ensureSessionCwd(sessionID string) {
 	if strings.TrimSpace(a.cwd) == "" {
 		return
 	}
-	a.recordSessionCwd(sessionID, a.cwd)
+	a.recordSessionCwd(sessionID, a.cwd, true)
 }
 
 func (a *App) applySessionCwd(sessionID string) {
@@ -4058,7 +3938,7 @@ func (a *App) applySessionCwd(sessionID string) {
 	if !ok || strings.TrimSpace(stored) == "" {
 		stored = a.sessionCwdFromList(sessionID)
 		if strings.TrimSpace(stored) == "" {
-			a.recordSessionCwd(sessionID, a.cwd)
+			a.recordSessionCwd(sessionID, a.cwd, true)
 			return
 		}
 		a.sessionCwds[sessionID] = stored

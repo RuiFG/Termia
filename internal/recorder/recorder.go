@@ -209,7 +209,7 @@ func shouldRecordCommand(command string) bool {
 	}
 
 	first := normalizeCommandToken(fields[0])
-	if first == "tui" || first == "tui.exe" {
+	if first == "tai" || first == "tai.exe" || first == "tui" || first == "tui.exe" {
 		return false
 	}
 	if len(fields) < 2 {
@@ -217,7 +217,7 @@ func shouldRecordCommand(command string) bool {
 	}
 
 	second := normalizeCommandToken(fields[1])
-	return !(isTermiaExecutable(first) && second == "tui")
+	return !(isTermiaExecutable(first) && (second == "tai" || second == "tui"))
 }
 
 func normalizeCommandToken(token string) string {

@@ -2108,11 +2108,17 @@ func (a App) renderInput(contentWidth int) string {
 	statusLine := buildStatusLine(status, badge, contentWidth)
 
 	inputLines := strings.Split(inputView, "\n")
-	cwdLine := a.renderInputCwdLine(contentWidth)
+	cwdLine := ""
+	if !a.approvalInput.Active() && !a.askInput.Active() {
+		cwdLine = a.renderInputCwdLine(contentWidth)
+	}
 	if cwdLine != "" {
 		inputLines = append([]string{cwdLine}, inputLines...)
 	}
 	inputAreaLines := a.inputHeight - 1
+	if (a.approvalInput.Active() || a.askInput.Active()) && len(inputLines) > inputAreaLines {
+		inputLines = trimInteractiveInputLines(inputLines, inputAreaLines)
+	}
 	blankLines := inputAreaLines - len(inputLines)
 	if blankLines < 0 {
 		blankLines = 0
@@ -2139,6 +2145,48 @@ func (a App) renderInput(contentWidth int) string {
 		style = focusedInputBarStyle.Width(contentWidth + pw)
 	}
 	return style.Render(inner)
+}
+
+func trimInteractiveInputLines(lines []string, maxLines int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	if len(lines) <= maxLines {
+		return lines
+	}
+	if maxLines == 1 {
+		return []string{lines[len(lines)-1]}
+	}
+
+	headCount := 1
+	if maxLines >= 4 && len(lines) > 1 {
+		headCount = 2
+	}
+	if headCount > len(lines) {
+		headCount = len(lines)
+	}
+
+	remaining := maxLines - headCount
+	useEllipsis := remaining >= 2 && len(lines)-headCount > remaining
+	tailCount := remaining
+	if useEllipsis {
+		tailCount--
+	}
+	if tailCount < 1 {
+		tailCount = 1
+	}
+
+	start := len(lines) - tailCount
+	if start < headCount {
+		start = headCount
+	}
+
+	trimmed := append([]string{}, lines[:headCount]...)
+	if useEllipsis && start > headCount {
+		trimmed = append(trimmed, hitlHintStyle.Render("..."))
+	}
+	trimmed = append(trimmed, lines[start:]...)
+	return trimmed
 }
 
 func (a App) renderAgentModeBadge() string {

@@ -6,7 +6,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func TestShouldRecordCommandIgnoresTUI(t *testing.T) {
+func TestShouldRecordCommandIgnoresTermiaUICommands(t *testing.T) {
 	tests := []struct {
 		command string
 		want    bool
@@ -15,7 +15,10 @@ func TestShouldRecordCommandIgnoresTUI(t *testing.T) {
 		{command: "tui --team ops", want: false},
 		{command: "termia tui", want: false},
 		{command: ".\\termia.exe tui --team ops", want: false},
-		{command: "tai summarize", want: true},
+		{command: "tai", want: false},
+		{command: "tai summarize", want: false},
+		{command: "termia tai summarize", want: false},
+		{command: ".\\termia.exe tai summarize", want: false},
 		{command: "ls -la", want: true},
 	}
 

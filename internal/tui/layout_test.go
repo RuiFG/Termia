@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -219,5 +220,31 @@ func TestApprovalResponseDoesNotSetStatusMessage(t *testing.T) {
 	updated := model.(App)
 	if updated.statusMsg != "" {
 		t.Fatalf("expected approval response to leave status bar empty, got %q", updated.statusMsg)
+	}
+}
+
+func TestApprovalLayoutKeepsActionsVisibleWhenCommandOverflows(t *testing.T) {
+	app := New(nil, config.DefaultConfig(), nil)
+	app.width = 60
+	app.height = 12
+	app.ready = true
+	app.cwd = "/tmp/session"
+	app.approvalInput.SetRequest(agent.HITLRequest{
+		Kind:    agent.HITLKindConfirm,
+		Command: strings.Repeat("very-long-command-segment ", 12),
+		Cwd:     "/tmp/project",
+	})
+
+	app.layoutPanels()
+	view := stripANSICodes(app.renderInput(app.leftContentW))
+	normalized := strings.Join(strings.Fields(view), " ")
+	if !strings.Contains(normalized, "Allow command") {
+		t.Fatalf("expected approval title to remain visible, got %q", view)
+	}
+	if !strings.Contains(normalized, "Allow Enter") {
+		t.Fatalf("expected allow action to remain visible, got %q", view)
+	}
+	if !strings.Contains(normalized, "Reject Esc") {
+		t.Fatalf("expected reject action to remain visible, got %q", view)
 	}
 }

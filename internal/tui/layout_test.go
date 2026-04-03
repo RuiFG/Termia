@@ -169,6 +169,43 @@ func TestAskInputKeyRelayoutsWhenEnteringCustomMode(t *testing.T) {
 	}
 }
 
+func TestAskInputKeySpaceInMultiSelectKeepsSelectMode(t *testing.T) {
+	app := New(nil, config.DefaultConfig(), nil)
+	app.width = 120
+	app.height = 40
+	app.ready = true
+	app.layoutPanels()
+
+	model, _ := app.Update(askRequestMsg{
+		request: askRequest{
+			request: agent.HITLRequest{
+				Kind: agent.HITLKindInputForm,
+				Questions: []agent.AskQuestion{{
+					Question: "Choose outputs",
+					Options: []agent.AskOption{
+						{Title: "Logs"},
+					},
+					Multiple: true,
+				}},
+			},
+			response: make(chan agent.HITLResponse, 1),
+		},
+	})
+	updated := model.(App)
+
+	model, _ = updated.handleInputKey(tea.KeyMsg{Type: tea.KeyDown})
+	updated = model.(App)
+	model, _ = updated.handleInputKey(tea.KeyMsg{Type: tea.KeySpace})
+	updated = model.(App)
+
+	if updated.askInput.Mode != AskModeSelect {
+		t.Fatalf("expected key space in multi-select to keep select mode, got %v", updated.askInput.Mode)
+	}
+	if !updated.askInput.isSelected(1) {
+		t.Fatalf("expected key space to toggle the custom option on")
+	}
+}
+
 func TestApprovalResponseDoesNotSetStatusMessage(t *testing.T) {
 	app := New(nil, config.DefaultConfig(), nil)
 	app.pendingPromptID = "prompt-1"

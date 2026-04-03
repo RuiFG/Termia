@@ -54,8 +54,8 @@ func TestBuildCLIConfirmTextUsesCompactCommandApprovalCopy(t *testing.T) {
 	if strings.Contains(text, "Tool: command") {
 		t.Fatalf("expected command tool label to be omitted, got %q", text)
 	}
-	if strings.Contains(text, "/tmp/project") {
-		t.Fatalf("expected command confirmation to stay inline, got %q", text)
+	if !strings.Contains(text, "/tmp/project") {
+		t.Fatalf("expected command confirmation to include cwd, got %q", text)
 	}
 	if !strings.Contains(text, "(y/n): ") {
 		t.Fatalf("expected inline y/n hint, got %q", text)

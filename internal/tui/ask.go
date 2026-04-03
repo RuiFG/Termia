@@ -133,7 +133,6 @@ func (m AskInput) View(contentWidth int) string {
 	}
 	if m.Mode == AskModeCustom {
 		lines = append(lines, "")
-		lines = append(lines, hitlSubtitleStyle.Render("Type your answer"))
 		lines = append(lines, m.Custom.View())
 		lines = append(lines, hitlHintStyle.Render("Enter save  Esc back"))
 		return strings.Join(lines, "\n")
@@ -209,7 +208,7 @@ func (m *AskInput) handleSelectKey(msg tea.KeyMsg) (*agent.HITLResponse, tea.Cmd
 	default:
 		if msg.String() == " " {
 			m.toggleSelection(m.Cursor, question)
-			if m.cursorIsCustom(question) && m.isSelected(m.Cursor) {
+			if !question.Multiple && m.cursorIsCustom(question) && m.isSelected(m.Cursor) {
 				return nil, m.enterCustomMode()
 			}
 		}
@@ -454,10 +453,7 @@ func renderAskOptionRow(width int, marker string, option agent.AskOption, focuse
 	}
 
 	titleStyle := hitlChoiceTitleStyle
-	switch {
-	case selected:
-		titleStyle = hitlSelectedStyle
-	case focused:
+	if focused {
 		titleStyle = hitlChoiceFocusStyle
 	}
 

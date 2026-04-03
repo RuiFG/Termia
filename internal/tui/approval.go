@@ -35,8 +35,8 @@ func (m *ApprovalInput) SetWidth(width int) {
 func (m ApprovalInput) View(contentWidth int) string {
 	width := maxInt(1, contentWidth)
 	lines := []string{hitlTitleStyle.Render(approvalTitle(m.Request))}
-	if strings.TrimSpace(m.Request.Command) != "" {
-		lines = append(lines, renderCodeBlockLine(strings.TrimSpace(m.Request.Command), width)...)
+	if line := approvalCommandLine(m.Request); line != "" {
+		lines = append(lines, renderCodeBlockLine(line, width)...)
 	}
 	meta := approvalMetaLine(m.Request)
 	if meta != "" {
@@ -76,18 +76,6 @@ func (m *ApprovalInput) Update(msg tea.Msg) (*agent.HITLResponse, tea.Cmd) {
 		resp := approvalResponse(false)
 		m.active = false
 		return resp, nil
-	case strings.EqualFold(keyMsg.String(), "y"):
-		resp := approvalResponse(true)
-		m.active = false
-		return resp, nil
-	case strings.EqualFold(keyMsg.String(), "n"):
-		resp := approvalResponse(false)
-		m.active = false
-		return resp, nil
-	case strings.EqualFold(keyMsg.String(), "r"):
-		resp := approvalResponse(false)
-		m.active = false
-		return resp, nil
 	default:
 		return nil, nil
 	}
@@ -109,13 +97,21 @@ func approvalTitle(request agent.HITLRequest) string {
 
 func approvalMetaLine(request agent.HITLRequest) string {
 	parts := make([]string, 0, 2)
-	if cwd := strings.TrimSpace(request.Cwd); cwd != "" {
-		parts = append(parts, cwd)
-	}
 	if tool := strings.TrimSpace(request.OriginalTool); tool != "" && !strings.EqualFold(tool, "command") {
 		parts = append(parts, "tool "+tool)
 	}
 	return strings.Join(parts, "  ")
+}
+
+func approvalCommandLine(request agent.HITLRequest) string {
+	command := strings.TrimSpace(request.Command)
+	if command == "" {
+		return ""
+	}
+	if cwd := strings.TrimSpace(request.Cwd); cwd != "" {
+		return command + "  " + cwd
+	}
+	return command
 }
 
 func approvalPrompt(request agent.HITLRequest) string {
@@ -141,8 +137,8 @@ func isGenericApprovalPrompt(prompt string) bool {
 }
 
 func renderApprovalActions(cursor int) string {
-	allow := renderApprovalActionChoice("Allow", "Enter / Y", cursor == 0, false)
-	reject := renderApprovalActionChoice("Reject", "Esc / N", cursor == 1, true)
+	allow := renderApprovalActionChoice("Allow", "Enter", cursor == 0, false)
+	reject := renderApprovalActionChoice("Reject", "Esc", cursor == 1, true)
 	return allow + "  " + reject
 }
 

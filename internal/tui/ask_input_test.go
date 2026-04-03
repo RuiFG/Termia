@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"github.com/termia/termia/internal/agent"
 )
 
@@ -89,7 +91,35 @@ func TestAskInputTypeYourAnswerFlow(t *testing.T) {
 	}
 }
 
-func TestAskInputCustomOptionViaSpaceEntersInputMode(t *testing.T) {
+func TestAskInputCustomModeDoesNotRepeatTypeYourAnswerHeading(t *testing.T) {
+	input := NewAskInput()
+	input.SetRequest(agent.HITLRequest{
+		Kind: agent.HITLKindInputForm,
+		Questions: []agent.AskQuestion{{
+			Question: "Provide details",
+			Options: []agent.AskOption{
+				{Title: "One"},
+				{Title: agent.AskTypeYourAnswerTitle},
+			},
+		}},
+	})
+
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyDown})
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if input.Mode != AskModeCustom {
+		t.Fatalf("expected custom mode, got %v", input.Mode)
+	}
+
+	view := stripANSICodes(input.View(80))
+	if strings.Contains(view, "\nType your answer\n> ") {
+		t.Fatalf("expected redundant custom-mode subtitle to be hidden, got %q", view)
+	}
+	if !strings.Contains(view, "> ") {
+		t.Fatalf("expected custom input prompt in view, got %q", view)
+	}
+}
+
+func TestAskInputCustomOptionViaSpaceOnlyTogglesSelectionInMultiSelect(t *testing.T) {
 	input := NewAskInput()
 	input.SetRequest(agent.HITLRequest{
 		Kind: agent.HITLKindInputForm,
@@ -105,20 +135,48 @@ func TestAskInputCustomOptionViaSpaceEntersInputMode(t *testing.T) {
 
 	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyDown})
 	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
-	if input.Mode != AskModeCustom {
-		t.Fatalf("expected selecting custom option with space to enter input mode, got %v", input.Mode)
+	if input.Mode != AskModeSelect {
+		t.Fatalf("expected space in multi-select to keep select mode, got %v", input.Mode)
 	}
-	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-	if got := input.Custom.Value(); got != "x" {
-		t.Fatalf("expected custom mode to accept typing after space selection, got %q", got)
+	if !input.isSelected(1) {
+		t.Fatalf("expected custom option to be toggled on")
 	}
-	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("yz")})
-	if got := input.Custom.Value(); got != "xyz" {
-		t.Fatalf("expected subsequent typing to append, got %q", got)
+	if got := input.Custom.Value(); got != "" {
+		t.Fatalf("expected no custom input draft when only toggling selection, got %q", got)
 	}
-	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyBackspace})
-	if got := input.Custom.Value(); got != "xy" {
-		t.Fatalf("expected backspace to work in custom mode, got %q", got)
+
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	if input.isSelected(1) {
+		t.Fatalf("expected second space to toggle custom option off")
+	}
+}
+
+func TestAskInputCustomOptionViaKeySpaceOnlyTogglesSelectionInMultiSelect(t *testing.T) {
+	input := NewAskInput()
+	input.SetRequest(agent.HITLRequest{
+		Kind: agent.HITLKindInputForm,
+		Questions: []agent.AskQuestion{{
+			Question: "Select outputs",
+			Options: []agent.AskOption{
+				{Title: "Logs"},
+				{Title: agent.AskTypeYourAnswerTitle},
+			},
+			Multiple: true,
+		}},
+	})
+
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyDown})
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if input.Mode != AskModeSelect {
+		t.Fatalf("expected key space in multi-select to keep select mode, got %v", input.Mode)
+	}
+	if !input.isSelected(1) {
+		t.Fatalf("expected key space to toggle the custom option on")
+	}
+
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if input.isSelected(1) {
+		t.Fatalf("expected second key space to toggle the custom option off")
 	}
 }
 
@@ -139,6 +197,10 @@ func TestAskInputMultiSelectWithCustom(t *testing.T) {
 	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
 	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyDown})
 	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	if input.Mode != AskModeSelect {
+		t.Fatalf("expected custom option selection to stay in select mode until enter, got %v", input.Mode)
+	}
+	_, _ = input.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if input.Mode != AskModeCustom {
 		t.Fatalf("expected custom mode, got %v", input.Mode)
 	}
@@ -188,6 +250,23 @@ func TestAskInputViewShowsDescriptionsWithoutArrow(t *testing.T) {
 	}
 	if strings.Contains(view, "> ") {
 		t.Fatalf("expected no arrow cursor in ask view, got %q", view)
+	}
+}
+
+func TestRenderAskOptionRowSelectedTitleUsesDefaultStyle(t *testing.T) {
+	previousProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(previousProfile)
+
+	lines := renderAskOptionRow(80, "[x]", agent.AskOption{Title: "Logs"}, false, true)
+	if len(lines) == 0 {
+		t.Fatalf("expected rendered lines")
+	}
+	if !strings.Contains(lines[0], hitlChoiceTitleStyle.Render("Logs")) {
+		t.Fatalf("expected selected option title to keep default style, got %q", lines[0])
+	}
+	if strings.Contains(lines[0], hitlSelectedStyle.Render("Logs")) {
+		t.Fatalf("expected selected option title to avoid selected highlight style, got %q", lines[0])
 	}
 }
 

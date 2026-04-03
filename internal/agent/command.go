@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	einoadk "github.com/cloudwego/eino/adk"
 	einotool "github.com/cloudwego/eino/components/tool"
@@ -125,6 +126,8 @@ func executeCommand(ctx context.Context, state *runtimeState, command, cwd, cwdM
 	tsStart := time.Now().UnixNano()
 	resolvedCwd := resolveCommandCwd(ctx, state, cwd, cwdMode)
 	var startOffset int64
+	stdoutPrefix := ""
+	cwdChanged := false
 
 	if database != nil {
 		_ = database.CreateCommand(&db.Command{
@@ -142,14 +145,20 @@ func executeCommand(ctx context.Context, state *runtimeState, command, cwd, cwdM
 
 	if cdReq, ok := parseDirectoryChangeCommand(command); ok {
 		targetCwd, stdout, err := applyDirectoryChange(ctx, state, resolvedCwd, cdReq)
-		tsEnd := time.Now().UnixNano()
-		if database != nil {
-			_ = database.UpdateCommandEnd(cmdID, tsEnd, 0, 0, 0, nil)
-		}
 		if err != nil {
 			return "", "", 1, resolvedCwd, false, err
 		}
-		return stdout, "", 0, targetCwd, true, nil
+		stdoutPrefix = stdout
+		resolvedCwd = targetCwd
+		cwdChanged = true
+		command = strings.TrimSpace(cdReq.FollowUpCommand)
+		if command == "" {
+			tsEnd := time.Now().UnixNano()
+			if database != nil {
+				_ = database.UpdateCommandEnd(cmdID, tsEnd, 0, 0, 0, nil)
+			}
+			return stdoutPrefix, "", 0, resolvedCwd, true, nil
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, shellPath, shellFlag, command)
@@ -181,6 +190,7 @@ func executeCommand(ctx context.Context, state *runtimeState, command, cwd, cwdM
 	tsEnd := time.Now().UnixNano()
 	stdout := sanitizeOutput(stdoutBuf.String())
 	stderr := sanitizeOutput(stderrBuf.String())
+	stdout = combineCommandOutput(stdoutPrefix, stdout)
 
 	exitCode := 0
 	if runErr != nil {
@@ -204,7 +214,20 @@ func executeCommand(ctx context.Context, state *runtimeState, command, cwd, cwdM
 		_ = database.UpdateCommandEnd(cmdID, tsEnd, exitCode, endOffset, outputSize, transcriptPtr)
 	}
 
-	return stdout, stderr, exitCode, resolvedCwd, false, runErr
+	return stdout, stderr, exitCode, resolvedCwd, cwdChanged, runErr
+}
+
+func combineCommandOutput(prefix, output string) string {
+	prefix = sanitizeOutput(prefix)
+	output = sanitizeOutput(output)
+	switch {
+	case prefix == "":
+		return output
+	case output == "":
+		return prefix
+	default:
+		return prefix + "\n" + output
+	}
 }
 
 type transcriptWriter struct {
@@ -236,7 +259,8 @@ func getTranscriptDir() string {
 }
 
 type directoryChangeRequest struct {
-	RawTarget string
+	RawTarget       string
+	FollowUpCommand string
 }
 
 func parseDirectoryChangeCommand(command string) (directoryChangeRequest, bool) {
@@ -244,16 +268,76 @@ func parseDirectoryChangeCommand(command string) (directoryChangeRequest, bool) 
 	if trimmed == "" {
 		return directoryChangeRequest{}, false
 	}
-	if strings.Contains(trimmed, "&&") || strings.Contains(trimmed, "||") || strings.ContainsAny(trimmed, "|;><`") {
-		return directoryChangeRequest{}, false
-	}
 	if trimmed == "cd" {
 		return directoryChangeRequest{}, true
 	}
-	if !strings.HasPrefix(trimmed, "cd ") {
+	if !strings.HasPrefix(trimmed, "cd") {
 		return directoryChangeRequest{}, false
 	}
-	return directoryChangeRequest{RawTarget: strings.TrimSpace(strings.TrimPrefix(trimmed, "cd"))}, true
+	if len(trimmed) > 2 && !unicode.IsSpace(rune(trimmed[2])) {
+		return directoryChangeRequest{}, false
+	}
+	tail := strings.TrimSpace(trimmed[2:])
+	if tail == "" {
+		return directoryChangeRequest{}, true
+	}
+	if index, separatorLen, ok, invalid := findDirectoryChangeSeparator(tail); invalid {
+		return directoryChangeRequest{}, false
+	} else if ok {
+		target := strings.TrimSpace(tail[:index])
+		followUp := strings.TrimSpace(tail[index+separatorLen:])
+		if target == "" || followUp == "" {
+			return directoryChangeRequest{}, false
+		}
+		return directoryChangeRequest{RawTarget: target, FollowUpCommand: followUp}, true
+	}
+	return directoryChangeRequest{RawTarget: tail}, true
+}
+
+func findDirectoryChangeSeparator(command string) (int, int, bool, bool) {
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+	for i := 0; i < len(command); i++ {
+		ch := command[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch ch {
+		case '\\':
+			escaped = true
+			continue
+		case '\'':
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
+			continue
+		case '"':
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+			continue
+		}
+		if inSingleQuote || inDoubleQuote {
+			continue
+		}
+		if i+1 < len(command) {
+			switch command[i : i+2] {
+			case "&&":
+				return i, 2, true, false
+			case "||":
+				return 0, 0, false, true
+			}
+		}
+		switch ch {
+		case ';':
+			return i, 1, true, false
+		case '|', '>', '<', '`', '&':
+			return 0, 0, false, true
+		}
+	}
+	return 0, 0, false, false
 }
 
 func applyDirectoryChange(ctx context.Context, state *runtimeState, currentCwd string, req directoryChangeRequest) (string, string, error) {

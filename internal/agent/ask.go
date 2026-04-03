@@ -659,7 +659,11 @@ func buildCLIInlineConfirmText(request HITLRequest) string {
 	if command == "" {
 		return cliTitleStyle.Render(cliConfirmTitle(request)) + " " + cliSubtitleStyle.Render("(y/n): ")
 	}
-	return "\n" + cliTitleStyle.Render("Allow command") + " " + cliCommandStyle.Render(command) + " " + cliSubtitleStyle.Render("(y/n): ")
+	line := command
+	if cwd := strings.TrimSpace(request.Cwd); cwd != "" {
+		line += "  " + cwd
+	}
+	return "\n" + cliTitleStyle.Render("Allow command") + " " + cliCommandStyle.Render(line) + " " + cliSubtitleStyle.Render("(y/n): ")
 }
 
 func cliConfirmInline(request HITLRequest) bool {

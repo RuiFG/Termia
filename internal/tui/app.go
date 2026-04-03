@@ -591,6 +591,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.handleSlashResult(msg)
 
 	case agentEventMsg:
+		reloadCommands := false
 		switch msg.event.Kind {
 		case agent.RuntimeEventText:
 			if msg.event.Text != "" {
@@ -607,6 +608,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.RuntimeEventToolResult:
 			if msg.event.ToolCall != nil {
 				a.agent.AppendToolCall(normalizeToolCall(*msg.event.ToolCall))
+				reloadCommands = strings.TrimSpace(msg.event.ToolCall.ToolName) == "command"
 			}
 		case agent.RuntimeEventCwd:
 			if cwd := strings.TrimSpace(msg.event.Cwd); cwd != "" {
@@ -618,7 +620,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.agent.AddMessage("error", text)
 			}
 		}
-		return a, readAgentEventCmd(msg.stream)
+		nextCmd := readAgentEventCmd(msg.stream)
+		if reloadCommands && a.db != nil {
+			nextCmd = tea.Batch(nextCmd, loadCommandsCmd(a.db))
+		}
+		return a, nextCmd
 
 	case agentStartMsg:
 		if msg.err != nil {

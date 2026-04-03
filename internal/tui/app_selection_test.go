@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/termia/termia/internal/agent"
@@ -115,6 +116,67 @@ func TestRuntimeCwdEventUpdatesUIWithoutPersistingSessionCwd(t *testing.T) {
 	}
 }
 
+func TestAgentCommandToolResultReloadsHistory(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "termia.db"), zap.NewNop())
+	if err != nil {
+		t.Fatalf("db.Open returned error: %v", err)
+	}
+	defer database.Close()
+
+	tsStart := time.Now().UnixNano()
+	tsEnd := tsStart + int64(time.Millisecond)
+	exitCode := 0
+	durationMs := int64(1)
+	if err := database.CreateCommand(&db.Command{
+		ID:         "cmd-1",
+		TsStart:    tsStart,
+		TsEnd:      &tsEnd,
+		DurationMs: &durationMs,
+		Command:    "pwd",
+		ExitCode:   &exitCode,
+		Cwd:        "/tmp/project",
+	}); err != nil {
+		t.Fatalf("CreateCommand returned error: %v", err)
+	}
+
+	app := New(database, config.DefaultConfig(), zap.NewNop())
+
+	model, cmd := app.Update(agentEventMsg{
+		event: agent.RuntimeEvent{
+			Kind: agent.RuntimeEventToolResult,
+			ToolCall: &agent.ToolCallEvent{
+				ToolName: "command",
+				Summary:  "pwd",
+				State:    agent.ToolCallStateSuccess,
+			},
+		},
+	})
+	updated := model.(App)
+
+	if cmd == nil {
+		t.Fatal("expected agent command result to trigger a history reload")
+	}
+
+	var sawCommandsLoaded bool
+	for _, msg := range runTeaCmd(cmd) {
+		switch loaded := msg.(type) {
+		case commandsLoadedMsg:
+			sawCommandsLoaded = true
+			model, _ = updated.Update(loaded)
+			updated = model.(App)
+		}
+	}
+	if !sawCommandsLoaded {
+		t.Fatal("expected history reload command to emit commandsLoadedMsg")
+	}
+	if len(updated.history.Commands()) != 1 {
+		t.Fatalf("expected history to reload with the new command, got %#v", updated.history.Commands())
+	}
+	if updated.history.Commands()[0].ID != "cmd-1" {
+		t.Fatalf("expected reloaded history to contain cmd-1, got %#v", updated.history.Commands()[0])
+	}
+}
+
 func TestSubmitInputAbortsWhenSessionRuntimePersistenceFails(t *testing.T) {
 	database, err := db.Open(filepath.Join(t.TempDir(), "termia.db"), zap.NewNop())
 	if err != nil {
@@ -161,6 +223,25 @@ func TestSubmitInputAbortsWhenSessionRuntimePersistenceFails(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(last.Content), "error") {
 		t.Fatalf("expected error message content, got %q", last.Content)
+	}
+}
+
+func runTeaCmd(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	switch typed := msg.(type) {
+	case nil:
+		return nil
+	case tea.BatchMsg:
+		var messages []tea.Msg
+		for _, nested := range typed {
+			messages = append(messages, runTeaCmd(nested)...)
+		}
+		return messages
+	default:
+		return []tea.Msg{typed}
 	}
 }
 

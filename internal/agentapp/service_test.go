@@ -3,12 +3,15 @@ package agentapp
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/adrg/xdg"
 	runtimeagent "github.com/termia/termia/internal/agent"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/sessionstate"
 	"go.uber.org/zap"
 )
 
@@ -381,6 +384,60 @@ func TestServiceRunCreatesAssistantSessionWhenDefaultModeIsNotTeam(t *testing.T)
 	}
 	if sessions[0].Mode != string(runtimeagent.ModeAssistant) || sessions[0].TeamName != "" {
 		t.Fatalf("expected assistant session with cleared team, got %+v", sessions[0])
+	}
+}
+
+func TestServiceRunStartsNewSessionWhenRequestedAndPersistsCurrentSessionID(t *testing.T) {
+	prevDataHome := xdg.DataHome
+	xdg.DataHome = t.TempDir()
+	t.Cleanup(func() {
+		xdg.DataHome = prevDataHome
+	})
+	t.Setenv("TERMIA_SESSION_ID", "session-1")
+
+	runtime := &fakeRuntime{eventsPerRun: [][]runtimeagent.RuntimeEvent{{
+		{Kind: runtimeagent.RuntimeEventText, Text: "fresh answer"},
+	}}}
+	svc, database := newTestService(t, runtime)
+	existingSession := createServiceTestSession(t, database, DefaultSessionState(), "/tmp/old")
+	createServiceTestMessage(t, database, existingSession.ID, "user", "old question", 1)
+	createServiceTestMessage(t, database, existingSession.ID, "assistant", "old answer", 2)
+
+	stream, err := svc.Run(context.Background(), RunRequest{
+		SessionID:  existingSession.ID,
+		Query:      "fresh question",
+		Cwd:        "/tmp/new",
+		NewSession: true,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	for event := range stream {
+		if event.Kind == runtimeagent.RuntimeEventError {
+			t.Fatalf("unexpected service error: %s", event.Text)
+		}
+	}
+
+	if len(runtime.requests) != 1 {
+		t.Fatalf("expected one runtime request, got %d", len(runtime.requests))
+	}
+	runReq := runtime.requests[0]
+	if strings.TrimSpace(runReq.SessionID) == "" || runReq.SessionID == existingSession.ID {
+		t.Fatalf("expected a fresh session ID for new-session runs, got %+v", runReq)
+	}
+	if len(runReq.Messages) != 0 {
+		t.Fatalf("expected new-session runs to start without prior history, got %+v", runReq.Messages)
+	}
+	if got := sessionstate.CurrentID(); got != runReq.SessionID {
+		t.Fatalf("expected current session pointer to track the new session %q, got %q", runReq.SessionID, got)
+	}
+
+	sessions, err := database.ListAgentSessions(10)
+	if err != nil {
+		t.Fatalf("ListAgentSessions returned error: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("expected old and new sessions to coexist, got %#v", sessions)
 	}
 }
 

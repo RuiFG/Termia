@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/muesli/cancelreader"
@@ -145,6 +146,7 @@ func (w *Wrapper) Start() error {
 		fmt.Sprintf("TERMIA_SHELL=%s", w.shell),
 		fmt.Sprintf("TERMIA_SOCK=%s", w.socketPath()),
 		fmt.Sprintf("TERMIA_BIN=%s", binPath),
+		fmt.Sprintf("TERMIA_WRAPPER_STARTED_AT=%d", time.Now().UnixNano()),
 		"TERMIA_INTERNAL=1",
 		"TERMIA_INTERNAL_PATTERN=^(echo \"🚀 Termia active! Type 'tui' for history, 'tai' for AI help.\")$",
 		"TERMIA_INTEGRATION_LOADED=",

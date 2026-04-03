@@ -196,6 +196,7 @@ type App struct {
 	// Sessions
 	sessions               []db.AgentSession
 	activeSessionID        string
+	newSessionRequested    bool
 	pendingPromptID        string
 	pendingPromptSessionID string
 	agentRunning           bool
@@ -397,6 +398,7 @@ func New(database *db.DB, cfg *config.Config, logger *zap.Logger) App {
 		launchCwd:                  cwd,
 		cwd:                        cwd,
 		sessionCwds:                make(map[string]string),
+		newSessionRequested:        sessionstate.NewSessionRequested(),
 		pendingPrompts:             make(map[string][]db.PendingPrompt),
 		dirPromptInput:             newDirPromptInput(),
 		providerConfigInput:        newProviderConfigInput(),
@@ -464,7 +466,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.sessions = msg.sessions
 		a.cacheSessionCwds(a.sessions)
 		if a.activeSessionID == "" {
-			if len(a.sessions) == 0 {
+			if a.newSessionRequested || len(a.sessions) == 0 {
 				return a, createSessionCmd(a.db, a.launchCwd, a.currentRuntimeMode(), a.activeTeamName)
 			}
 			selectedID := selectInitialSessionID(a.sessions, sessionstate.CurrentID())
@@ -490,6 +492,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionCreatedMsg:
 		a.sessions = append([]db.AgentSession{msg.session}, a.sessions...)
 		a.setActiveSessionID(msg.session.ID)
+		a.newSessionRequested = false
 		a.applySessionRuntime(msg.session.ID)
 		a.cacheSessionCwd(msg.session)
 		a.ensureSessionCwd(msg.session.ID)
@@ -3489,7 +3492,7 @@ func loadCommandsCmd(database *db.DB) tea.Cmd {
 		if err != nil {
 			return commandsErrorMsg{err: err}
 		}
-		return commandsLoadedMsg{commands: commands}
+		return commandsLoadedMsg{commands: filterVisibleCommands(commands)}
 	}
 }
 

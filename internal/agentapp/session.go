@@ -61,6 +61,16 @@ func (s *SessionService) Resolve(preferredID, cwd string, defaultState SessionSt
 	return s.createSession(cwd, defaultState, now())
 }
 
+func (s *SessionService) Create(cwd string, defaultState SessionState, now func() time.Time) (db.AgentSession, SessionState, error) {
+	if s == nil || s.database == nil {
+		return db.AgentSession{}, SessionState{}, fmt.Errorf("session database is nil")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return s.createSession(cwd, defaultState, now())
+}
+
 func (s *SessionService) Update(sessionID string, state SessionState, now func() time.Time) (SessionState, error) {
 	if s == nil || s.database == nil {
 		return SessionState{}, fmt.Errorf("session database is nil")

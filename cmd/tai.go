@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,8 +26,14 @@ import (
 var (
 	taiCmd          *cobra.Command
 	taiCommandCount int
-	taiAll          bool
+	taiRecent       bool
 	taiHistoryMode  string
+	taiNewSession   bool
+)
+
+const (
+	taiRecentCommandLimit     = 20
+	taiWrapperStartedAtEnvKey = "TERMIA_WRAPPER_STARTED_AT"
 )
 
 type taiAgentAppService interface {
@@ -69,10 +76,18 @@ func init() {
 		"number of recent commands to include",
 	)
 	taiCmd.Flags().BoolVar(
-		&taiAll,
-		"all",
+		&taiRecent,
+		"recent",
 		false,
-		"include all recent commands",
+		"include up to 20 commands from the current shell session",
+	)
+	taiCmd.Flags().Lookup("recent").Shorthand = "r"
+	taiCmd.Flags().BoolVarP(
+		&taiNewSession,
+		"new-session",
+		"n",
+		false,
+		"start a new conversation session",
 	)
 	taiCmd.Flags().StringVarP(
 		&taiHistoryMode,
@@ -130,6 +145,7 @@ func taiRun(cmd *cobra.Command, args []string) error {
 		SessionID:        sessionID,
 		Query:            userQuery,
 		Cwd:              cwd,
+		NewSession:       taiNewSession,
 		SelectedCommands: taiAgentCommandsFromDBCommands(selectedCommands),
 		StreamReader:     streamReader,
 		Responder:        agent.NewCLIResponder(),
@@ -195,8 +211,8 @@ func resolveTaiHistory(cmd *cobra.Command, database *db.DB) ([]db.Command, error
 	}
 
 	limit := 0
-	if taiAll {
-		limit = 1000
+	if taiRecent {
+		limit = taiRecentCommandLimit
 	} else if taiCommandCount > 0 {
 		limit = taiCommandCount
 	}
@@ -218,13 +234,9 @@ func resolveTaiHistory(cmd *cobra.Command, database *db.DB) ([]db.Command, error
 		limit = count
 	}
 
-	fetchLimit := limit + 5
-	if taiAll {
-		fetchLimit = limit
-	}
-	commands, err := database.ListRecentCommands(fetchLimit)
+	commands, err := loadTaiHistoryCommands(database, limit)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch commands: %w", err)
+		return nil, err
 	}
 
 	mode, err := normalizeTaiHistoryMode(taiHistoryMode)
@@ -233,11 +245,42 @@ func resolveTaiHistory(cmd *cobra.Command, database *db.DB) ([]db.Command, error
 	}
 
 	filtered := filterTaiHistory(commands, mode)
-	if !taiAll && limit > 0 && len(filtered) > limit {
+	if limit > 0 && len(filtered) > limit {
 		filtered = filtered[:limit]
 	}
 	reverseCommands(filtered)
 	return filtered, nil
+}
+
+func loadTaiHistoryCommands(database *db.DB, limit int) ([]db.Command, error) {
+	if taiRecent {
+		startedAt, err := taiWrapperStartedAt()
+		if err != nil {
+			return nil, err
+		}
+		commands, err := database.ListRecentCommandsSince(startedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch recent commands: %w", err)
+		}
+		return commands, nil
+	}
+	commands, err := database.ListRecentCommands(limit + 5)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch commands: %w", err)
+	}
+	return commands, nil
+}
+
+func taiWrapperStartedAt() (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(taiWrapperStartedAtEnvKey))
+	if raw == "" {
+		return 0, fmt.Errorf("wrapper start timestamp is unavailable; restart the Termia shell to use --recent")
+	}
+	startedAt, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || startedAt <= 0 {
+		return 0, fmt.Errorf("invalid wrapper start timestamp: %s", raw)
+	}
+	return startedAt, nil
 }
 
 func normalizeTaiHistoryMode(mode string) (string, error) {
@@ -260,7 +303,7 @@ func filterTaiHistory(commands []db.Command, mode string) []db.Command {
 		if trimmed == "" {
 			continue
 		}
-		isTai := isTaiCommand(trimmed)
+		isTai := isTaiCommand(cmd)
 		switch mode {
 		case "cmd":
 			if isTai {
@@ -276,10 +319,34 @@ func filterTaiHistory(commands []db.Command, mode string) []db.Command {
 	return filtered
 }
 
-func isTaiCommand(command string) bool {
-	lower := strings.ToLower(strings.TrimSpace(command))
+func isTaiCommand(command db.Command) bool {
+	lower := strings.ToLower(strings.TrimSpace(command.Command))
 	return lower == "tai" || strings.HasPrefix(lower, "tai ") || lower == "tui" || strings.HasPrefix(lower, "tui ") ||
-		strings.HasPrefix(lower, "termia tai") || strings.HasPrefix(lower, "termia tui")
+		strings.HasPrefix(lower, "termia tai") || strings.HasPrefix(lower, "termia tui") ||
+		isTermiaLaunchCommand(command)
+}
+
+func isTermiaLaunchCommand(command db.Command) bool {
+	termiaBin := strings.TrimSpace(os.Getenv("TERMIA_BIN"))
+	if termiaBin == "" {
+		return false
+	}
+	fields := strings.Fields(strings.TrimSpace(command.Command))
+	if len(fields) == 0 {
+		return false
+	}
+	commandPath := strings.Trim(fields[0], `"'`)
+	if commandPath == "" {
+		return false
+	}
+	if !filepath.IsAbs(commandPath) && strings.ContainsAny(commandPath, `/\`) {
+		cwd := strings.TrimSpace(command.Cwd)
+		if cwd == "" {
+			return false
+		}
+		commandPath = filepath.Join(cwd, commandPath)
+	}
+	return filepath.Clean(commandPath) == filepath.Clean(termiaBin)
 }
 
 func reverseCommands(commands []db.Command) {

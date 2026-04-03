@@ -144,6 +144,25 @@ func (d *DB) ListRecentCommands(limit int) ([]Command, error) {
 	return d.scanCommands(rows)
 }
 
+// ListRecentCommandsSince retrieves completed commands since the lower bound ordered by ts_end descending.
+func (d *DB) ListRecentCommandsSince(since int64) ([]Command, error) {
+	query := `
+		SELECT id, ts_start, ts_end, duration_ms, command, exit_code,
+		       cwd, start_offset, end_offset, output_size, transcript_path, tags, favorite
+		FROM commands
+		WHERE ts_end IS NOT NULL AND ts_end >= ?
+		ORDER BY ts_end DESC
+	`
+
+	rows, err := d.conn.Query(query, since)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list recent commands since %d: %w", since, err)
+	}
+	defer rows.Close()
+
+	return d.scanCommands(rows)
+}
+
 // SearchCommands searches for commands matching the query string in the command text.
 func (d *DB) SearchCommands(query string, limit int) ([]Command, error) {
 	sqlQuery := `

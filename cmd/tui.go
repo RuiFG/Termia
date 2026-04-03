@@ -8,9 +8,11 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/termia/termia/internal/sessionstate"
 )
 
 var tuiCmd *cobra.Command
+var tuiNewSession bool
 
 func init() {
 	if os.Getenv("TERMIA_WRAPPED") != "1" {
@@ -22,15 +24,26 @@ func init() {
 		Short: "Interactive history browser",
 		RunE:  tuiRun,
 	}
+	tuiCmd.Flags().BoolVarP(
+		&tuiNewSession,
+		"new-session",
+		"n",
+		false,
+		"start TUI in a new conversation session",
+	)
 
 	rootCmd.AddCommand(tuiCmd)
 }
 
 func tuiRun(cmd *cobra.Command, args []string) error {
-	return sendWrapperRPC("tui")
+	var env map[string]string
+	if tuiNewSession {
+		env = map[string]string{sessionstate.NewSessionEnvKey: "1"}
+	}
+	return sendWrapperRPC("tui", env)
 }
 
-func sendWrapperRPC(command string) error {
+func sendWrapperRPC(command string, env map[string]string) error {
 	sockPath := os.Getenv("TERMIA_SOCK")
 	if sockPath == "" {
 		return fmt.Errorf("no wrapper socket found; start a Termia-wrapped shell first")
@@ -49,6 +62,9 @@ func sendWrapperRPC(command string) error {
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		payload.Cwd = cwd
+	}
+	if len(env) > 0 {
+		payload.Env = env
 	}
 	encoder := json.NewEncoder(conn)
 	if err := encoder.Encode(payload); err != nil {

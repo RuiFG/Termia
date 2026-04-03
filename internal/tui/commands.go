@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -113,8 +115,45 @@ func searchCommandsCmd(database *db.DB, query string) tea.Cmd {
 		if err != nil {
 			return commandsErrorMsg{err: err}
 		}
-		return commandsLoadedMsg{commands: commands}
+		return commandsLoadedMsg{commands: filterVisibleCommands(commands)}
 	}
+}
+
+func filterVisibleCommands(commands []db.Command) []db.Command {
+	if len(commands) == 0 {
+		return nil
+	}
+	filtered := make([]db.Command, 0, len(commands))
+	for _, command := range commands {
+		if isTermiaLaunchCommand(command) {
+			continue
+		}
+		filtered = append(filtered, command)
+	}
+	return filtered
+}
+
+func isTermiaLaunchCommand(command db.Command) bool {
+	termiaBin := strings.TrimSpace(os.Getenv("TERMIA_BIN"))
+	if termiaBin == "" {
+		return false
+	}
+	fields := strings.Fields(strings.TrimSpace(command.Command))
+	if len(fields) == 0 {
+		return false
+	}
+	commandPath := strings.Trim(fields[0], `"'`)
+	if commandPath == "" {
+		return false
+	}
+	if !filepath.IsAbs(commandPath) && strings.ContainsAny(commandPath, `/\`) {
+		cwd := strings.TrimSpace(command.Cwd)
+		if cwd == "" {
+			return false
+		}
+		commandPath = filepath.Join(cwd, commandPath)
+	}
+	return filepath.Clean(commandPath) == filepath.Clean(termiaBin)
 }
 
 func renderModelsText(cfg *config.LLMConfig) string {

@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -190,6 +192,78 @@ func TestFilterTaiHistoryCmdExcludesTaiCommands(t *testing.T) {
 	}
 }
 
+func TestFilterTaiHistoryCmdExcludesOnlyCurrentTermiaBinaryPath(t *testing.T) {
+	cwd := t.TempDir()
+	t.Setenv("TERMIA_BIN", filepath.Join(cwd, "bin", "custom-launcher"))
+
+	commands := []db.Command{
+		{Command: "./bin/custom-launcher", Cwd: cwd},
+		{Command: "./other/custom-launcher", Cwd: cwd},
+		{Command: "pwd", Cwd: cwd},
+	}
+
+	filtered := filterTaiHistory(commands, "cmd")
+	if len(filtered) != 2 {
+		t.Fatalf("expected only the active Termia launcher command to be hidden, got %#v", filtered)
+	}
+	if strings.TrimSpace(filtered[0].Command) != "./other/custom-launcher" || strings.TrimSpace(filtered[1].Command) != "pwd" {
+		t.Fatalf("expected same-name command in a different path to remain visible, got %#v", filtered)
+	}
+}
+
+func TestResolveTaiHistoryRecentUsesWrapperStartTimeAndCapsAtTwentyCommands(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "termia.db")
+	wrapperStartedAt := time.Now().UnixNano()
+	seedTaiTestDB(t, dbPath, func(database *db.DB) {
+		createTaiTestCommand(t, database, "cmd-old", "pwd", wrapperStartedAt-1, false)
+		createTaiTestCommand(t, database, "cmd-ai", "tai explain", wrapperStartedAt+1, false)
+		for i := 1; i <= 21; i++ {
+			createTaiTestCommand(
+				t,
+				database,
+				fmt.Sprintf("cmd-%02d", i),
+				fmt.Sprintf("echo %02d", i),
+				wrapperStartedAt+int64(i+1),
+				false,
+			)
+		}
+	})
+
+	prevCmdCount, prevRecent, prevHistoryMode, prevNewSession := taiCommandCount, taiRecent, taiHistoryMode, taiNewSession
+	taiCommandCount = 0
+	taiRecent = true
+	taiHistoryMode = "cmd"
+	taiNewSession = false
+	t.Cleanup(func() {
+		taiCommandCount = prevCmdCount
+		taiRecent = prevRecent
+		taiHistoryMode = prevHistoryMode
+		taiNewSession = prevNewSession
+	})
+	t.Setenv("TERMIA_WRAPPER_STARTED_AT", strconv.FormatInt(wrapperStartedAt, 10))
+
+	withTaiTestDB(t, dbPath, func(database *db.DB) {
+		commands, err := resolveTaiHistory(newTaiRunTestCommand(), database)
+		if err != nil {
+			t.Fatalf("resolveTaiHistory returned error: %v", err)
+		}
+		if len(commands) != 20 {
+			t.Fatalf("expected recent history to be capped at 20 commands, got %d (%#v)", len(commands), commands)
+		}
+		if commands[0].ID != "cmd-02" || commands[len(commands)-1].ID != "cmd-21" {
+			t.Fatalf("expected newest 20 startup commands in chronological order, got first=%q last=%q", commands[0].ID, commands[len(commands)-1].ID)
+		}
+		for _, command := range commands {
+			if command.ID == "cmd-old" {
+				t.Fatalf("expected commands before wrapper startup to be excluded, got %#v", commands)
+			}
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(command.Command)), "tai ") {
+				t.Fatalf("expected ai commands to be filtered by default history mode, got %#v", commands)
+			}
+		}
+	})
+}
+
 func TestTaiRunUsesSharedAgentAppServiceAndStoresAnalysis(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "termia.db")
 	seedTaiTestDB(t, dbPath, func(database *db.DB) {
@@ -219,14 +293,16 @@ func TestTaiRunUsesSharedAgentAppServiceAndStoresAnalysis(t *testing.T) {
 		newTaiAgentAppService = prevFactory
 	})
 
-	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	prevCmdCount, prevRecent, prevHistoryMode, prevNewSession := taiCommandCount, taiRecent, taiHistoryMode, taiNewSession
 	taiCommandCount = 1
-	taiAll = false
+	taiRecent = false
 	taiHistoryMode = "cmd"
+	taiNewSession = false
 	t.Cleanup(func() {
 		taiCommandCount = prevCmdCount
-		taiAll = prevAll
+		taiRecent = prevRecent
 		taiHistoryMode = prevHistoryMode
+		taiNewSession = prevNewSession
 	})
 
 	t.Setenv("TERMIA_SESSION_ID", "session-current")
@@ -294,14 +370,16 @@ func TestTaiRunSupportsHSelectorPrefixWithSharedService(t *testing.T) {
 		newTaiAgentAppService = prevFactory
 	})
 
-	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	prevCmdCount, prevRecent, prevHistoryMode, prevNewSession := taiCommandCount, taiRecent, taiHistoryMode, taiNewSession
 	taiCommandCount = 0
-	taiAll = false
+	taiRecent = false
 	taiHistoryMode = "cmd"
+	taiNewSession = false
 	t.Cleanup(func() {
 		taiCommandCount = prevCmdCount
-		taiAll = prevAll
+		taiRecent = prevRecent
 		taiHistoryMode = prevHistoryMode
+		taiNewSession = prevNewSession
 	})
 
 	runCmd := &cobra.Command{
@@ -325,6 +403,56 @@ func TestTaiRunSupportsHSelectorPrefixWithSharedService(t *testing.T) {
 	}
 	if req.SelectedCommands[0].ID != "cmd-1" || req.SelectedCommands[1].ID != "cmd-2" {
 		t.Fatalf("expected commands in chronological order, got %#v", req.SelectedCommands)
+	}
+}
+
+func TestTaiRunRequestsNewSessionFromSharedService(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "termia.db")
+
+	prevOpen := openTaiDB
+	openTaiDB = func() (*db.DB, error) {
+		return db.Open(dbPath, zap.NewNop())
+	}
+	t.Cleanup(func() {
+		openTaiDB = prevOpen
+	})
+
+	fakeSvc := &fakeTaiAgentAppService{
+		events: []agent.RuntimeEvent{
+			{Kind: agent.RuntimeEventText, Text: "fresh session"},
+		},
+	}
+	prevFactory := newTaiAgentAppService
+	newTaiAgentAppService = func(_ *config.Config, _ *db.DB) taiAgentAppService {
+		return fakeSvc
+	}
+	t.Cleanup(func() {
+		newTaiAgentAppService = prevFactory
+	})
+
+	prevCmdCount, prevRecent, prevHistoryMode, prevNewSession := taiCommandCount, taiRecent, taiHistoryMode, taiNewSession
+	taiCommandCount = 0
+	taiRecent = false
+	taiHistoryMode = "cmd"
+	taiNewSession = true
+	t.Cleanup(func() {
+		taiCommandCount = prevCmdCount
+		taiRecent = prevRecent
+		taiHistoryMode = prevHistoryMode
+		taiNewSession = prevNewSession
+	})
+
+	t.Setenv("TERMIA_SESSION_ID", "session-current")
+
+	cmd := newTaiRunTestCommand()
+	if err := taiRun(cmd, []string{"start fresh"}); err != nil {
+		t.Fatalf("taiRun returned error: %v", err)
+	}
+	if len(fakeSvc.requests) != 1 {
+		t.Fatalf("expected one service run request, got %d", len(fakeSvc.requests))
+	}
+	if !fakeSvc.requests[0].NewSession {
+		t.Fatalf("expected tai -n to request a new session, got %#v", fakeSvc.requests[0])
 	}
 }
 
@@ -352,14 +480,16 @@ func TestTaiRunReturnsErrorOnStreamErrorAndSkipsAnalysis(t *testing.T) {
 		newTaiAgentAppService = prevFactory
 	})
 
-	prevCmdCount, prevAll, prevHistoryMode := taiCommandCount, taiAll, taiHistoryMode
+	prevCmdCount, prevRecent, prevHistoryMode, prevNewSession := taiCommandCount, taiRecent, taiHistoryMode, taiNewSession
 	taiCommandCount = 0
-	taiAll = false
+	taiRecent = false
 	taiHistoryMode = "cmd"
+	taiNewSession = false
 	t.Cleanup(func() {
 		taiCommandCount = prevCmdCount
-		taiAll = prevAll
+		taiRecent = prevRecent
 		taiHistoryMode = prevHistoryMode
+		taiNewSession = prevNewSession
 	})
 
 	cmd := newTaiRunTestCommand()
@@ -434,8 +564,9 @@ func (f *fakeTaiAgentAppService) Run(ctx context.Context, req agentapp.RunReques
 func newTaiRunTestCommand() *cobra.Command {
 	cmd := &cobra.Command{Use: "tai"}
 	cmd.Flags().Int("cmd", 0, "")
-	cmd.Flags().Bool("all", false, "")
+	cmd.Flags().BoolP("recent", "r", false, "")
 	cmd.Flags().String("history-mode", "cmd", "")
+	cmd.Flags().BoolP("new-session", "n", false, "")
 	return cmd
 }
 

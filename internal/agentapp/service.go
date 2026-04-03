@@ -11,6 +11,7 @@ import (
 	runtimeagent "github.com/termia/termia/internal/agent"
 	"github.com/termia/termia/internal/config"
 	"github.com/termia/termia/internal/db"
+	"github.com/termia/termia/internal/sessionstate"
 	"github.com/termia/termia/internal/textutil"
 )
 
@@ -26,6 +27,7 @@ type RunRequest struct {
 	SessionID        string
 	Query            string
 	Cwd              string
+	NewSession       bool
 	SelectedCommands []runtimeagent.Command
 	StreamReader     *runtimeagent.StreamReader
 	Responder        runtimeagent.HITLResponder
@@ -57,7 +59,7 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 		return nil, fmt.Errorf("service is not initialized")
 	}
 
-	session, state, err := s.sessions.Resolve(req.SessionID, req.Cwd, defaultSessionStateFromConfig(s.cfg), nil)
+	session, state, err := s.resolveRunSession(req)
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +100,21 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (<-chan runtimeagent.
 	out := make(chan runtimeagent.RuntimeEvent, 32)
 	go s.runLoop(ctx, out, runCtx, history, middleware, req.StreamReader, req.Responder)
 	return out, nil
+}
+
+func (s *Service) resolveRunSession(req RunRequest) (db.AgentSession, SessionState, error) {
+	defaultState := defaultSessionStateFromConfig(s.cfg)
+	if req.NewSession {
+		session, state, err := s.sessions.Create(req.Cwd, defaultState, nil)
+		if err != nil {
+			return db.AgentSession{}, SessionState{}, err
+		}
+		if err := sessionstate.SetCurrentID(session.ID); err != nil {
+			return db.AgentSession{}, SessionState{}, err
+		}
+		return session, state, nil
+	}
+	return s.sessions.Resolve(req.SessionID, req.Cwd, defaultState, nil)
 }
 
 func (s *Service) applySharedSlashCommand(sessionID string, state SessionState, query string) (string, SessionState, []MiddlewareActivation, error) {

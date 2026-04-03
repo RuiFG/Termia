@@ -385,3 +385,42 @@ func TestUpdateSessionRuntimePrefersFreshDBSnapshotOverStaleLocalSession(t *test
 		t.Fatalf("expected local snapshot middleware to be refreshed from db row, got %+v", decodedLocal.SessionMiddleware)
 	}
 }
+
+func TestSessionsLoadedCreatesNewSessionWhenRequestedByEnv(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "termia.db"), zap.NewNop())
+	if err != nil {
+		t.Fatalf("db.Open returned error: %v", err)
+	}
+	defer database.Close()
+
+	existingSession, err := createSession(database, "/old", agent.ModeAssistant, "")
+	if err != nil {
+		t.Fatalf("createSession returned error: %v", err)
+	}
+	t.Setenv("TERMIA_NEW_SESSION", "1")
+
+	app := New(database, config.DefaultConfig(), zap.NewNop())
+	model, cmd := app.Update(sessionsLoadedMsg{sessions: []db.AgentSession{existingSession}})
+	updated := model.(App)
+	if cmd == nil {
+		t.Fatalf("expected startup with TERMIA_NEW_SESSION=1 to create a fresh session")
+	}
+
+	msgs := runTeaCmd(cmd)
+	if len(msgs) != 1 {
+		t.Fatalf("expected one session creation message, got %#v", msgs)
+	}
+	created, ok := msgs[0].(sessionCreatedMsg)
+	if !ok {
+		t.Fatalf("expected sessionCreatedMsg, got %#v", msgs[0])
+	}
+	model, _ = updated.Update(created)
+	updated = model.(App)
+
+	if updated.activeSessionID == "" || updated.activeSessionID == existingSession.ID {
+		t.Fatalf("expected a new active session, got %q", updated.activeSessionID)
+	}
+	if len(updated.sessions) != 2 || updated.sessions[0].ID != updated.activeSessionID {
+		t.Fatalf("expected the new session to be prepended and active, got %#v", updated.sessions)
+	}
+}
